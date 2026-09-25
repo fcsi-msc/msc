@@ -6523,7 +6523,10 @@ int msc_udp_receiver_recv(void *session, struct msc_udp_config *cfg)
    x.transfer_id = transfer_id;
    x.files = &onefile;
    x.nfiles = 1;
-   x.allow_mmap = 1;
+   /* Only a receiver that owns the whole file may size or map it.  In multi
+    * mode the destination is shared, and ftruncate()ing it to this worker's
+    * slice would cut off bytes another worker has already written. */
+   x.allow_mmap = !cfg->multi;
    x.stripe_size = stripe_size;
    x.stripe_count = stripe_count;
    x.my_ost_start = cfg->my_ost_count > 0 ? cfg->my_ost_start : -1;

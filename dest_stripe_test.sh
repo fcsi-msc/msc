@@ -194,15 +194,29 @@ fi
 echo "ok: the multimachine -x/child path carries the request too"
 
 # And the shape it must not break: multimachine with no request at all.
+# MSC_UDP_STATS reports each receiver's write path.  The pairs share one
+# destination, so none may take the mmap path: it ftruncate()s the file to its
+# own slice, cutting off whatever the other pair has already written -- a race
+# that loses data only sometimes, which is why the check is on the path taken.
 rm -f "$work/out"
-timeout 120 "$MSC" -n2 -q 2 -l localhost,localhost -r localhost,localhost \
-   -B "$MSC" -i "$work/src" -o "$work/out" >/dev/null 2>"$work/log" \
+MSC_UDP_STATS=1 timeout 120 "$MSC" -n2 -q 2 -l localhost,localhost \
+   -r localhost,localhost -B "$MSC" -i "$work/src" -o "$work/out" \
+   >/dev/null 2>"$work/log" \
    || { echo "FAIL: a multimachine transfer without the option stopped working"
         sed -n '1,6p' "$work/log"; exit 1; }
 cmp -s "$work/src" "$work/out" \
    || { echo "FAIL: a multimachine transfer without the option corrupted the file"
         exit 1; }
-echo "ok: multimachine without the option still transfers intact"
+if grep -q 'write-path: mmap [1-9]' "$work/log"; then
+   echo "FAIL: a multimachine receiver mapped the shared destination:"
+   grep 'write-path' "$work/log"
+   exit 1
+fi
+if ! grep -q 'write-path: mmap 0' "$work/log"; then
+   echo "FAIL: no receiver reported its write path, so the check above proves nothing"
+   exit 1
+fi
+echo "ok: multimachine without the option transfers intact without mapping the shared file"
 
 # A transfer with no request must be completely unaffected by any of this.
 rm -f "$work/out"
