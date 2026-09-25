@@ -26,16 +26,38 @@ static int writepipe[2];
 #define CHILD_READ_REMOTE   writepipe[0]
 #define PARENT_WRITE_REMOTE writepipe[1]
 
-/* interface between file socket read and output write */
+/* Pipe-mode receive ring.  The socket loop fills a buffer only while it is
+ * empty and hands it over by marking it full; write_thread drains full buffers
+ * in order and marks them empty again.  Each side waits on ring_cond for its
+ * next buffer, so neither can overtake the other however the threads are
+ * scheduled, and the buffer handed over with datalast set ends the stream.
+ * readsocket() joins the writer before it returns. */
 #define NUMBUFFERS 3
 static char *databuffer[NUMBUFFERS];
-long long int datacounter[NUMBUFFERS];
-pthread_mutex_t datamutex[NUMBUFFERS];
-pthread_mutex_t worker_lock;
+static long long int datacounter[NUMBUFFERS];
+static int datafull[NUMBUFFERS];
+static int datalast[NUMBUFFERS];
+static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ring_cond = PTHREAD_COND_INITIALIZER;
 
-/* The legacy pipe receiver mirrors local_sockets.c's ownership hand-off:
- * datamutex selects which ring buffer the socket loop may fill, while
- * worker_lock acts as a one-shot completion latch for the writer thread. */
+/* socket loop -> writer: this buffer is ready (last: and ends the stream) */
+static void ring_hand_off(int buffer, int last)
+{
+   pthread_mutex_lock(&ring_lock);
+   datalast[buffer] = last;
+   datafull[buffer] = 1;
+   pthread_cond_broadcast(&ring_cond);
+   pthread_mutex_unlock(&ring_lock);
+}
+
+/* socket loop: wait until the writer has emptied this buffer */
+static void ring_wait_empty(int buffer)
+{
+   pthread_mutex_lock(&ring_lock);
+   while (datafull[buffer])
+      pthread_cond_wait(&ring_cond, &ring_lock);
+   pthread_mutex_unlock(&ring_lock);
+}
 
 struct receiver_state
 {
@@ -76,56 +98,51 @@ struct receiver_worker
 void *write_thread(void *arg)
 {
    int current = 0;
-   int didsomething = 1;
-   int b;
+   int last = 0;
    FILE *outfile = arg;
 
    DEBUG0("start write_thread\n");
    DEBUGSYNC;
-   pthread_mutex_lock(&worker_lock);
-   while(didsomething)
+   while (!last)
    {
-        /* get buffer */
-      DEBUG1("write_thread get lock buffer %d\n",current);
-      DEBUGSYNC;
-      pthread_mutex_lock(&datamutex[current]);
-      didsomething = datacounter[current];
-      DEBUG2("write_thread: got mutex buffer %d size %lld\n", current, datacounter[current]);
+      long long count, woff = 0;
+
+      pthread_mutex_lock(&ring_lock);
+      while (!datafull[current])
+         pthread_cond_wait(&ring_cond, &ring_lock);
+      count = datacounter[current];
+      last = datalast[current];
+      pthread_mutex_unlock(&ring_lock);
+      DEBUG2("write_thread: buffer %d size %lld\n", current, count);
+
+      while (count > 0)
       {
-         long long woff = 0;
-         while (datacounter[current] > 0)
+         size_t b = fwrite(databuffer[current] + woff, 1, (size_t)count, outfile);
+         if (b == 0)
          {
-            b = fwrite(databuffer[current] + woff, 1, datacounter[current],
-                       outfile);
-            if (b == 0)
-            {
-               /* A destination that stops accepting bytes (full disk, dead
-                * command pipe) used to spin here forever.  Nothing downstream
-                * can recover the pipe path, so fail with the right class. */
-               fprintf(stderr, "MSC pipe-mode destination write failed\n");
-               _exit(MSC_EXIT_DESTINATION);
-            }
-            /* a short write resumes after the written bytes, never from the
-             * buffer head (which would duplicate data) */
-            datacounter[current] -= b;
-            woff += b;
-            didsomething = 1;
+            /* A destination that stops accepting bytes (full disk, dead
+             * command pipe) used to spin here forever.  Nothing downstream
+             * can recover the pipe path, so fail with the right class. */
+            fprintf(stderr, "MSC pipe-mode destination write failed\n");
+            _exit(MSC_EXIT_DESTINATION);
          }
+         /* a short write resumes after the written bytes, never from the
+          * buffer head (which would duplicate data) */
+         count -= (long long)b;
+         woff += (long long)b;
       }
-      DEBUG1("write_thread: write buffer %d\n",current);
-      DEBUGSYNC;
 
-        /* reset buffer for scket end */
+      /* hand the emptied buffer back to the socket loop */
+      pthread_mutex_lock(&ring_lock);
       datacounter[current] = 0;
-      pthread_mutex_unlock(&datamutex[current]);
-
-        /* next buffer */
+      datafull[current] = 0;
+      pthread_cond_broadcast(&ring_cond);
+      pthread_mutex_unlock(&ring_lock);
       current++;
       if (current >= NUMBUFFERS)
          current = 0;
    }
-   DEBUG0("write_thread: unlock worker_lock\n");
-   pthread_mutex_unlock(&worker_lock);
+   DEBUG0("write_thread: done\n");
    return NULL;
 }
 
@@ -620,83 +637,84 @@ void readsocket(int numstreams, int newsockfds[], FILE * outfile, int buffsize)
    int lc;
    int snum = 0;
    int currentbuffer = 0;
-   int oldcurrentbuffer;
+   int receive_failed = 0;
    pthread_t threadid;
-   int buffersize = 4*buffsize; /* start with this */
+   /* Each recvall reads exactly one buffsize block from one socket, so every
+    * buffer must hold at least one block; the soft-start fill size never
+    * exceeds what was allocated. */
+   long long alloc = buffsize > MAX_INTERPROCESS_BUFFER_SIZE
+                     ? buffsize : MAX_INTERPROCESS_BUFFER_SIZE;
+   long long buffersize = 4LL * buffsize;
 
-   DEBUG1("in readsocket, buffersize %d\n",buffersize);
+   if (buffersize > alloc)
+      buffersize = alloc;
+   DEBUG1("in readsocket, buffersize %lld\n", buffersize);
    DEBUGSYNC;
-       /* initialize things for the file writing pthread */
-   for (lc = 0;lc < NUMBUFFERS; lc++)
+   for (lc = 0; lc < NUMBUFFERS; lc++)
    {
-      databuffer[lc] = checkmalloc(MAX_INTERPROCESS_BUFFER_SIZE,"databuffer");
+      databuffer[lc] = checkmalloc((size_t)alloc, "databuffer");
       datacounter[lc] = 0;
-      pthread_mutex_init(&datamutex[lc], NULL);
-      pthread_mutex_init(&worker_lock, NULL);
+      datafull[lc] = 0;
+      datalast[lc] = 0;
    }
-
-      /* grab the first mutex before we start the writing thread */
-   pthread_mutex_lock(&datamutex[currentbuffer]);
-      /* create output thread */
-   pthread_create(&threadid, NULL, &write_thread, outfile);
+   if (pthread_create(&threadid, NULL, &write_thread, outfile) != 0)
+   {
+      fprintf(stderr, "MSC could not start the pipe-mode writer thread\n");
+      exit(MSC_EXIT_INTERNAL);
+   }
 
    while (n > 0)
    {
       n = recvall(newsockfds[snum],
                   databuffer[currentbuffer] + datacounter[currentbuffer],
                   buffsize);
-      if (n < 0)   /* socket error: stop reading, drain what we have */
-         n = 0;
-      datacounter[currentbuffer]+= n;
-      if (buffersize - datacounter[currentbuffer] < buffsize)
+      if (n < 0)   /* socket error: hand over what we have, then fail */
       {
-           /* process to file writer */
-          oldcurrentbuffer = currentbuffer;
-          currentbuffer++;
-          if (currentbuffer >= NUMBUFFERS)
-             currentbuffer = 0;
-          DEBUG1("readsocket: prior to lock buffer %d\n", currentbuffer);
-          pthread_mutex_lock(&datamutex[currentbuffer]);
-          DEBUG1("readsocket: post lock buffer %d\n", currentbuffer);
-          DEBUG1("readsocket: unlock buffer %d\n", oldcurrentbuffer);
-          pthread_mutex_unlock(&datamutex[oldcurrentbuffer]);
-             /* update buffer size...soft start */
-          if (buffersize < MAX_INTERPROCESS_BUFFER_SIZE)
-          {
-             buffersize *= 4;
-             if (buffersize > MAX_INTERPROCESS_BUFFER_SIZE)
-                buffersize = MAX_INTERPROCESS_BUFFER_SIZE;
-             DEBUG1("readsocket: new buffersize %d\n",buffersize);
-             DEBUGSYNC;
-          }
+         receive_failed = 1;
+         n = 0;
+      }
+      datacounter[currentbuffer] += n;
+      if (n > 0 && buffersize - datacounter[currentbuffer] < buffsize)
+      {
+         /* no room for another block: hand this buffer to the writer and
+          * move on to the next one once the writer has emptied it */
+         ring_hand_off(currentbuffer, 0);
+         currentbuffer++;
+         if (currentbuffer >= NUMBUFFERS)
+            currentbuffer = 0;
+         ring_wait_empty(currentbuffer);
+         if (buffersize < alloc)   /* soft start */
+         {
+            buffersize *= 4;
+            if (buffersize > alloc)
+               buffersize = alloc;
+            DEBUG1("readsocket: new buffersize %lld\n", buffersize);
+         }
       }
          /* next socket to read from */
       snum++;
       if (snum >= numstreams)
          snum = 0;
    }
+   /* the final, possibly empty, buffer ends the stream */
+   ring_hand_off(currentbuffer, 1);
 
-      /* Release the buffer that was locked for the next read but never filled. */
-   DEBUG1("readsocket: cleanup unlock buffer %d\n", currentbuffer);
-   pthread_mutex_unlock(&datamutex[currentbuffer]);
-
-      /* clean up sockets */
    for (snum = 0; snum < numstreams; snum++)
-   {
       close(newsockfds[snum]);
-   }
 
-      /* wait for output write to complete */
-   DEBUG0("readsocket: cleanup wait for worker_lock\n");
-   pthread_mutex_lock(&worker_lock);
-   DEBUG0("readsocket: cleanup done with worker_lock\n");
-
-      /* finish cleanup */
+   /* wait until the writer has written everything */
+   pthread_join(threadid, NULL);
    for (lc = 0; lc < NUMBUFFERS; lc++)
    {
-      pthread_mutex_destroy(&datamutex[lc]);
+      free(databuffer[lc]);
+      databuffer[lc] = NULL;
    }
-   pthread_mutex_destroy(&worker_lock);
+   if (receive_failed)
+   {
+      /* recvall reported the error; do not let a truncated stream pass as
+       * a completed transfer */
+      exit(MSC_EXIT_NETWORK);
+   }
 }
 
 /* Open a socket, bind it to the first free port in the range, and listen.
@@ -965,6 +983,11 @@ void exec_remote(struct argdata *AD, int childnum)
 {
    (void)childnum;
    dup2(CHILD_READ_REMOTE, STDIN_FILENO);
+   /* Drop the original pipe ends, above all our copy of the write end: while
+    * any process holds it open, the command never sees end of input. */
+   if (CHILD_READ_REMOTE != STDIN_FILENO)
+      close(CHILD_READ_REMOTE);
+   close(PARENT_WRITE_REMOTE);
    DEBUGSYNC;
    DEBUG1("AD->remote_program: %s\n", AD->remote_program);
    DEBUGSYNC;
@@ -998,6 +1021,11 @@ void remote_process(struct argdata *AD)
 
         /* fork and exec remote command */
       childproc = makechild_inline(exec_remote, AD, 0, "execute process");
+      if (childproc < 0)
+         exit(MSC_EXIT_INTERNAL);
+      /* The command owns the read end now.  Without our copy, a command that
+       * exits early makes our writes fail instead of blocking forever. */
+      close(CHILD_READ_REMOTE);
    }
    else
    {
@@ -1097,8 +1125,32 @@ void remote_process(struct argdata *AD)
 
    DEBUG0("done with remote_process\n");
 
-       /* in case we forked off an output process */
-   if (childproc)
-      waitpid(childproc, NULL, WNOHANG);
+   /* A -c command must finish before this receiver reports success: the
+    * sender returns as soon as we exit, and the command's exit status is the
+    * destination's verdict on the transfer. */
+   if (childproc > 0)
+   {
+      int status;
+      while (waitpid(childproc, &status, 0) < 0)
+      {
+         if (errno != EINTR)
+         {
+            perror("MSC waitpid for the -c command");
+            exit(MSC_EXIT_INTERNAL);
+         }
+         if (msc_cancelled())
+            kill(childproc, SIGTERM);
+      }
+      if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+      {
+         if (WIFEXITED(status))
+            fprintf(stderr, "MSC remote command exited %d: %s\n",
+                    WEXITSTATUS(status), AD->remote_program);
+         else
+            fprintf(stderr, "MSC remote command killed by signal %d: %s\n",
+                    WTERMSIG(status), AD->remote_program);
+         exit(MSC_EXIT_DESTINATION);
+      }
+   }
    exit(0);
 }

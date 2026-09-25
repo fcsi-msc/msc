@@ -48,10 +48,12 @@ struct sender_worker
 };
 
 #define NUMBUFFERS 3
-long long int inputcounter[NUMBUFFERS];
-char *inputbuffer[NUMBUFFERS];
-pthread_mutex_t inputmutex[NUMBUFFERS];
-pthread_mutex_t input_lock;
+static long long int inputcounter[NUMBUFFERS];
+static char *inputbuffer[NUMBUFFERS];
+static int inputfull[NUMBUFFERS];
+static int inputlast[NUMBUFFERS];
+static pthread_mutex_t input_ring_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t input_ring_cond = PTHREAD_COND_INITIALIZER;
 
 static uint64_t socket_now_ns(void)
 {
@@ -60,10 +62,12 @@ static uint64_t socket_now_ns(void)
    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
 
-/* Legacy pipe mode uses the three buffer mutexes as ownership hand-offs, not
- * just exclusion: the reader keeps the buffer being filled locked, then
- * unlocks it for sendout_thread and blocks on the next buffer.  input_lock is
- * a completion latch held by the sender thread for its entire lifetime. */
+/* Legacy pipe mode passes buffers through a ring: xferdata fills a buffer
+ * only while it is empty and hands it over by marking it full; sendout_thread
+ * sends full buffers in order and marks them empty again.  Each side waits on
+ * input_ring_cond for its next buffer, so neither can overtake the other, and
+ * the buffer handed over with inputlast set ends the stream.  xferdata joins
+ * sendout_thread before it returns. */
 
 /* Legacy stdin/command-pipe sender.  File-to-file transfers use the labeled
  * segment workers below, where short I/O and socket errors are handled. */
@@ -71,54 +75,67 @@ void *sendout_thread(void *arg)
 {
    struct argdata *AD = arg;
    int current = 0;
-   int didsomething = 1;
+   int last = 0;
    unsigned int snum = 0;
-   int written;
-   int offset = 0;
 
    DEBUG0("start sendout_thread\n");
    DEBUGSYNC;
-   pthread_mutex_lock(&input_lock);
-   while(didsomething)
+   while (!last)
    {
-      didsomething = 0;
-      DEBUG1("sendout_thread: wait on lock buffer %d\n",current);
-      pthread_mutex_lock(&inputmutex[current]);
-      DEBUG1("sendout_thread: process buffer %d\n",current);
-      while (inputcounter[current] > 0)
+      long long count, offset = 0;
+
+      pthread_mutex_lock(&input_ring_lock);
+      while (!inputfull[current])
+         pthread_cond_wait(&input_ring_cond, &input_ring_lock);
+      count = inputcounter[current];
+      last = inputlast[current];
+      pthread_mutex_unlock(&input_ring_lock);
+      DEBUG1("sendout_thread: process buffer %d\n", current);
+
+      /* Deal the buffer out one packetsize block per socket in turn.  Each
+       * block goes to its socket whole: the receiver reads exactly one block
+       * from each socket in the same order, so letting the rest of a short
+       * write spill onto the next socket would reorder the stream. */
+      while (count > 0)
       {
-         size_t towrite = inputcounter[current] < AD->packetsize
-                        ? (size_t)inputcounter[current]  /* poss. last buffer */
-                        : (size_t)AD->packetsize;
-         written = write(sockfd[snum], inputbuffer[current]+offset, towrite);
-         if (written < 0 && errno == EINTR)
-            continue;
-         if (written <= 0)
+         size_t block = count < (long long)AD->packetsize
+                      ? (size_t)count : (size_t)AD->packetsize;
+         size_t done = 0;
+         while (done < block)
          {
-            /* A failed socket write used to be subtracted as -1, growing the
-             * counter and spinning forever.  The pipe path has no resume
-             * state, so a dead stream is a fatal transport error. */
-            fprintf(stderr, "MSC pipe-mode socket write failed: %s\n",
-                    strerror(errno));
-            exit(MSC_EXIT_NETWORK);
+            ssize_t written = write(sockfd[snum],
+                                    inputbuffer[current] + offset + done,
+                                    block - done);
+            if (written < 0 && errno == EINTR)
+               continue;
+            if (written <= 0)
+            {
+               /* The pipe path has no resume state, so a dead stream is a
+                * fatal transport error. */
+               fprintf(stderr, "MSC pipe-mode socket write failed: %s\n",
+                       strerror(errno));
+               exit(MSC_EXIT_NETWORK);
+            }
+            done += (size_t)written;
          }
-         inputcounter[current] -= written;
-         offset += written;
+         count -= (long long)block;
+         offset += (long long)block;
          snum++;
          if (snum >= AD->numstreams)
             snum = 0;
-         didsomething = 1;
       }
-      offset = 0;
-      /* The loop above should drain this buffer completely. Reset it here so
-       * a later pass cannot resend stale bytes if a short-write path changes. */
+
+      /* hand the emptied buffer back to xferdata */
+      pthread_mutex_lock(&input_ring_lock);
       inputcounter[current] = 0;
-      pthread_mutex_unlock(&inputmutex[current]);
+      inputfull[current] = 0;
+      pthread_cond_broadcast(&input_ring_cond);
+      pthread_mutex_unlock(&input_ring_lock);
       current++;
       if (current >= NUMBUFFERS)
          current = 0;
    }
-   pthread_mutex_unlock(&input_lock);
+   DEBUG0("sendout_thread: done\n");
    return NULL;
 }
 
@@ -174,86 +191,80 @@ void opensockets(struct argdata *AD)
 
 void xferdata(FILE * in, struct argdata *AD)
 {
-   int n = 1;
    int lc;
    pthread_t threadid;
    int currentbuffer = 0;
-   int oldbuffer;
-   int buffersize = 1024*AD->packetsize;
-   int toread;
+   /* A whole number of packetsize blocks per buffer (see sendout_thread),
+    * about 64 MiB and at least one block. */
+   long long blocks = (64LL * 1024 * 1024) / AD->packetsize;
+   long long buffersize;
    long long int xfcount = 0;
 
+   if (blocks < 1)
+      blocks = 1;
+   if (blocks > 1024)
+      blocks = 1024;
+   buffersize = blocks * AD->packetsize;
    DEBUG0("in xferdata\n");
    DEBUGSYNC;
-       /* set up pthread and start */
    for (lc = 0; lc < NUMBUFFERS; lc++)
    {
-      inputbuffer[lc] = checkmalloc(buffersize, "inputbuffer");
+      inputbuffer[lc] = checkmalloc((size_t)buffersize, "inputbuffer");
       inputcounter[lc] = 0;
-      pthread_mutex_init(&inputmutex[lc], NULL);
-      pthread_mutex_init(&input_lock, NULL);
+      inputfull[lc] = 0;
+      inputlast[lc] = 0;
    }
-        /* grab lock on first buffer, then start output thread */
-   pthread_mutex_lock(&inputmutex[currentbuffer]);
-   pthread_create(&threadid, NULL, &sendout_thread, AD);
-
+   if (pthread_create(&threadid, NULL, &sendout_thread, AD) != 0)
+   {
+      fprintf(stderr, "MSC could not start the pipe-mode sender thread\n");
+      exit(MSC_EXIT_INTERNAL);
+   }
 
    DEBUG0("xferdata start xfer\n");
    DEBUGSYNC;
-   while (n > 0)
+   for (;;)
    {
-               /* read data from input stream */
-      if (AD->xferlen != 0) /* limit on data transferred */
-      {
-         if ((AD->xferlen - xfcount) > buffersize)
-            toread = buffersize;
-         else
-            toread = AD->xferlen - xfcount;
-      }
+      long long toread;
+      size_t n;
+
+      /* wait until sendout_thread has emptied this buffer */
+      pthread_mutex_lock(&input_ring_lock);
+      while (inputfull[currentbuffer])
+         pthread_cond_wait(&input_ring_cond, &input_ring_lock);
+      pthread_mutex_unlock(&input_ring_lock);
+
+      if (AD->xferlen != 0 && AD->xferlen - xfcount < buffersize)
+         toread = AD->xferlen - xfcount;   /* limit on data transferred */
       else
-      {
          toread = buffersize;
-      }
-
-      inputcounter[currentbuffer] = fread(inputbuffer[currentbuffer], 1,
-                                              toread, in);
-
-      n = inputcounter[currentbuffer];
-        /* track how much data we have read */
-      xfcount += n;
-      DEBUG1("xferdata read from file to buffer %d\n",currentbuffer);
-      /* fread on a blocking stream returns short only at EOF or error, so no
-       * separate EOF probe is needed.  The old one-byte probe read could
-       * consume and silently discard a byte of pipe data. */
+      /* fread on a blocking stream returns short only at EOF or error */
+      n = toread > 0 ? fread(inputbuffer[currentbuffer], 1, (size_t)toread, in) : 0;
+      xfcount += (long long)n;
       if (n == 0 && ferror(in) != 0)
       {
          fprintf(stderr, "MSC pipe-mode input read failed\n");
          exit(MSC_EXIT_SOURCE);
       }
+      DEBUG1("xferdata read from file to buffer %d\n", currentbuffer);
 
-      if (n > 0)
-      {
-                 /* change buffers and give full one to output thread */
-         oldbuffer = currentbuffer;
-         currentbuffer++;
-         if (currentbuffer >= NUMBUFFERS)
-            currentbuffer = 0;
-         DEBUG1("xferdata lock mutex %d\n",currentbuffer);
-         pthread_mutex_lock(&inputmutex[currentbuffer]);
-         DEBUG1("xferdata unlock mutex %d\n",oldbuffer);
-         pthread_mutex_unlock(&inputmutex[oldbuffer]);
-      }
-      else
-      {
-         /* read returned zero, shut down */
-         /* in robust program, check for EAGAIN */
-         
-         DEBUG1("xferdata shutdown unlock mutex %d\n",currentbuffer);
-         pthread_mutex_unlock(&inputmutex[currentbuffer]);
-         DEBUG0("xferdata shutdown lock input_lock\n");
-         pthread_mutex_lock(&input_lock); /* wait for thread to exit */
-         DEBUG0("xferdata shutdown post input_lock\n");
-      }
+      /* hand it over; an empty read ends the stream */
+      pthread_mutex_lock(&input_ring_lock);
+      inputcounter[currentbuffer] = (long long)n;
+      inputlast[currentbuffer] = n == 0;
+      inputfull[currentbuffer] = 1;
+      pthread_cond_broadcast(&input_ring_cond);
+      pthread_mutex_unlock(&input_ring_lock);
+      if (n == 0)
+         break;
+      currentbuffer++;
+      if (currentbuffer >= NUMBUFFERS)
+         currentbuffer = 0;
+   }
+   pthread_join(threadid, NULL);
+   for (lc = 0; lc < NUMBUFFERS; lc++)
+   {
+      free(inputbuffer[lc]);
+      inputbuffer[lc] = NULL;
    }
    AD->childinfo->xfercount = xfcount;
 }

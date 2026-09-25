@@ -73,11 +73,55 @@ echo "ok: implicit, -T and -U all deliver the file intact"
 
 # ---- stdin and -c belong to TCP -------------------------------------------
 # The implicit case must fall back rather than break the documented pipeline.
+rc=0
 cat "$work/src" | timeout 120 "$MSC" -n4 -l localhost -r localhost -B "$MSC" \
-   -c "cat > '$work/out.pipe'" >/dev/null 2>"$work/log.pipe"
-cmp -s "$work/src" "$work/out.pipe" \
-   || { echo "FAIL: piped -c transfer corrupted the file or produced nothing"; exit 1; }
+   -c "cat > '$work/out.pipe'" >/dev/null 2>"$work/log.pipe" || rc=$?
+if ! cmp -s "$work/src" "$work/out.pipe"; then
+   echo "FAIL: piped -c transfer corrupted the file or produced nothing"
+   echo "      (msc exited $rc; wrote $(wc -c < "$work/out.pipe" 2>/dev/null || echo no) of $(wc -c < "$work/src") bytes); msc reported:"
+   tail -20 "$work/log.pipe" | sed 's/^/   /'
+   exit 1
+fi
 echo "ok: stdin | msc ... -c CMD still transfers under the UDP default"
+
+# ---- the pipe path itself --------------------------------------------------
+# Larger than one 2 MiB receive buffer, from stdin and from a file.  By the time
+# msc returns, the command must have finished: seen end of input and run what
+# follows it.
+head -c 8388608 /dev/urandom > "$work/big"
+for shape in stdin file; do
+   rm -f "$work/out.big" "$work/done.big"
+   rc=0
+   if [ "$shape" = stdin ]; then
+      timeout 120 "$MSC" -n4 -l localhost -r localhost -B "$MSC" \
+         -c "cat > '$work/out.big'; echo done > '$work/done.big'" \
+         < "$work/big" >/dev/null 2>"$work/log.big" || rc=$?
+   else
+      timeout 120 "$MSC" -n4 -l localhost -r localhost -B "$MSC" -i "$work/big" \
+         -c "cat > '$work/out.big'; echo done > '$work/done.big'" \
+         >/dev/null 2>"$work/log.big" || rc=$?
+   fi
+   if [ "$rc" -ne 0 ] || ! cmp -s "$work/big" "$work/out.big" ||
+      [ ! -f "$work/done.big" ]; then
+      echo "FAIL: 8 MiB $shape -> -c: msc exited $rc, $(wc -c < "$work/out.big" 2>/dev/null || echo no) of 8388608 bytes arrived, and the command"
+      if [ -f "$work/done.big" ]; then echo "      finished"; else echo "      had not finished (never saw end of input?)"; fi
+      echo "      msc reported:"
+      tail -20 "$work/log.big" | sed 's/^/   /'
+      exit 1
+   fi
+   echo "ok: 8 MiB $shape -> -c arrives intact and the command has finished"
+done
+
+# A command that fails is a destination failure, not a successful transfer.
+rc=0
+"$MSC" -n4 -l localhost -r localhost -B "$MSC" -i "$work/src" \
+   -c "cat > /dev/null; exit 3" >/dev/null 2>"$work/log.cmdfail" || rc=$?
+if [ "$rc" -ne 4 ]; then
+   echo "FAIL: a -c command that exited 3 made msc exit $rc, want 4 (destination)"
+   tail -5 "$work/log.cmdfail" | sed 's/^/   /'
+   exit 1
+fi
+echo "ok: a failing -c command makes msc exit 4"
 
 # Proof that it fell back, rather than UDP quietly coping: a UDP-only control
 # topology is refused on this shape, and the refusal names the reason.
