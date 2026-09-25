@@ -10,6 +10,11 @@
  * Env:
  *   MSC_TEST_LISTEN_LOG=PATH   append one line per successful listen() on a
  *                              TCP socket (unset = pure pass-through)
+ *   MSC_TEST_LISTEN_DELAY_MS=N sleep N ms before every listen(), widening the
+ *                              gap between a receiver binding its port and
+ *                              accepting on it, so a receiver that announces
+ *                              its port before listening loses the race to the
+ *                              sender deterministically instead of rarely
  *
  * The log is opened O_APPEND per call, so the sender, the receiver and any
  * forked children can all share one file without coordinating.
@@ -20,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 
@@ -33,6 +39,14 @@ int listen(int fd, int backlog)
 
    if (real_listen == NULL)
       real_listen = (int (*)(int, int))dlsym(RTLD_NEXT, "listen");
+   path = getenv("MSC_TEST_LISTEN_DELAY_MS");
+   if (path != NULL && path[0] != '\0')
+   {
+      long ms = strtol(path, NULL, 10);
+      struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+      if (ms > 0)
+         nanosleep(&ts, NULL);
+   }
    rc = real_listen(fd, backlog);
 
    path = getenv("MSC_TEST_LISTEN_LOG");

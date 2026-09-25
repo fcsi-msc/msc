@@ -41,7 +41,7 @@ head -c 8388608 /dev/urandom > "$work/src"
 count_listeners() {
    log="$work/listens"
    : > "$log"
-   LD_PRELOAD="$LISTEN_SHIM" MSC_TEST_LISTEN_LOG="$log" "$@" >/dev/null 2>&1 || true
+   LD_PRELOAD="$LISTEN_SHIM" MSC_TEST_LISTEN_LOG="$log" "$@" >"$work/run.$arm.log" 2>&1 || true
    wc -l < "$log" | tr -d ' '
 }
 
@@ -52,7 +52,11 @@ run_arm() {
    MSC_SSH="$work/fakessh" export MSC_SSH
    peak=$(count_listeners "$MSC" -U -n4 -l localhost -r localhost -B "$MSC" \
                          -i "$work/src" -o "$out")
-   cmp -s "$work/src" "$out" || { echo "FAIL: $arm corrupted or produced no output"; exit 1; }
+   if ! cmp -s "$work/src" "$out"; then
+      echo "FAIL: $arm corrupted or produced no output; msc reported:"
+      tail -20 "$work/run.$arm.log" | sed 's/^/   /'
+      exit 1
+   fi
    echo "$arm: bytes ok, msc TCP listen() calls = ${peak:-0}"
    echo "${peak:-0}"> "$work/peak.$arm"
 }
@@ -70,6 +74,27 @@ for arm in stdio stdio1; do
       echo "FAIL: MSC_UDP_CTL=$arm opened a listening TCP port"
       exit 1
    fi
+done
+
+# Listen before announcing.  A receiver must already be accepting on its port
+# when it tells the sender which port to dial (MSC-CONNECT): a sender that
+# dials a bound-but-not-yet-listening port is refused.  Delaying listen() makes
+# the wrong order fail every time instead of only on a slow machine.  Covers
+# the TCP control channel (-U with MSC_UDP_CTL=tcp) and the TCP transport (-T).
+for transport in -U -T; do
+   out="$work/out.slowlisten$transport"
+   rm -f "$out"
+   MSC_UDP_CTL=tcp LD_PRELOAD="$LISTEN_SHIM" MSC_TEST_LISTEN_DELAY_MS=300 \
+      MSC_SSH="$work/fakessh" timeout 60 "$MSC" "$transport" -n4 -l localhost \
+      -r localhost -B "$MSC" -i "$work/src" -o "$out" \
+      > "$work/run.slowlisten.log" 2>&1 || true
+   if ! cmp -s "$work/src" "$out"; then
+      echo "FAIL: $transport with a slow listen() -- the receiver announced its"
+      echo "      port before listening on it; msc reported:"
+      tail -5 "$work/run.slowlisten.log" | sed 's/^/   /'
+      exit 1
+   fi
+   echo "$transport: receiver listens before announcing its port"
 done
 
 # Recursive checkpoint records share the same stdio abstraction as manifests.

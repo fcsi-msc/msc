@@ -699,7 +699,14 @@ void readsocket(int numstreams, int newsockfds[], FILE * outfile, int buffsize)
    pthread_mutex_destroy(&worker_lock);
 }
 
-/*open socket and bind to port */
+/* Open a socket, bind it to the first free port in the range, and listen.
+ *
+ * Listening here, before returning, is what makes the port safe to announce:
+ * the caller prints it (MSC-CONNECT) straight away, and a sender that dials a
+ * bound-but-not-yet-listening port is refused.  It also settles contention
+ * between receivers on one host: SO_REUSEADDR lets two sockets bind the same
+ * port, but only one can listen, so the other moves on to the next port
+ * instead of announcing a port it cannot serve. */
 void bindsocket(unsigned int portnum, unsigned int port_tries,
                 int *socketfd, int *finalport)
 {
@@ -708,27 +715,31 @@ void bindsocket(unsigned int portnum, unsigned int port_tries,
    int portno;
    int reuse = 1;
 
-   *socketfd = socket(AF_INET, SOCK_STREAM, 0);
-   if (*socketfd < 0)
-   {
-      perror("ERROR opening socket");
-      exit(MSC_EXIT_INTERNAL);
-   }
-   setsockopt(*socketfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
    bzero((char *) &serv_addr, sizeof(struct sockaddr_in));
    serv_addr.sin_family = AF_INET;
    serv_addr.sin_addr.s_addr = INADDR_ANY;
    if (port_tries == 0) port_tries = 100;
    for (numtries = 0; numtries < (int)port_tries; numtries++)
    {
+      /* a fresh socket per port: a socket that bound but failed to listen
+       * cannot be bound again */
+      *socketfd = socket(AF_INET, SOCK_STREAM, 0);
+      if (*socketfd < 0)
+      {
+         perror("ERROR opening socket");
+         exit(MSC_EXIT_INTERNAL);
+      }
+      setsockopt(*socketfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
       portno = portnum + numtries;
       serv_addr.sin_port = htons(portno);
-      if (bind(*socketfd,(struct sockaddr *) &serv_addr, 
-            sizeof(serv_addr)) >= 0)
+      if (bind(*socketfd, (struct sockaddr *) &serv_addr,
+               sizeof(serv_addr)) >= 0 &&
+          listen(*socketfd, SOMAXCONN) == 0)
       {
          *finalport = portno;
-         return;   /* finished binding */
+         return;   /* bound and accepting connections */
       }
+      close(*socketfd);
    }
    fprintf(stderr,"Couldn't bind to any address. Tried %d to %d\n",
            portnum, portnum + port_tries - 1);
@@ -752,14 +763,6 @@ void acceptsocket(int numaccepts, int socketfd, int newsockfds[],
    struct sockaddr_in cli_addr;
    struct sigaction act;
    int buffer_size = TCP_SOCKET_BUFFER;
-   int backlog = numaccepts;
-
-   if (backlog < 16)
-      backlog = 16;
-#ifdef SOMAXCONN
-   if (backlog > SOMAXCONN)
-      backlog = SOMAXCONN;
-#endif
 
    DEBUG1("in acceptsocket, numaccepts %d\n", numaccepts);
    DEBUGSYNC;
@@ -770,11 +773,8 @@ void acceptsocket(int numaccepts, int socketfd, int newsockfds[],
            /* set alarm to die if we don't get accepts on socket */
    sigaction(SIGALRM, &act, NULL);
    alarm(ACCEPT_TIMEOUT_SECONDS); /* set timer.  die if it goes off */
-   if (listen(socketfd, backlog) != 0)
-   {
-      perror("ERROR on listen");
-      exit(MSC_EXIT_NETWORK);
-   }
+   /* socketfd is already listening: bindsocket() listens before the port is
+    * announced to the sender */
    
    for (snum = 0; snum < numaccepts; snum++)
    {
