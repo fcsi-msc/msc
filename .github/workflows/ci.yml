@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.cc }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        if: matrix.cc == 'clang'
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Build with warnings as errors
+        env:
+          CC: ${{ matrix.cc }}
+          CFLAGS: -O2 -g -Werror
+        run: make -j"$(nproc)" all
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # The suites push multi-gigabit loopback UDP; the stock 208 KiB socket
+      # buffer ceiling makes the throughput-gated WAN tests needlessly noisy.
+      - name: Raise socket buffer limits
+        run: sudo sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304
+      - name: Build
+        run: make -j"$(nproc)" all
+      - name: Run the test suites
+        run: make check
+
+  sanitizers:
+    name: sanitizers (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    env:
+      ASAN_OPTIONS: verify_asan_link_order=0:detect_leaks=0
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Raise socket buffer limits
+        run: sudo sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304
+      # The LD_PRELOAD test shims stay uninstrumented; only msc and the
+      # harnesses carry the sanitizers.
+      - name: Build the test shims
+        run: make shims/wan_shim.so shims/storage_fault_shim.so shims/listen_count_shim.so udp_offload_shim.so
+      # The throughput-gated wanshim suite is left out: sanitizer slowdown
+      # would trip its floors without saying anything about memory safety.
+      - name: Run the suites under ASan + UBSan
+        env:
+          CFLAGS: -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined
+          LDFLAGS: -fsanitize=address,undefined
+        run: |
+          make udp_parity
+          make resume_suite
+
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -s sh -S warning *.sh

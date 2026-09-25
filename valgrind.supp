@@ -1,0 +1,14 @@
+# glibc caches joined threads' stacks and TLS (dtv) blocks for reuse; the
+# cache holds interior pointers, so memcheck classifies them "possibly lost"
+# even after every pthread_join succeeded.  This is allocator behavior, not an
+# MSC leak -- suppress it so `make valgrind` stays a strict pass/fail gate.
+{
+   glibc-cached-thread-tls-dtv
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   ...
+   fun:_dl_allocate_tls
+   ...
+   fun:pthread_create*
+}

@@ -1,0 +1,16 @@
+# Build outputs
+*.o
+*.so
+/msc
+/recursive_test
+/segmented_test
+/child_status_test
+/udp_test
+/udp_protocol_test
+/resume_test
+/retry_test
+/exit_code_test
+/stall_timeout_test
+/port_spec_test
+/port_squat
+/shims/wan_shim_test
