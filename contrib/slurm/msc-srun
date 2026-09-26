@@ -1,0 +1,28 @@
+#!/bin/sh
+# msc-srun - start msc's remote side with Slurm's srun instead of ssh.
+#
+# msc launches the receiving msc through the program named by MSC_SSH, and
+# calls it the way it calls ssh:
+#
+#     PROGRAM [-o option]... [user@]host command
+#
+# On clusters where compute nodes cannot ssh to each other, point MSC_SSH at
+# this script and run msc from inside a job allocation that includes the
+# receiving node:
+#
+#     MSC_SSH=/path/to/msc-srun msc -l localhost -r node02 -i src -o dst
+#
+# The host given to msc with -r is used as the Slurm node name.  If msc has to
+# reach that node at a different address -- for example its InfiniBand IP,
+# when compute nodes cannot resolve each other's names -- give msc the address
+# and name the node in MSC_SRUN_NODE:
+#
+#     MSC_SSH=/path/to/msc-srun MSC_SRUN_NODE=node02 msc -l localhost -r 192.168.10.2 ...
+#
+# ssh's -o options have no srun equivalent and are skipped, and the user@ part
+# is ignored: the job step already runs as you.  --overlap (Slurm 20.11 or
+# later) lets this step share the allocation with the step msc runs in.
+while [ "$1" = "-o" ]; do shift 2; done
+host=${1#*@}
+shift
+exec srun --overlap -N1 -n1 -w "${MSC_SRUN_NODE:-$host}" -u /bin/sh -c "$*"

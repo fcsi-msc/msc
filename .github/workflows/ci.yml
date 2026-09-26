@@ -67,4 +67,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck -s sh -S warning *.sh
+      - run: |
+          shellcheck -s sh -S warning *.sh contrib/slurm/msc-srun
+          shellcheck -S warning contrib/slurm/msc-slurm-smoke.sh
