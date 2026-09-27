@@ -24,7 +24,7 @@ From the repository root:
 
 ```sh
 make clean all
-make udp_parity udp_resume_suite resume_suite wanshim
+make check
 ```
 
 | Target | Coverage |
@@ -36,12 +36,19 @@ make udp_parity udp_resume_suite resume_suite wanshim
 | `transport_suite` | UDP default, explicit `-T`/`-U`, stdin/command TCP fallback, and invalid combinations. |
 | `dest_stripe_suite` | Destination-stripe option parsing, restrictions, and forwarding. |
 | `wanshim` | Synthetic WAN smoke, a WAN profile with throughput/retransmission gates, and MTU black-hole behavior. |
-| `shim_check` | Emulator passthrough, delay, loss, combined conditions, and seeded behavior. |
-| `valgrind`, `helgrind` | Memory checks and a TCP worker race pass; see [Valgrind](valgrind.md). |
+| `shim_check` | Emulator passthrough, delay, loss, and seeded behavior; GSO/sendmmsg datagram equivalence, MTU, scatter/gather and TOS preservation. |
+| `udp_regressions` | Small MTUs, exhausted PMTUD, bounded ring wraparound under loss, fsync worker failures and syscall coverage, publication errors, and growing hardlink indexes. |
+| `valgrind`, `helgrind`, `helgrind_udp` | Memory checks, TCP worker races, and UDP telemetry/shared-socket/offload-fallback races; see [Valgrind](valgrind.md). |
 
 Avoid `make clean` in a checkout where another process is building or testing.
 Use an independent copy/worktree when changing compiler flags or running
 multiple development experiments.
+
+With noninteractive sudo and mount-namespace support, `sh mapped_enospc_test.sh`
+tests real ENOSPC on a private 1 MiB tmpfs. MSC runs as the invoking user; only
+namespace creation/mounting uses root. The mount never propagates to the host,
+is bounded by a timeout, and is removed on exit. This optional test is separate
+from `make check`, which needs no administrative access.
 
 ## Direct harnesses
 
@@ -67,6 +74,7 @@ Always compare outputs even when an internal checksum is enabled.
 | `MSC_UDP_CONTROL_DROP` | Loss in the optional UDP control shim, including handshake/ACK/FIN frames. |
 | [wan_shim.c](../shims/wan_shim.c) | Preload-based UDP delay, jitter, independent loss, duplication, initial ACK/FIN drops, and MTU black holes. |
 | [storage_fault_shim.c](../shims/storage_fault_shim.c) | Destination write failures after a byte threshold; used with the non-mapped write path. |
+| [fsync_fault_shim.c](../shims/fsync_fault_shim.c) | Worker creation failures, fsync recording, and forced file/directory sync errors. |
 | [udp_offload_shim.c](../udp_offload_shim.c) | Unsupported GSO/GRO fallback paths. |
 | [listen_count_shim.c](../shims/listen_count_shim.c) | Records TCP `listen()` calls to verify the stdio port footprint. |
 

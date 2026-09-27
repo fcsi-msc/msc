@@ -14,3 +14,13 @@
 /port_spec_test
 /port_squat
 /shims/wan_shim_test
+__pycache__/
+*.pyc
+/benchmarks/manifest_scan
+
+# Local engineering notes and measurement artifacts; keep source releases clean.
+/docs/performance-release-review.md
+/docs/implementation-results.md
+/benchmarks/results/
+/benchmarks/proposals/
+/benchmarks/thread_failure_shim.c

@@ -15,8 +15,8 @@ Run `msc -h` or `msc man` for offline help.
 | `-B PATH` | Remote MSC executable; default `msc` on the remote PATH. |
 | `-T`, `-U` | TCP or reliable UDP; UDP is default. Stdin/command shapes automatically use TCP unless explicit `-U` makes them an error. |
 | `-R` | Recursive tree; requires one pair and rejects offsets/slices. |
-| `-n N` | Parallel streams/flows. Defaults: single UDP file 30, tree 64, single TCP file 8, pipe 30. Maximum UDP 256; TCP 2,048. |
-| `-s BYTES` | TCP chunk size (default 1 MiB), or explicit UDP file payload. Implicit UDP payload is PMTUD-selected from a 1,400-byte baseline. |
+| `-n N` | Parallel streams/flows. Defaults: UDP file/tree 8, TCP tree 64, TCP file 8, pipe 30. Maximum UDP 256; TCP 2,048. |
+| `-s BYTES` | TCP chunk size (default 1 MiB), or explicit UDP file payload. Implicit UDP payload uses the confirmed PMTUD ceiling; 1,400 bytes when probing is disabled. |
 | `-a BYTES`, `-b BYTES`, `-t BYTES` | Source offset, destination offset, transfer length; zero length means remaining source. Checkpointed UDP rejects these. |
 | `-I HOST` | Address used by the UDP sender; does not select a local interface by device name. |
 | `-p PORT` | Socket-based rendezvous starts here; default 16400. Default SSH stdio control needs no such listener. |
@@ -41,7 +41,7 @@ Run `msc -h` or `msc man` for offline help.
 | `--reconnect-interval D` | Checkpointed-transfer SSH reconnect interval; default 10 s, zero disables. |
 | `--progress=auto\|always\|never` | Progress on stderr; default auto. |
 | `--progress-interval D` | Progress cadence; default 1 s. |
-| `-x` | Print proposed commands for a multiple-machine transfer. |
+| `-x` | Print shell-quoted restart commands for a multiple-machine transfer. May be the first option. |
 | `-h`, `man` | Short help or embedded manual. |
 
 Use explicit `ms`, `s`, or `m` suffixes for duration arguments. Port flags apply
@@ -147,6 +147,7 @@ Defaults below are the base values before profile adjustments.
 | `MSC_UDP_PMTUD_CAP` | Positive implicit file-payload ceiling in bytes; CLI 9,000, engine 2,016. |
 | `MSC_UDP_GSO`, `MSC_UDP_GRO` | Offload booleans; CLI sets both from flags, default on. |
 | `MSC_UDP_RECV_BATCH` | Positive receive slots and write-coalescing limit; default 64, capped at 1,024. |
+| `MSC_UDP_RETRANSMIT_MB` | Aggregate sender payload-cache and ring-metadata budget in MiB; default 512. Integer range 1–1,048,576. Power-of-two per-flow rings shrink for smaller transfers, never exceed 16,384 slots, and reserve one unused slot. Does not include I/O buffers, mappings, receiver queues, or kernel socket memory. |
 | `MSC_UDP_SOCK_BUFFER` | Positive initial buffer request in bytes; base 16 MiB, kernel-clamped. Explicit setting disables automatic receive seeding. |
 | `MSC_UDP_SOCK_AUTOTUNE` | 0 disables buffer autotuning; default on. |
 | `MSC_UDP_AUTOTUNE_MAX` | Positive autotune ceiling in bytes; 256 MiB, capped at `INT_MAX`; kernel limits still apply. |

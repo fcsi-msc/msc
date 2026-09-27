@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1325,6 +1326,7 @@ struct dmx_queue
 struct msc_udp_receive_demux
 {
    int fd;
+   int wakefd;        /* wake a blocked poll immediately during teardown */
    int nflows;        /* TOTAL flows in the transfer (global flow_id space) */
    int qbase, qstride; /* this demux owns flows where f % qstride == qbase */
    int nq;            /* owned-flow count = queues allocated */
@@ -1334,6 +1336,7 @@ struct msc_udp_receive_demux
    struct sockaddr_storage peer; /* sender addr: acknowledgments + control sendto it */
    socklen_t peerlen;
    int have_peer;
+   pthread_mutex_t peer_lock;
    struct dmx_queue ctlq;
    struct dmx_queue *flowq;      /* nq entries; flow f lives at f / qstride */
    uint64_t rx_dgrams, gro_slots, gro_segs, drop_unroutable;
@@ -1503,15 +1506,15 @@ static void *dmx_thread(void *arg)
 
    while (!atomic_load(&d->stop))
    {
-      struct pollfd p;
+      struct pollfd p[2] = { { .fd = d->fd, .events = POLLIN },
+                            { .fd = d->wakefd, .events = POLLIN } };
       int got, k;
       int r;
-      p.fd = d->fd;
-      p.events = POLLIN;
-      r = poll(&p, 1, 20);   /* short slices so stop is honored promptly */
+      r = poll(p, 2, 20);   /* timeout also covers unavailable eventfd */
       if (r < 0 && errno != EINTR)
          break;
-      if (r <= 0 || !(p.revents & POLLIN))
+      if (atomic_load(&d->stop)) break;
+      if (r <= 0 || !(p[0].revents & POLLIN))
          continue;
       for (k = 0; k < DMX_BATCH; k++)
       {
@@ -1538,13 +1541,17 @@ static void *dmx_thread(void *arg)
          size_t pos;
 
          d->rx_dgrams++;
-         if (!d->have_peer && msgs[k].msg_hdr.msg_namelen > 0)
+         if (!d->have_peer && msgs[k].msg_hdr.msg_namelen > 0 &&
+             msgs[k].msg_hdr.msg_namelen <= sizeof(d->peer))
          {
+            /* Only this thread writes have_peer; readers use peer_lock. */
+            pthread_mutex_lock(&d->peer_lock);
             /* all flows share one sender peer: stash the source once so the
              * receiver's acknowledgments have a sendto target */
             memcpy(&d->peer, &names[k], msgs[k].msg_hdr.msg_namelen);
             d->peerlen = msgs[k].msg_hdr.msg_namelen;
             d->have_peer = 1;
+            pthread_mutex_unlock(&d->peer_lock);
          }
          for (c = CMSG_FIRSTHDR(&msgs[k].msg_hdr); c != NULL;
               c = CMSG_NXTHDR(&msgs[k].msg_hdr, c))
@@ -1598,10 +1605,12 @@ struct msc_udp_receive_demux *msc_udp_receive_demux_start(int fd, int nflows, in
    }
    memset(d, 0, sizeof(*d));
    d->fd = fd;
+   d->wakefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
    d->nflows = nflows;
    d->qbase = qbase;
    d->qstride = qstride;
    d->nq = (nflows - qbase + qstride - 1) / qstride;
+   pthread_mutex_init(&d->peer_lock, NULL);
    dmxq_init(&d->ctlq, DMX_CTLQ_CAP);
    d->flowq = msc_udp_alloc(sizeof(*d->flowq) * (size_t)d->nq, "demux flow queues");
    for (f = 0; f < d->nq; f++)
@@ -1645,11 +1654,25 @@ int msc_udp_receive_demux_pop(struct msc_udp_receive_demux *d, int flow, void *b
 
 int msc_udp_receive_demux_peer(struct msc_udp_receive_demux *d, struct sockaddr_storage *ss, socklen_t *len)
 {
-   if (d == NULL || !d->have_peer)
-      return -1;
+   if (d == NULL) return -1;
+   pthread_mutex_lock(&d->peer_lock);
+   if (!d->have_peer)
+   { pthread_mutex_unlock(&d->peer_lock); return -1; }
    memcpy(ss, &d->peer, sizeof(*ss));
    *len = d->peerlen;
+   pthread_mutex_unlock(&d->peer_lock);
    return 0;
+}
+
+void msc_udp_receive_demux_request_stop(struct msc_udp_receive_demux *d)
+{
+   if (d != NULL && !atomic_exchange(&d->stop, 1) && d->wakefd >= 0)
+   {
+      uint64_t one = 1;
+      ssize_t n;
+      do { n = write(d->wakefd, &one, sizeof(one)); } while (n < 0 && errno == EINTR);
+      /* EAGAIN means a wake is already pending; poll's timeout is a backstop. */
+   }
 }
 
 void msc_udp_receive_demux_stop(struct msc_udp_receive_demux *d)
@@ -1657,7 +1680,7 @@ void msc_udp_receive_demux_stop(struct msc_udp_receive_demux *d)
    int f;
    if (d == NULL)
       return;
-   atomic_store(&d->stop, 1);
+   msc_udp_receive_demux_request_stop(d);
    if (d->started)
       pthread_join(d->tid, NULL);
    if (hs_stats_on())
@@ -1684,5 +1707,7 @@ void msc_udp_receive_demux_stop(struct msc_udp_receive_demux *d)
    for (f = 0; f < d->nq; f++)
       dmxq_free(&d->flowq[f]);
    free(d->flowq);
+   if (d->wakefd >= 0) close(d->wakefd);
+   pthread_mutex_destroy(&d->peer_lock);
    free(d);
 }

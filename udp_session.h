@@ -143,7 +143,8 @@ extern int msc_port_spec_contains(const struct msc_port_spec *spec, unsigned int
 #define MSC_UDP_CTL_TREE_DIR  7               /* sender -> receiver: recursive dir path */
 #define MSC_UDP_CTL_TREE_DONE 8               /* sender -> receiver: recursive complete */
 #define MSC_UDP_CTL_HELLO    9                /* both ways at session open: proto
-                                           * version + feature bits. A version
+                                           * version + feature bits; sender also
+                                           * sends a u64 initial transfer ID. A version
                                            * mismatch fails loudly here instead of
                                            * corrupting a longer wire struct. */
 #define MSC_UDP_CTL_MTU      10               /* reserved for the PMTUD probe exchange
@@ -175,8 +176,8 @@ extern int msc_port_spec_contains(const struct msc_port_spec *spec, unsigned int
 #define MSC_UDP_RECV_BATCH   64               /* packets per recvmmsg syscall */
 #define MSC_UDP_SEND_BATCH   64               /* packets per sendmmsg syscall */
 #define MSC_UDP_SOCK_BUFFER  (16*1024*1024)   /* best-effort SO_RCVBUF/SO_SNDBUF */
-#define MSC_UDP_WIN_RING     16384            /* per-flow window ring; power of two,
-                                           * also the hard window cap (units) */
+#define MSC_UDP_WIN_RING     16384            /* maximum per-flow ring slots;
+                                           * actual rings may shrink to budget */
 #define MSC_UDP_INIT_CWND    16               /* initial sender capacity (units) */
 #define MSC_UDP_MAX_SACK     16               /* SACK blocks carried per acknowledgment */
 #define MSC_UDP_DUPACK_THRESH 3               /* duplicate cum-acks that trip fast rtx */
@@ -285,11 +286,10 @@ extern int msc_port_spec_contains(const struct msc_port_spec *spec, unsigned int
  * kernel's net.core.{r,w}mem_max still clamps below this). */
 #define MSC_UDP_AUTOTUNE_MAX (256*1024*1024)
 
-/* PMTUD: ceiling on an auto-raised default payload (bytes). The probe may confirm
- * a 64 KiB loopback payload, but per-flow buffers scale with payload (retransmission cache =
- * MSC_UDP_WIN_RING * payload), so an unbounded raise would balloon memory ~46x. 2016
- * covers the IPoIB datagram-mode MTU of 2044 (payload 2016, payload 1968) -- the
- * fabric this exists for -- while keeping buffers near today's. Raise it with
+/* PMTUD: engine ceiling on an auto-raised file payload (bytes). The probe may
+ * confirm a 64 KiB loopback datagram, but per-flow I/O buffers still scale with
+ * payload even though retransmission rings now share a memory budget. Keep the
+ * conservative engine default; the CLI selects 9000. Raise it with
  * MSC_UDP_PMTUD_CAP on jumbo/connected-mode paths. An explicit -s is never raised,
  * only clamped down to what the path can actually carry. */
 #define MSC_UDP_PMTUD_PAYLOAD_CAP 2016
@@ -638,10 +638,14 @@ extern int msc_udp_receive_demux_peer(struct msc_udp_receive_demux *d, struct so
 /* Signal + join the demux thread, free the queues, print MSC_UDP_STATS metrics.
  * Two-phase shutdown: msc_udp_control_channel_close(channel) MUST run first (the FIN/ACK
  * exchange rides the still-live demux), then this, then close the fd once. */
+/* Request stop on every socket before joining any of them. Control FIN/ACK
+ * completion must precede the first request. NULL is allowed. */
+extern void msc_udp_receive_demux_request_stop(struct msc_udp_receive_demux *d);
 extern void msc_udp_receive_demux_stop(struct msc_udp_receive_demux *d);
 
 /* ===== shared helpers (udp_io.c) ======================================== */
 extern void *msc_udp_alloc(size_t size, const char *what);
+extern int msc_udp_fsync_parent(const char *path);
 extern uint64_t msc_udp_hton64(uint64_t v);
 extern uint64_t msc_udp_ntoh64(uint64_t v);
 extern int msc_udp_send_all(int fd, const void *buf, size_t n);

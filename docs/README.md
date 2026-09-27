@@ -3,7 +3,7 @@
 Start with the [project README](../README.md) for installation and examples.
 These documents describe the implementation shipped in this repository.
 Protocol details and defaults should be updated alongside the code that changes
-them; historical benchmark results are not guarantees for another path.
+them. Measure performance on the intended path and storage system.
 
 ## Build your own congestion controller
 
@@ -29,4 +29,5 @@ Read [architecture](architecture.md), then [reliability](reliability.md) and
 [congestion control](congestion-control.md). Use the [wire protocol](wire-protocol.md)
 when changing messages or interoperability. The [testing guide](testing.md) maps
 behavior to the existing suites; [Valgrind](valgrind.md) covers memory and race
-checks.
+checks. The [benchmarking guide](../benchmarks/README.md) describes repeatable
+local and wired measurements.

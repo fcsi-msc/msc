@@ -22,7 +22,7 @@
  * Current scope: single-file and recursive table transfers, sendmmsg batching,
  * optional UDP GSO/GRO, Lustre layout/OST affinity, and multi-machine worker
  * slices. Retransmissions are served directly from the retransmission-cache RAM cache. The window
- * ring bounds in-flight to MSC_UDP_WIN_RING-1 units, so per-unit metadata is
+ * ring bounds in-flight to ring_slots-1 units, so per-unit metadata is
  * O(ring), not O(file).
  */
 #include "udp_session.h"
@@ -149,7 +149,7 @@ static uint64_t g_stall_timeout_ns =
  */
 static int g_no_cc = 0;
 static uint64_t g_ack_every = MSC_UDP_ACK_EVERY;
-static double g_init_cwnd = MSC_UDP_INIT_CWND;
+static _Atomic double g_init_cwnd = MSC_UDP_INIT_CWND;
 static long g_tick_us = 200;   /* window-blocked poll; tight clock measured best */
 static int g_gso = 0;          /* MSC_UDP_GSO=1: batch sends with UDP_SEGMENT */
 static int g_gro = 0;          /* MSC_UDP_GRO=1: receiver coalesces recvs with UDP_GRO */
@@ -163,6 +163,7 @@ static int g_no_affinity = 0;  /* MSC_UDP_NO_AFFINITY=1: force the contiguous pa
  * on a non-Lustre mount. 0 means "use the real query result". */
 static uint64_t g_stripe_size = 0;
 static uint32_t g_stripe_count = 0;
+static uint64_t g_retransmit_budget = 512ULL * 1024 * 1024;
 static int g_fsync_threads = 64; /* parallel fsync workers for the tree tail flush */
 static int g_no_mmap = 0;      /* MSC_UDP_NO_MMAP=1: never mmap the dest; use the pwritev
                                 * coalescer even for base==0 (whole-file) writers. */
@@ -175,25 +176,25 @@ static int g_recv_batch = MSC_UDP_RECV_BATCH; /* MSC_UDP_RECV_BATCH=N: recvmmsg 
                                 * bigger batches -> bigger sequential writes (the whole
                                 * point: ~1 MiB writes hit Lustre's large-write rate).
                                 * Capped at 1024 (IOV_MAX). */
-static int g_pace = 0;           /* MSC_UDP_PACE=1: token-bucket pace fresh sends */
+static _Atomic int g_pace = 0;           /* MSC_UDP_PACE=1: token-bucket pace fresh sends */
 static int g_pace_set = 0;       /* user pinned MSC_UDP_PACE (a profile cannot undo it) */
-static double g_pace_gain = 1.25;   /* rate headroom over cwnd/srtt */
-static uint64_t g_pace_burst = MSC_UDP_SEND_BATCH; /* token-bucket depth (units) */
+static _Atomic double g_pace_gain = 1.25;   /* rate headroom over cwnd/srtt */
+static _Atomic uint64_t g_pace_burst = MSC_UDP_SEND_BATCH; /* token-bucket depth (units) */
 static double g_pace_rate_mbit = 0.0; /* explicit aggregate fresh-payload cap */
-static uint64_t g_pace_bootstrap_ns = 1000; /* no RTT sample yet: legacy 1 us floor */
-static uint64_t g_reorder_wait_ns = 0; /* SACK/RTO reordering hold; 0 = immediate */
-static int g_reorder_wait_set = 0;     /* an explicit knob (env or WAN_GUARD) pinned the
+static _Atomic uint64_t g_pace_bootstrap_ns = 1000; /* no RTT sample yet: legacy 1 us floor */
+static _Atomic uint64_t g_reorder_wait_ns = 0; /* SACK/RTO reordering hold; 0 = immediate */
+static _Atomic int g_reorder_wait_set = 0;     /* an explicit knob (env or WAN_GUARD) pinned the
                                         * value above; otherwise it is derived per flow
                                         * from SRTT -- see flow_reorder_wait_ns() */
-static int g_dupack_thresh = MSC_UDP_DUPACK_THRESH;
+static _Atomic int g_dupack_thresh = MSC_UDP_DUPACK_THRESH;
 /* MSC_UDP_STARTUP_QUEUE_MULT / the active profile's startup_queue_mult: STARTUP
  * gives up on the pipe once SRTT reaches this multiple of the flow's min RTT.
  * 0 = off, which is the LAN default and the historic behaviour. */
-static double g_startup_queue_mult = 0.0;
+static _Atomic double g_startup_queue_mult = 0.0;
 /* MSC_UDP_BW_RESTART / the active profile's bw_restart. 0 = a flow never
  * re-enters STARTUP, which is the LAN default and the historic behaviour. */
-static int g_bw_restart = 0;
-static int g_wan_guard = 0;      /* WAN profile engaged (MSC_UDP_WAN_GUARD=1, or auto) */
+static _Atomic int g_bw_restart = 0;
+static _Atomic int g_wan_guard = 0;      /* WAN profile engaged (MSC_UDP_WAN_GUARD=1, or auto) */
 /* Path profile (W1). The engine grew up on IB/loopback, so every default is a
  * LAN default: pacing off, dupack-3, a 2 ms RTO floor. On a 50 ms path those
  * interact into a collapse loop -- spurious RTOs cut cwnd to 1, the reopened
@@ -314,7 +315,7 @@ static const struct msc_udp_profile_def g_profile_geo = {
    "geo", 4.0, 256, 1.0, 16, 2.5, 1.5, 1
 };
 /* Which table is in force, for telemetry and for the reconsider path. */
-static const struct msc_udp_profile_def *g_profile_active;
+static const struct msc_udp_profile_def * _Atomic g_profile_active;
 static const struct msc_udp_profile_def *profile_for_rtt(uint64_t rtt_ns);
 static uint64_t g_handshake_rtt_ns = 0;  /* control-channel HELLO round trip (0 = none) */
 static uint64_t g_data_rtt_ns = 0;       /* pre-data UDP probe RTT (0 = unavailable) */
@@ -373,7 +374,7 @@ static void cc_on_ecn(struct sender_flow *g);
 static void cc_on_rto(struct sender_flow *g);
 static double g_min_cwnd = 1.0;  /* MSC_UDP_MIN_CWND: cwnd floor after any reduction */
 static int g_rto_gentle = 0;     /* MSC_UDP_RTO_GENTLE=1: RTO does cwnd*=beta, not cwnd=1 */
-static uint64_t g_min_rto_ns = MSC_UDP_MIN_RTO_NS; /* MSC_UDP_MIN_RTO_MS: RTO floor override */
+static _Atomic uint64_t g_min_rto_ns = MSC_UDP_MIN_RTO_NS; /* MSC_UDP_MIN_RTO_MS: RTO floor override */
 /* real receive window:
  *   MSC_UDP_RWND=0      revert to the constant advertised window. Default on: the
  *                   receiver advertises its real window (ring space minus the
@@ -629,6 +630,20 @@ static void read_env(void)
    const char *dupth = getenv("MSC_UDP_DUPACK_THRESH");
    const char *rwait = getenv("MSC_UDP_REORDER_WAIT_MS");
    const char *wguard = getenv("MSC_UDP_WAN_GUARD");
+   const char *memory = getenv("MSC_UDP_RETRANSMIT_MB");
+   if (memory != NULL)
+   {
+      char *end;
+      unsigned long long mb;
+      errno = 0;
+      mb = strtoull(memory, &end, 10);
+      if (errno || end == memory || *end || *memory == '-' || mb < 1 || mb > 1048576)
+      {
+         fprintf(stderr, "MSC_UDP_RETRANSMIT_MB must be an integer from 1 to 1048576\n");
+         exit(MSC_EXIT_CLI);
+      }
+      g_retransmit_budget = (uint64_t)mb * 1024 * 1024;
+   }
    if (drop != NULL)
    {
       g_drop_pct = atoi(drop);
@@ -1461,7 +1476,7 @@ static int hello_sender(int controlfd, uint64_t first_transfer_id)
    if (ver != MSC_UDP_PROTO_VERSION)
    {
       fprintf(stderr, "MSC UDP sender: protocol mismatch (receiver v%u, mine v%u) -- "
-              "rebuild both ends\n", ver, MSC_UDP_PROTO_VERSION);
+              "rebuild both ends\n", ver, (unsigned int)MSC_UDP_PROTO_VERSION);
       return -1;
    }
    g_feat_agreed = my_feature_bits() & peer;
@@ -1487,7 +1502,7 @@ static int hello_receiver(int controlfd, uint64_t *first_transfer_id)
    if (ver != MSC_UDP_PROTO_VERSION)
    {
       fprintf(stderr, "MSC UDP receiver: protocol mismatch (sender v%u, mine v%u) -- "
-              "rebuild both ends\n", ver, MSC_UDP_PROTO_VERSION);
+              "rebuild both ends\n", ver, (unsigned int)MSC_UDP_PROTO_VERSION);
       return -1;
    }
    if (recv_u64(controlfd, first_transfer_id) != 0 || *first_transfer_id == 0 ||
@@ -1864,6 +1879,9 @@ static void sockset_teardown(struct msc_udp_sockset *ss)
    int k;
    if (ss->receive_demux != NULL)
       for (k = 0; k < ss->nports; k++)
+         msc_udp_receive_demux_request_stop(ss->receive_demux[k]);
+   if (ss->receive_demux != NULL)
+      for (k = 0; k < ss->nports; k++)
          msc_udp_receive_demux_stop(ss->receive_demux[k]);   /* NULL-safe */
    free(ss->receive_demux);
    free(ss->receive_demux_of);
@@ -1921,7 +1939,10 @@ static size_t pick_payload(size_t requested)
 static int pmtud_ladder(int seed_mtu, size_t *cand, int maxn)
 {
    size_t hdr = sizeof(struct msc_udp_packet_header);
-   size_t lid[] = { sizeof(struct msc_udp_packet_header) + MSC_UDP_DEFAULT_PAYLOAD_SIZE,
+   /* A remote black hole need not appear in the local route MTU. Start below
+    * normal tunnel MTUs, including the conservative IPv4 576-byte IP size. */
+   size_t lid[] = { 548, 768, 1024, 1248,
+                    sizeof(struct msc_udp_packet_header) + MSC_UDP_DEFAULT_PAYLOAD_SIZE,
                     1472, 2016, 4068, 8972, 65507 };
    size_t lim = g_pmtud_cap + hdr;
    int n = 0;
@@ -1959,8 +1980,8 @@ static void pmtud_sleep_ms(long ms)
 
 /* sender side: fire the ladder at the receiver on flow 0 (DF set so nothing is
  * fragmented into a false positive), tell it over the control_channel, and adopt the
- * largest payload it confirms. Best-effort throughout: a total probe loss just
- * leaves g_payload_probe at 0 and payload policy falls back to the defaults. */
+ * largest payload it confirms. A total probe loss leaves g_payload_probe at 0;
+ * session opening then fails instead of assuming an unconfirmed payload. */
 /* Watch the sender's UDP socket until `until_ns` for the ack to the RTT probe
  * identified by `probe_id`, retransmitting it every `retx_gap_ns`.
  *
@@ -2414,6 +2435,7 @@ struct sender_flow
    uint64_t units;              /* part.units (loop bound) */
    uint64_t file_hint;          /* cached file index for xfer_file_of */
 
+   size_t ring_slots;          /* power of two; includes one unused slot */
    uint64_t snd_una;            /* oldest unacked local unit */
    uint64_t snd_nxt;            /* next new local unit to send */
    uint64_t recover;            /* fast-recovery episode boundary */
@@ -2460,14 +2482,15 @@ struct sender_flow
    struct msc_udp_pacer *pacer;
    uint64_t fair_starved;       /* rounds the shared bucket returned 0 (telemetry) */
 
-   /* window-ring metadata, indexed by local seq % MSC_UDP_WIN_RING */
+   /* window-ring metadata, indexed by local seq % ring_slots */
    uint64_t *sent_ns;
    uint64_t *gap_seen_ns; /* first SACK/dupack report for a hole; WAN guard only */
    uint8_t *sacked;
    uint8_t *retransmitted;
 
-   char *retransmit_cache;           /* MSC_UDP_WIN_RING * payload bytes: retransmit cache */
+   char *retransmit_cache;           /* ring_slots * payload bytes */
    unsigned int seed;
+   int gso_enabled;              /* fallback belongs to this worker */
 
    /* batch scratch for fresh sends (one pread + one sendmmsg per ~64 units) */
    char *readbuf;                       /* MSC_UDP_SEND_BATCH * payload bytes */
@@ -2544,7 +2567,7 @@ struct sender_flow
    int error;
 };
 
-#define RING_AT(arr, seq) ((arr)[(seq) & (MSC_UDP_WIN_RING - 1)])
+#define RING_AT(arr, seq) ((arr)[(seq) & (g->ring_slots - 1)])
 
 static uint64_t sender_window(const struct sender_flow *g)
 {
@@ -2553,7 +2576,7 @@ static uint64_t sender_window(const struct sender_flow *g)
    if (c < 1) c = 1;
    w = c < g->rwnd ? c : g->rwnd;
    if (w < 1) w = 1;
-   if (w > MSC_UDP_WIN_RING - 1) w = MSC_UDP_WIN_RING - 1;
+   if (w > g->ring_slots - 1) w = g->ring_slots - 1;
    return w;
 }
 
@@ -3050,7 +3073,7 @@ static void rate_update(struct sender_flow *g, uint64_t now)
          if (g->inflight_hi > 0.0)                          /* (B) sub-threshold: re-probe */
          {
             g->inflight_hi *= 1.25;
-            if (g->inflight_hi > (double)(MSC_UDP_WIN_RING - 1))
+            if (g->inflight_hi > (double)(g->ring_slots - 1))
                g->inflight_hi = 0.0;   /* fully recovered: cap dissolves */
          }
       }
@@ -3256,8 +3279,8 @@ static void rate_on_ack_cwnd(struct sender_flow *g, uint64_t acked)
     * never binds. */
    if (g->cwnd < (double)MSC_UDP_INIT_CWND)
       g->cwnd = (double)MSC_UDP_INIT_CWND;
-   if (g->cwnd > (double)(MSC_UDP_WIN_RING - 1))
-      g->cwnd = (double)(MSC_UDP_WIN_RING - 1);
+   if (g->cwnd > (double)(g->ring_slots - 1))
+      g->cwnd = (double)(g->ring_slots - 1);
 }
 
 /* Publish this flow's rate, refill the shared bucket (one winner per timestamp
@@ -3381,7 +3404,7 @@ static void fire_packet(struct sender_flow *g, uint64_t seq, int is_retransmit,
    h.offset = msc_udp_hton64(off);
    h.send_tsc = msc_udp_hton64(now);
    iov[0].iov_base = &h; iov[0].iov_len = sizeof(h);
-   iov[1].iov_base = g->retransmit_cache + (size_t)(seq & (MSC_UDP_WIN_RING - 1)) * g->x->payload_size; iov[1].iov_len = (size_t)len;
+   iov[1].iov_base = g->retransmit_cache + (size_t)(seq & (g->ring_slots - 1)) * g->x->payload_size; iov[1].iov_len = (size_t)len;
    memset(&msg, 0, sizeof(msg));
    msg.msg_iov = iov;
    msg.msg_iovlen = 2;
@@ -3538,8 +3561,8 @@ static void loss_cc_on_ack(struct sender_flow *g, uint64_t newest_seq,
       }
       else
          g->cwnd += 0.01 * (double)acked / g->cwnd;   /* minimal probing */
-      if (g->cwnd > (double)(MSC_UDP_WIN_RING - 1))
-         g->cwnd = (double)(MSC_UDP_WIN_RING - 1);
+      if (g->cwnd > (double)(g->ring_slots - 1))
+         g->cwnd = (double)(g->ring_slots - 1);
    }
 }
 
@@ -3558,15 +3581,15 @@ static void cc_noop_loss(struct sender_flow *g) { (void)g; }
 
 static void rate_cc_init(struct sender_flow *g)
 {
-   g->del_at_send = msc_udp_alloc(sizeof(uint64_t) * MSC_UDP_WIN_RING,
+   g->del_at_send = msc_udp_alloc(sizeof(uint64_t) * g->ring_slots,
                                   "rate del_at_send");
-   g->del_ns_at_send = msc_udp_alloc(sizeof(uint64_t) * MSC_UDP_WIN_RING,
+   g->del_ns_at_send = msc_udp_alloc(sizeof(uint64_t) * g->ring_slots,
                                      "rate del_ns_at_send");
-   g->ftx_at_send = msc_udp_alloc(sizeof(uint64_t) * MSC_UDP_WIN_RING,
+   g->ftx_at_send = msc_udp_alloc(sizeof(uint64_t) * g->ring_slots,
                                   "rate ftx_at_send");
-   memset(g->del_at_send, 0, sizeof(uint64_t) * MSC_UDP_WIN_RING);
-   memset(g->del_ns_at_send, 0, sizeof(uint64_t) * MSC_UDP_WIN_RING);
-   memset(g->ftx_at_send, 0, sizeof(uint64_t) * MSC_UDP_WIN_RING);
+   memset(g->del_at_send, 0, sizeof(uint64_t) * g->ring_slots);
+   memset(g->del_ns_at_send, 0, sizeof(uint64_t) * g->ring_slots);
+   memset(g->ftx_at_send, 0, sizeof(uint64_t) * g->ring_slots);
    g->rate_pacing_gain = MSC_UDP_RATE_HIGH_GAIN;
 }
 
@@ -3767,7 +3790,7 @@ static void sender_take_acknowledgment(struct sender_flow *g, const char *buf, s
    delivered = msc_udp_ntoh64(r->delivered);
    { uint64_t w = msc_udp_ntoh64(r->rwnd_units);
      if (w < 1) w = 1;
-     if (w > MSC_UDP_WIN_RING - 1) w = MSC_UDP_WIN_RING - 1;
+     if (w > g->ring_slots - 1) w = g->ring_slots - 1;
      g->rwnd = w; }
    g->acknowledgments++;
    cc_on_delivered(g, delivered, msc_udp_now_ns());
@@ -3871,8 +3894,8 @@ static void sender_take_acknowledgment(struct sender_flow *g, const char *buf, s
       }
       /* ring-reuse guard: a slot's `retransmitted` flag is only this unit's
        * while the window has not lapped it */
-      if (is_dsack && e0 - s0 <= MSC_UDP_WIN_RING &&
-          s0 + MSC_UDP_WIN_RING >= g->snd_nxt)
+      if (is_dsack && e0 - s0 <= g->ring_slots &&
+          s0 + g->ring_slots >= g->snd_nxt)
       {
          uint64_t u, spur = 0;
          for (u = s0; u < e0; u++)
@@ -4012,7 +4035,7 @@ static void fill_header(struct msc_udp_packet_header *h, struct sender_flow *g,
  * well under that and split a batch into several sends if needed. */
 #define MSC_UDP_GSO_MAX_BYTES 60000
 
-static int g_gso_logged = 0;   /* log the first GSO failure's errno once */
+static atomic_int g_gso_logged = 0;   /* log the first failure once */
 
 /* GSO send: lay the k packets out contiguously as [hdr|payload], each exactly
  * gso_size except a partial final unit (which lands last), then hand the kernel
@@ -4081,9 +4104,8 @@ static int fire_send_gso(struct sender_flow *g, uint64_t start, unsigned k, uint
          ssize_t s = sendmsg(g->udpfd, &msg, 0);
          if (s >= 0) break;
          if (errno == EINTR) continue;
-         if (!g_gso_logged)
+         if (!atomic_exchange(&g_gso_logged, 1))
          {
-            g_gso_logged = 1;
             fprintf(stderr, "MSC UDP sender: UDP GSO sendmsg failed (%s); "
                     "falling back to sendmmsg\n", strerror(errno));
          }
@@ -4128,7 +4150,7 @@ static void fire_batch(struct sender_flow *g, uint64_t start, unsigned k)
    {
       uint64_t seq = start + i;
       size_t len = unit_len(x, &g->part, fl, base_global + i);
-      memcpy(g->retransmit_cache + (size_t)(seq & (MSC_UDP_WIN_RING - 1)) * payload,
+      memcpy(g->retransmit_cache + (size_t)(seq & (g->ring_slots - 1)) * payload,
              g->readbuf + (size_t)i * payload, len);
       RING_AT(g->sent_ns, seq) = now;
       cc_on_sent(g, seq, now);
@@ -4138,12 +4160,11 @@ static void fire_batch(struct sender_flow *g, uint64_t start, unsigned k)
       g->tx_units++;
    }
 
-   if (g_gso)
+   if (g->gso_enabled)
    {
       if (fire_send_gso(g, start, k, now) == 0)
          return;
-      g_gso = 0;   /* unsupported: fall back to sendmmsg for the rest of the run */
-      fprintf(stderr, "MSC UDP sender: UDP GSO unsupported here, using sendmmsg\n");
+      g->gso_enabled = 0;
    }
 
    for (i = 0; i < k; i++)
@@ -4206,7 +4227,7 @@ static void fire_fresh(struct sender_flow *g)
    unsigned slot = 0;   /* units placed in the current batch (readbuf slots used) */
    unsigned ndg = 0;    /* datagrams queued for sendmmsg (<= slot under MSC_UDP_DROP) */
 
-   if (g_gso)
+   if (g->gso_enabled)
    {
       while (g->snd_nxt < g->units && (g->snd_nxt - g->snd_una) < win &&
              nfresh < budget && !g->error)
@@ -4286,7 +4307,7 @@ static void fire_fresh(struct sender_flow *g)
          uint64_t len = unit_len(x, &g->part, fl, global + i);
          struct msc_udp_packet_header *h;
 
-         memcpy(g->retransmit_cache + (size_t)(seq & (MSC_UDP_WIN_RING - 1)) * payload,
+         memcpy(g->retransmit_cache + (size_t)(seq & (g->ring_slots - 1)) * payload,
                 g->readbuf + (size_t)s * payload, len);
 
          RING_AT(g->sent_ns, seq) = now;
@@ -4561,6 +4582,9 @@ struct receiver_flow
    int have_addr;
 
    uint64_t rx_units, dup_units, acknowledgments_sent;
+   /* Only the sampler sees this snapshot; publish once per receive batch. */
+   pthread_mutex_t sample_lock;
+   uint64_t sampled_rx_units;
    uint64_t dsack_start, dsack_end; /* duplicate range to report in the next
                                      * acknowledgment's first SACK block (DSACK) */
    int dsack_pending;
@@ -5140,6 +5164,13 @@ static void *receiver_flow_worker(void *arg)
       while (cf->rcv_nxt < cf->units && board_test(cf->receive_bitmap, cf->rcv_nxt))
          cf->rcv_nxt++;
 
+      if (g_stats)
+      {
+         pthread_mutex_lock(&cf->sample_lock);
+         cf->sampled_rx_units = cf->rx_units;
+         pthread_mutex_unlock(&cf->sample_lock);
+      }
+
       /* echo the send time of the newest in-order packet we saw this batch
        * (latest arrival with seq < rcv_nxt), scanning the recorded arrival list */
       if (cf->rcv_nxt > prev_nxt)
@@ -5283,9 +5314,26 @@ static struct sender_flow *sender_flows_alloc(struct msc_udp_xfer *x,
                 x->payload_size, x->stripe_size, x->stripe_count,
                 x->my_ost_start, x->my_ost_count);
       flows[f].units = flows[f].part.units;
-      flows[f].cwnd = g_no_cc ? (double)(MSC_UDP_WIN_RING - 1) : g_init_cwnd;
-      flows[f].ssthresh = MSC_UDP_WIN_RING - 1;
-      flows[f].rwnd = MSC_UDP_WIN_RING - 1;
+      /* Bound the cache AND its metadata, even for many jumbo-payload flows.
+       * Small transfers only allocate the ring they can actually use. */
+      {
+         uint64_t unit_bytes = x->payload_size + 5 * sizeof(uint64_t) + 2;
+         uint64_t limit = g_retransmit_budget / (uint64_t)x->flow_count / unit_bytes;
+         size_t slots = 2;
+         if (limit < 2)
+         {
+            fprintf(stderr, "MSC UDP: retransmission budget too small for %d flows\n",
+                    x->flow_count);
+            exit(MSC_EXIT_CLI);
+         }
+         while (slots < MSC_UDP_WIN_RING && slots < flows[f].units + 1 &&
+                slots * 2 <= limit)
+            slots *= 2;
+         flows[f].ring_slots = slots;
+      }
+      flows[f].cwnd = g_no_cc ? (double)(flows[f].ring_slots - 1) : g_init_cwnd;
+      flows[f].ssthresh = flows[f].ring_slots - 1;
+      flows[f].rwnd = flows[f].ring_slots - 1;
       /* W0: start from the data-path probe when available, rather than have_rtt=0
        * plus a blind 200 ms RTO. Fall back to HELLO only when the probe was
        * unavailable. have_rtt stays 0, so the seed is provisional -- the first
@@ -5317,14 +5365,15 @@ static struct sender_flow *sender_flows_alloc(struct msc_udp_xfer *x,
          ? get_buf_size(ss->udp_fds[f], SO_SNDBUF)
          : set_buf_size(ss->udp_fds[f], SO_SNDBUF, g_sock_buffer);
       flows[f].seed = (unsigned int)(f * 2654435761u) ^ (unsigned int)msc_udp_now_ns();
-      flows[f].sent_ns = msc_udp_alloc(sizeof(uint64_t) * MSC_UDP_WIN_RING, "sent_ns");
-      flows[f].gap_seen_ns = msc_udp_alloc(sizeof(uint64_t) * MSC_UDP_WIN_RING, "gap_seen_ns");
-      flows[f].sacked = msc_udp_alloc(MSC_UDP_WIN_RING, "sacked");
-      flows[f].retransmitted = msc_udp_alloc(MSC_UDP_WIN_RING, "retransmitted");
-      memset(flows[f].gap_seen_ns, 0, sizeof(uint64_t) * MSC_UDP_WIN_RING);
-      memset(flows[f].sacked, 0, MSC_UDP_WIN_RING);
-      memset(flows[f].retransmitted, 0, MSC_UDP_WIN_RING);
-      flows[f].retransmit_cache = msc_udp_alloc((size_t)MSC_UDP_WIN_RING * x->payload_size, "retransmission cache");
+      flows[f].gso_enabled = g_gso;
+      flows[f].sent_ns = msc_udp_alloc(sizeof(uint64_t) * flows[f].ring_slots, "sent_ns");
+      flows[f].gap_seen_ns = msc_udp_alloc(sizeof(uint64_t) * flows[f].ring_slots, "gap_seen_ns");
+      flows[f].sacked = msc_udp_alloc(flows[f].ring_slots, "sacked");
+      flows[f].retransmitted = msc_udp_alloc(flows[f].ring_slots, "retransmitted");
+      memset(flows[f].gap_seen_ns, 0, sizeof(uint64_t) * flows[f].ring_slots);
+      memset(flows[f].sacked, 0, flows[f].ring_slots);
+      memset(flows[f].retransmitted, 0, flows[f].ring_slots);
+      flows[f].retransmit_cache = msc_udp_alloc((size_t)flows[f].ring_slots * x->payload_size, "retransmission cache");
       flows[f].readbuf = msc_udp_alloc(x->payload_size * MSC_UDP_SEND_BATCH, "send readbuf");
       flows[f].hdrs = msc_udp_alloc(sizeof(struct msc_udp_packet_header) * MSC_UDP_SEND_BATCH, "send hdrs");
       flows[f].iov = msc_udp_alloc(sizeof(struct iovec) * 2 * MSC_UDP_SEND_BATCH, "send iov");
@@ -5386,6 +5435,7 @@ static struct receiver_flow *receiver_flows_alloc(struct msc_udp_xfer *x,
    memset(flows, 0, sizeof(*flows) * (size_t)x->flow_count);
    for (f = 0; f < x->flow_count; f++)
    {
+      pthread_mutex_init(&flows[f].sample_lock, NULL);
       flows[f].x = x;
       flows[f].udpfd = ss->udp_fds[f];
       flows[f].receive_demux = ss->receive_demux_of[f];
@@ -5420,7 +5470,11 @@ static struct receiver_flow *receiver_flows_alloc(struct msc_udp_xfer *x,
 static void receiver_flows_free(struct receiver_flow *flows, int n)
 {
    int f;
-   for (f = 0; f < n; f++) free(flows[f].receive_bitmap);
+   for (f = 0; f < n; f++)
+   {
+      pthread_mutex_destroy(&flows[f].sample_lock);
+      free(flows[f].receive_bitmap);
+   }
    free(flows);
 }
 
@@ -5471,6 +5525,10 @@ static int fsync_table(struct msc_udp_file *files, uint64_t nfiles)
       jobs[i].hi = next + per + (i < rem ? 1 : 0);
       jobs[i].rc = 0;
       next = jobs[i].hi;
+   }
+   /* A failed create must leave valid ranges for EVERY inline fallback. */
+   for (i = 0; i < nworkers; i++)
+   {
       if (pthread_create(&threads[i], NULL, fsync_worker, &jobs[i]) != 0) break;
       created++;
    }
@@ -5555,14 +5613,17 @@ static long snmp_udp_stat(const char *name)
    return result;
 }
 
-/* aggregate units written by every receiver flow so far (a lock-free read of each
- * flow's monotonically-increasing rx_units -- a slightly stale sum is fine for a
- * coarse rate sample) */
+/* Read snapshots without racing the workers' private packet accounting. */
 static uint64_t receiver_rx_units_total(struct receiver_flow *flows, int n)
 {
    uint64_t t = 0;
    int f;
-   for (f = 0; f < n; f++) t += flows[f].rx_units;
+   for (f = 0; f < n; f++)
+   {
+      pthread_mutex_lock(&flows[f].sample_lock);
+      t += flows[f].sampled_rx_units;
+      pthread_mutex_unlock(&flows[f].sample_lock);
+   }
    return t;
 }
 
@@ -5576,7 +5637,9 @@ struct rx_sampler
    int nflows;
    size_t payload_size;
    uint64_t interval_ns;
-   volatile int stop;
+   pthread_mutex_t lock;
+   pthread_cond_t wake;
+   int stop;          /* protected by lock */
    double peak_bps;   /* out */
 };
 
@@ -5586,13 +5649,17 @@ static void *rx_sampler_thread(void *arg)
    uint64_t last_ns = msc_udp_now_ns();
    uint64_t last_units = receiver_rx_units_total(s->flows, s->nflows);
    double peak = 0.0;
+   pthread_mutex_lock(&s->lock);
    while (!s->stop)
    {
       struct timespec ts;
       uint64_t now, units, dns;
-      ts.tv_sec = (time_t)(s->interval_ns / 1000000000ULL);
-      ts.tv_nsec = (long)(s->interval_ns % 1000000000ULL);
-      nanosleep(&ts, NULL);
+      uint64_t deadline = msc_udp_now_ns() + s->interval_ns;
+      ts.tv_sec = (time_t)(deadline / 1000000000ULL);
+      ts.tv_nsec = (long)(deadline % 1000000000ULL);
+      while (!s->stop)
+         if (pthread_cond_timedwait(&s->wake, &s->lock, &ts) == ETIMEDOUT)
+            break;
       now = msc_udp_now_ns();
       units = receiver_rx_units_total(s->flows, s->nflows);
       dns = now - last_ns;
@@ -5605,6 +5672,7 @@ static void *rx_sampler_thread(void *arg)
       last_ns = now;
       last_units = units;
    }
+   pthread_mutex_unlock(&s->lock);
    s->peak_bps = peak;
    return NULL;
 }
@@ -5630,13 +5698,29 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
           x->files[i].base == 0 && !g_no_mmap &&
           (g_force_mmap || !msc_udp_fd_is_lustre(x->files[i].fd)))
       {
-         /* the file must be at least `size` bytes or a memcpy past EOF SIGBUSes;
-          * the recursive path already ftruncates, the single-file path may not,
-          * so size it here (idempotent). Only mmap if that succeeds. */
+         /* Reserve storage before mmap: ftruncate alone can leave sparse pages
+          * whose first write kills the process with SIGBUS on a full device.
+          * Unsupported allocation falls back to pwritev, which reports errno. */
          void *m = MAP_FAILED;
          if (ftruncate(x->files[i].fd, (off_t)x->files[i].size) == 0)
-            m = mmap(NULL, (size_t)x->files[i].size, PROT_READ | PROT_WRITE,
-                     MAP_SHARED, x->files[i].fd, 0);
+         {
+            if (fallocate(x->files[i].fd, 0, 0, (off_t)x->files[i].size) == 0)
+               m = mmap(NULL, (size_t)x->files[i].size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, x->files[i].fd, 0);
+            else if (errno == ENOSPC || errno == EDQUOT || errno == EIO)
+            {
+               uint64_t j;
+               fprintf(stderr, "MSC UDP receiver: cannot reserve destination storage: %s\n",
+                       strerror(errno));
+               for (j = 0; j < i; j++)
+                  if (x->files[j].map != NULL)
+                  {
+                     munmap(x->files[j].map, (size_t)x->files[j].size);
+                     x->files[j].map = NULL;
+                  }
+               return MSC_EXIT_DESTINATION;
+            }
+         }
          if (m != MAP_FAILED) x->files[i].map = m;   /* else fall back to pwritev */
       }
    }
@@ -5663,6 +5747,12 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
    uint64_t rx_start_ns = 0;
    if (g_stats)
    {
+      pthread_condattr_t attr;
+      pthread_mutex_init(&samp.lock, NULL);
+      pthread_condattr_init(&attr);
+      pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+      pthread_cond_init(&samp.wake, &attr);
+      pthread_condattr_destroy(&attr);
       rcvbuf_before = snmp_udp_stat("RcvbufErrors");
       inerr_before = snmp_udp_stat("InErrors");
       samp.flows = flows;
@@ -5694,7 +5784,10 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
       double secs = (double)elapsed / 1e9;
       long rcvbuf_after = snmp_udp_stat("RcvbufErrors");
       long inerr_after = snmp_udp_stat("InErrors");
+      pthread_mutex_lock(&samp.lock);
       samp.stop = 1;
+      pthread_cond_signal(&samp.wake);
+      pthread_mutex_unlock(&samp.lock);
       pthread_join(samp_thread, NULL);
       fprintf(stderr, "MSC UDP receiver rx: %llu bytes in %.0f ms, avg %.2f Gbit/s, "
               "peak %.2f Gbit/s, UdpRcvbufErrors +%ld, UdpInErrors +%ld\n",
@@ -5703,6 +5796,11 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
               samp.peak_bps / 1e9,
               rcvbuf_before >= 0 && rcvbuf_after >= 0 ? rcvbuf_after - rcvbuf_before : -1,
               inerr_before >= 0 && inerr_after >= 0 ? inerr_after - inerr_before : -1);
+   }
+   if (g_stats)
+   {
+      pthread_cond_destroy(&samp.wake);
+      pthread_mutex_destroy(&samp.lock);
    }
    free(threads);
    receiver_flows_free(flows, x->flow_count);
@@ -5911,6 +6009,12 @@ void *msc_udp_sender_open(struct msc_udp_config *cfg)
       pmtud_probe_sender(s->ss.udp_fds[0], s->controlfd,
                          s->ss.receive_demux_of[0],
                          g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD));
+   if (g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD) && g_payload_probe == 0)
+   {
+      fprintf(stderr, "MSC UDP sender: no usable payload confirmed by PMTUD\n");
+      msc_udp_sender_close(s);
+      return NULL;
+   }
    return s;
 }
 
@@ -6424,6 +6528,12 @@ void *msc_udp_receiver_open(struct msc_udp_config *cfg, int controlfd)
       pmtud_probe_receiver(s->ss.udp_fds[0], controlfd,
                            s->ss.receive_demux_of[0],
                            g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD));
+   if (g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD) && g_payload_probe == 0)
+   {
+      fprintf(stderr, "MSC UDP receiver: no usable payload confirmed by PMTUD\n");
+      msc_udp_receiver_close(s);
+      return NULL;
+   }
    return s;
 }
 
@@ -6606,6 +6716,14 @@ int msc_udp_receiver_recv(void *session, struct msc_udp_config *cfg)
                unlink(cfg->dest_path) != 0)
       {
          fprintf(stderr, "MSC UDP receiver: publish link failed: %s\n", strerror(errno));
+         error_code = MSC_EXIT_DESTINATION;
+         rc = -1;
+         goto out;
+      }
+      if (msc_udp_fsync_parent(cfg->final_dest_path) != 0)
+      {
+         fprintf(stderr, "MSC UDP receiver: syncing published directory failed: %s\n",
+                 strerror(errno));
          error_code = MSC_EXIT_DESTINATION;
          rc = -1;
          goto out;

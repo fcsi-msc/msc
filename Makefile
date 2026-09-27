@@ -37,6 +37,12 @@ msc: $(ALL_OBJS)
 recursive_test: recursive_test.o recursive.o resume.o progress.o cancellation.o netutil.o $(UDP_ENGINE_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o recursive_test $(LDLIBS)
 
+benchmarks/manifest_scan.o: benchmarks/manifest_scan.c msc.h
+	$(CC) $(CFLAGS) -I. -c $< -o $@
+
+benchmarks/manifest_scan: benchmarks/manifest_scan.o recursive.o resume.o progress.o cancellation.o netutil.o $(UDP_ENGINE_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LDLIBS)
+
 segmented_test: segmented_test.o local_sockets.o remote.o recursive.o fork.o netutil.o resume.o progress.o cancellation.o udp_transport.o $(UDP_ENGINE_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o segmented_test $(LDLIBS)
 
@@ -81,6 +87,9 @@ shims/storage_fault_shim.so: shims/storage_fault_shim.c
 shims/listen_count_shim.so: shims/listen_count_shim.c
 	$(CC) $(CFLAGS) -shared -fPIC $< -o $@ -ldl
 
+shims/fsync_fault_shim.so: shims/fsync_fault_shim.c
+	$(CC) $(CFLAGS) -shared -fPIC -pthread $< -o $@ -ldl
+
 shims/wan_shim_test: shims/wan_shim_test.c
 	$(CC) $(CFLAGS) -pthread $< -o $@
 
@@ -98,6 +107,18 @@ shim_check: shims/wan_shim.so shims/wan_shim_test
 	a=$$(LD_PRELOAD=$$SHIM MSC_UDP_WANSHIM_LOSS_PCT=20 MSC_UDP_WANSHIM_SEED=12345 $$T | grep '^DROPPED:'); \
 	b=$$(LD_PRELOAD=$$SHIM MSC_UDP_WANSHIM_LOSS_PCT=20 MSC_UDP_WANSHIM_SEED=12345 $$T | grep '^DROPPED:'); \
 	test "$$a" = "$$b" && echo "  deterministic OK" || { echo "  NONDETERMINISTIC"; exit 1; }
+	@set -e; SHIM=$$PWD/shims/wan_shim.so; T=./shims/wan_shim_test; \
+	for mode in gso mmsg; do \
+	   echo "== $$mode: per-segment MTU, loss, delay, scatter/gather and TOS =="; \
+	   LD_PRELOAD=$$SHIM MSC_TEST_SEND_STYLE=$$mode MSC_UDP_WANSHIM_MTU=12 $$T; \
+	   a=$$(LD_PRELOAD=$$SHIM MSC_UDP_WANSHIM_LOSS_PCT=20 MSC_UDP_WANSHIM_SEED=12345 $$T | grep '^DROPPED:'); \
+	   b=$$(LD_PRELOAD=$$SHIM MSC_TEST_SEND_STYLE=$$mode MSC_UDP_WANSHIM_DELAY_MS=10 \
+	      MSC_UDP_WANSHIM_MTU=12 MSC_UDP_WANSHIM_LOSS_PCT=20 MSC_UDP_WANSHIM_SEED=12345 $$T | grep '^DROPPED:'); \
+	   test "$$a" = "$$b" || { echo "GSO changed the loss pattern"; exit 1; }; \
+	done
+
+udp_regressions: msc udp_test shims/wan_shim.so shims/fsync_fault_shim.so
+	python3 ./udp_regression_test.py
 
 udp_parity: udp_test udp_protocol_test udp_offload_shim.so port_spec_test port_squat
 	./port_spec_test
@@ -152,6 +173,8 @@ resume_suite: msc resume_test recursive_test retry_test exit_code_test stall_tim
 check:
 	$(MAKE) udp_parity
 	$(MAKE) resume_suite
+	$(MAKE) udp_regressions
+	$(MAKE) shim_check
 	$(MAKE) wanshim
 
 mscclean:
@@ -163,6 +186,8 @@ mscclean:
 		stall_timeout_test udp_offload_shim.so port_spec_test port_squat \
 		shims/wan_shim.so shims/storage_fault_shim.so shims/wan_shim_test \
 		shims/listen_count_shim.so
+	/bin/rm -f shims/fsync_fault_shim.so
+	/bin/rm -f benchmarks/manifest_scan benchmarks/manifest_scan.o
 
 clean: mscclean
 
@@ -177,9 +202,9 @@ uninstall:
 	/bin/rm -f $(DESTDIR)$(BINDIR)/msc
 
 # --- Valgrind / Helgrind memory + race checks (see docs/valgrind.md) ---
-.PHONY: all check clean mscclean install uninstall valgrind helgrind udp_parity \
+.PHONY: all check clean mscclean install uninstall valgrind helgrind helgrind_udp udp_parity \
 	udp_resume_suite resume_suite wanshim wanshim_wan shim_check \
-	dest_stripe_suite stdio_ctl_suite transport_suite
+	dest_stripe_suite stdio_ctl_suite transport_suite udp_regressions
 
 VALGRIND ?= valgrind
 VG_DIR ?= /tmp/mscvg
@@ -217,3 +242,6 @@ helgrind: CFLAGS := -O0 -g
 helgrind: segmented_test
 	@mkdir -p $(VG_DIR); head -c 16M /dev/urandom > $(VG_DIR)/in.bin
 	$(VALGRIND) --tool=helgrind --num-callers=40 ./segmented_test $(VG_DIR)/in.bin $(VG_DIR)/out.bin 8 1048576 1
+
+helgrind_udp: udp_test udp_offload_shim.so
+	VALGRIND="$(VALGRIND)" sh ./helgrind_udp_test.sh

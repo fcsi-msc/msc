@@ -25,8 +25,9 @@ offset, and length from the same partition and file table.
 
 Outstanding units lie in `[snd_una, snd_nxt)`. Fresh transmission must fit the
 congestion window, receiver window, and local ring capacity, and must have a
-pacing grant when pacing is active. The 16,384-slot sender ring permits at most
-16,383 outstanding units. It stores payload copies, sequence identities,
+pacing grant when pacing is active. Sender rings have at most 16,384 slots and
+shrink to fit the transfer and `MSC_UDP_RETRANSMIT_MB` budget. At most
+`ring_slots - 1` units may be outstanding. They store payload copies, sequence identities,
 timestamps, and recovery flags. Retransmission uses the RAM copy without
 rereading the source file.
 

@@ -29,10 +29,10 @@ temporary name when replacing an existing file is forbidden. This makes the
 final name appear atomically. Handled failures remove the ordinary temporary
 file; abrupt process termination may leave one for later inspection.
 
-Atomic name visibility is distinct from power-failure durability. The ordinary
-UDP publish path syncs file data but does not explicitly sync the parent after
-publishing. Checkpointed single-file publication additionally syncs the parent
-directory and checkpoint removal. A failure after publication can report an
+Atomic name visibility is distinct from power-failure durability. Ordinary and
+checkpointed single-file UDP publication sync the destination's parent directory
+after publishing. Checkpointed completion also syncs checkpoint removal.
+A failure after publication can report an
 error even though the final file already exists; inspect the final name and
 retained state before restarting.
 

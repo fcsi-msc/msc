@@ -12,3 +12,22 @@
    ...
    fun:pthread_create*
 }
+
+# glibc's timed-wait implementation can emit an internal replacement signal
+# after releasing the application mutex. Helgrind 3.22 mistakes that internal
+# signal for an application call. Match ONLY its immediate libc wait frames,
+# not MSC's signal sites, and never suppress Helgrind:Race reports.
+{
+   glibc-timedwait-internal-replacement-signal
+   Helgrind:Dubious
+   obj:*/vgpreload_helgrind-*.so
+   fun:__pthread_cond_wait_common
+   fun:pthread_cond_timedwait*
+}
+{
+   glibc-timedwait-internal-signal-other-lock-owner
+   Helgrind:Misc
+   obj:*/vgpreload_helgrind-*.so
+   fun:__pthread_cond_wait_common
+   fun:pthread_cond_timedwait*
+}

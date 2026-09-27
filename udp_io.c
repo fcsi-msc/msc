@@ -43,6 +43,27 @@ void *msc_udp_alloc(size_t size, const char *what)
    return t;
 }
 
+int msc_udp_fsync_parent(const char *path)
+{
+   char *copy, *slash;
+   int fd, rc, saved;
+   if (path == NULL || *path == '\0') { errno = EINVAL; return -1; }
+   copy = strdup(path);
+   if (copy == NULL) return -1;
+   slash = strrchr(copy, '/');
+   if (slash == NULL) strcpy(copy, ".");
+   else if (slash == copy) slash[1] = '\0';
+   else *slash = '\0';
+   fd = open(copy, O_RDONLY | O_DIRECTORY);
+   free(copy);
+   if (fd < 0) return -1;
+   rc = fsync(fd);
+   saved = errno;
+   close(fd);
+   errno = saved;
+   return rc;
+}
+
 uint64_t msc_udp_hton64(uint64_t v)
 {
    uint32_t hi = htonl((uint32_t)(v >> 32));

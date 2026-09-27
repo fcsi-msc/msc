@@ -52,6 +52,9 @@ struct directory_manifest
    size_t capacity;
    size_t file_count;
    size_t file_capacity;
+   size_t *hardlink_slots;  /* entry index + 1; zero denotes an empty slot */
+   size_t hardlink_capacity;
+   size_t hardlink_count;
    mode_t root_mode;
    uid_t root_uid;
    gid_t root_gid;
@@ -282,6 +285,7 @@ static void manifest_free(struct directory_manifest *manifest)
    }
    free(manifest->entries);
    free(manifest->file_entry_indices);
+   free(manifest->hardlink_slots);
    memset(manifest, 0, sizeof(*manifest));
 }
 
@@ -444,6 +448,53 @@ int manifest_verify_range_digests(int fd, struct directory_manifest *manifest,
    return manifest_range_digests(fd, manifest, start, end, 1);
 }
 
+static size_t hardlink_hash(dev_t dev, ino_t ino)
+{
+   uint64_t x = (uint64_t)ino ^ ((uint64_t)dev * UINT64_C(0x9e3779b97f4a7c15));
+   x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+   x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+   return (size_t)(x ^ (x >> 31));
+}
+
+/* Only multiply linked files need indexing. Store indices rather than entry
+ * pointers because manifest_add can move the array. The first path remains
+ * the canonical file, preserving manifest order and checkpoint hashes. */
+static size_t manifest_hardlink(struct directory_manifest *m, const struct stat *st)
+{
+   size_t slot;
+   if (st->st_nlink <= 1) return m->count;
+   if (m->hardlink_count * 2 >= m->hardlink_capacity)
+   {
+      size_t cap = m->hardlink_capacity ? m->hardlink_capacity * 2 : 128;
+      size_t *slots = calloc(cap, sizeof(*slots));
+      size_t i;
+      if (slots == NULL)
+      { fprintf(stderr, "MSC could not grow hardlink index\n"); exit(MSC_EXIT_INTERNAL); }
+      for (i = 0; i < m->hardlink_capacity; i++)
+         if (m->hardlink_slots[i] != 0)
+         {
+            struct directory_entry *e = &m->entries[m->hardlink_slots[i] - 1];
+            slot = hardlink_hash(e->dev, e->ino) & (cap - 1);
+            while (slots[slot]) slot = (slot + 1) & (cap - 1);
+            slots[slot] = m->hardlink_slots[i];
+         }
+      free(m->hardlink_slots);
+      m->hardlink_slots = slots;
+      m->hardlink_capacity = cap;
+   }
+   slot = hardlink_hash(st->st_dev, st->st_ino) & (m->hardlink_capacity - 1);
+   while (m->hardlink_slots[slot])
+   {
+      size_t index = m->hardlink_slots[slot] - 1;
+      struct directory_entry *e = &m->entries[index];
+      if (e->dev == st->st_dev && e->ino == st->st_ino) return index;
+      slot = (slot + 1) & (m->hardlink_capacity - 1);
+   }
+   m->hardlink_slots[slot] = m->count + 1;
+   m->hardlink_count++;
+   return m->count;
+}
+
 static void scan_directory(struct directory_manifest *manifest,
                            const char *root, const char *relative)
 {
@@ -487,15 +538,10 @@ static void scan_directory(struct directory_manifest *manifest,
       }
       else if (S_ISREG(statbuf.st_mode))
       {
-         size_t prior;
+         size_t prior = manifest_hardlink(manifest, &statbuf);
          /* Traversal order is also manifest order.  A repeated device/inode
           * therefore becomes a hard link to an entry the receiver has already
           * created, and only the first path receives file data. */
-         for (prior = 0; prior < manifest->count; prior++)
-            if (manifest->entries[prior].type == MSC_RECORD_FILE &&
-                manifest->entries[prior].dev == statbuf.st_dev &&
-                manifest->entries[prior].ino == statbuf.st_ino)
-               break;
          if (prior < manifest->count)
             manifest_add(manifest, child_relative, child_full, MSC_RECORD_HARDLINK, 0,
                          statbuf.st_mode & 07777, manifest->entries[prior].file_id,

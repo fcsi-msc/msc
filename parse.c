@@ -27,6 +27,20 @@ static __attribute__((noreturn)) void parse_exit(int status)
 }
 #define exit parse_exit
 
+/* Printed partition commands are intended to be pasted into a POSIX shell.
+ * Quote each dynamic argument as one word, including embedded apostrophes. */
+static void print_shell_word(const char *value)
+{
+   const char *p;
+   putchar('\'');
+   for (p = value; *p != '\0'; p++)
+   {
+      if (*p == '\'') fputs("'\\''", stdout);
+      else putchar((unsigned char)*p);
+   }
+   putchar('\'');
+}
+
 
 void usage(struct argdata *AD)
 {
@@ -60,8 +74,8 @@ void help(struct argdata *AD)
    fprintf(stderr," -c: command to send output to. Must be quoted.  Must be specified if -o is not.\n");
    fprintf(stderr," -u: username to use at remote.  Must have public key for ssh from current user.\n");
    fprintf(stderr," -B: path to the msc binary to launch on the remote side, default \"msc\" (found on the remote PATH).  Set an absolute path to avoid needing msc on the remote's non-interactive PATH.\n");
-   fprintf(stderr," -n: TCP streams or MSC UDP flows; default picks by workload: %d recursive, %d single-file TCP, %d single-file UDP, %d pipe (pipe and -c transfers are always TCP)\n",
-         DEFAULT_TREE_STREAMS, DEFAULT_SINGLE_STREAMS,
+   fprintf(stderr," -n: TCP streams or MSC UDP flows; defaults: %d recursive TCP, %d recursive UDP, %d single-file TCP, %d single-file UDP, %d pipe (pipe and -c transfers are always TCP)\n",
+         DEFAULT_TREE_STREAMS, DEFAULT_UDP_TREE_FLOWS, DEFAULT_SINGLE_STREAMS,
          DEFAULT_UDP_SINGLE_FLOWS, DEFAULT_STREAMS);
    fprintf(stderr," -p: port number to use at remote, default %d\n",
          DEFAULT_PORT);
@@ -364,7 +378,7 @@ void parse_remote(int argc, char *argv[], struct argdata *AD)
    /* Not a positional: appending one would make the no-'-d' form 29 arguments,
     * which an older receiver's arity check accepts while silently ignoring the
     * value. The environment carries it to the TCP and resume setup paths, and
-    * the UDP greeting (protocol v5) carries it authoritatively. */
+    * the UDP greeting (since protocol v5) carries it authoritatively. */
    AD->dest_stripe_count = dest_stripe_count_from_env();
    if ((strlen(AD->destfile) == 1) && (*(AD->destfile) == '-'))
       AD->destfile = NULL;
@@ -508,7 +522,9 @@ void parseargs(int argc, char *argv[], struct argdata *AD)
       remote_process(AD);  /*this does not return */
    }
 
-   if (strncmp(argv[1],"-x", 2) == 0) /* this is find first zero in section*/
+   /* The private findzero ABI is exactly `-x [-d] N DEST SIZE`. A user's
+    * `msc -x -l ... -r ...` must reach the ordinary partition printer. */
+   if (strcmp(argv[1], "-x") == 0 && (argc == 5 || argc == 6))
    {
       parse_findzero(argc, argv, AD);
       findzero_process(AD);  /*this does not return */
@@ -717,7 +733,7 @@ void parseargs(int argc, char *argv[], struct argdata *AD)
             AD->numstreams = atoi(optarg);
             if ((AD->numstreams) > MAX_STREAMS)
             {
-               fprintf(stderr,"-n set to %d, max %d\n", 
+               fprintf(stderr,"-n set to %u, max %d\n",
                               AD->numstreams, MAX_STREAMS);
             }
             break;
@@ -829,7 +845,7 @@ void parseargs(int argc, char *argv[], struct argdata *AD)
    if (!AD->numstreams_explicit)
    {
       if (AD->recursive)
-         AD->numstreams = DEFAULT_TREE_STREAMS;
+         AD->numstreams = AD->udp ? DEFAULT_UDP_TREE_FLOWS : DEFAULT_TREE_STREAMS;
       else if (AD->udp)
          AD->numstreams = DEFAULT_UDP_SINGLE_FLOWS;
       else if (AD->sourcefile != NULL)
@@ -1110,28 +1126,52 @@ void parseargs(int argc, char *argv[], struct argdata *AD)
           * lines are meant to be copied back into a shell to restart a failed
           * section, possibly long after the default changes again, and possibly
           * against an msc on another host. */
-         printf("msc %s -l %s -r %s -q %d ",
-            AD->udp ? "-U" : "-T",
-            AD->childinfo[lc].localmachine,
-            AD->childinfo[lc].remotemachine,
-            AD->numsets);
+         printf("msc %s -l ", AD->udp ? "-U" : "-T");
+         print_shell_word(AD->childinfo[lc].localmachine);
+         fputs(" -r ", stdout);
+         print_shell_word(AD->childinfo[lc].remotemachine);
+         printf(" -q %u ", AD->numsets);
+         if (AD->remote_user != NULL)
+         {
+            fputs("-u ", stdout);
+            print_shell_word(AD->remote_user);
+            putchar(' ');
+         }
+         if (strcmp(AD->remote_binary, "msc") != 0)
+         {
+            fputs("-B ", stdout);
+            print_shell_word(AD->remote_binary);
+            putchar(' ');
+         }
          if (AD->numstreams != DEFAULT_STREAMS)
-            printf("-n %d ", AD->numstreams);
+            printf("-n %u ", AD->numstreams);
          if (AD->portnum != DEFAULT_PORT)
-            printf("-p %d ", AD->portnum);
+            printf("-p %u ", AD->portnum);
          if (AD->packetsize_explicit)
-            printf("-s %d ", AD->packetsize);
+            printf("-s %u ", AD->packetsize);
          /* Spell the destination layout out for the same reason as the
           * transport: a restarted section must recreate the same file, and the
           * OST width cannot be changed after creation. */
          if (AD->dest_stripe_count != 0)
             printf("--dest-stripe-count %ld ", AD->dest_stripe_count);
          if (AD->sourcefile != NULL)
-            printf("-i %s ",AD->sourcefile);
+         {
+            fputs("-i ", stdout);
+            print_shell_word(AD->sourcefile);
+            putchar(' ');
+         }
          if (AD->destfile == NULL)
-            printf("-c %s ",AD->remote_program);
+         {
+            fputs("-c ", stdout);
+            print_shell_word(AD->remote_program);
+            putchar(' ');
+         }
          else
-            printf("-o %s ",AD->destfile);
+         {
+            fputs("-o ", stdout);
+            print_shell_word(AD->destfile);
+            putchar(' ');
+         }
          printf("-t %lld -a %lld -b %lld\n", 
                  (long long int)AD->childinfo[lc].xferlen,
                  (long long int)AD->childinfo[lc].startloc, 

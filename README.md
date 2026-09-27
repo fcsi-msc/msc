@@ -76,10 +76,10 @@ tar cf - . | msc -l localhost -r receiver.example -c 'cd /data && tar xf -'
 `-c` is an error because those shapes require TCP. Run `msc -h` for options
 or `msc man` for the embedded manual.
 
-Implicit parallelism depends on the workload: 30 flows for a single UDP file,
-64 streams/flows for a recursive tree, eight streams for a regular TCP file,
-and 30 for a pipe. Explicit `-n` overrides it. Logical flow count and UDP socket
-count are separate settings.
+UDP defaults to eight flows for files and trees, matching the default socket
+count. TCP uses 64 streams for a tree, eight for a file, and 30 for a pipe.
+Explicit `-n` overrides these values; storage-heavy Lustre workloads may benefit
+from `-n30` or `-R -n64`. Logical flows and UDP sockets are separate settings.
 
 ## Path profiles and congestion control
 
@@ -226,7 +226,7 @@ experiments. The helper verifies byte equality and controller selection.
 Build warning-free with `-Wall -Wextra`, then run:
 
 ```sh
-make udp_parity udp_resume_suite resume_suite wanshim
+make check
 ```
 
 The [testing guide](docs/testing.md) explains coverage, direct harnesses,
@@ -236,6 +236,11 @@ privilege-free WAN/storage shims, and real-Lustre checks. See
 Keep exit classes stable, forward new remote settings through the explicit
 allowlist, and pass `-T` in tests that intend TCP. Update the relevant docs with
 changes to defaults, protocol records, controller callbacks, or guarantees.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and release steps,
+[SECURITY.md](SECURITY.md) for the security boundary and reporting process, and
+[CHANGELOG.md](CHANGELOG.md) for changes pending release. Supported platforms
+and validation limits are in [docs/support.md](docs/support.md).
 
 ## Documentation
 
@@ -248,6 +253,7 @@ changes to defaults, protocol records, controller callbacks, or guarantees.
 - [Wire protocol](docs/wire-protocol.md)
 - [Configuration reference](docs/configuration.md)
 - [Performance and storage](docs/performance.md)
+- [Benchmarking](benchmarks/README.md)
 - [Troubleshooting and telemetry](docs/troubleshooting.md)
 - [Testing](docs/testing.md)
 

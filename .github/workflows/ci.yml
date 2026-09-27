@@ -16,7 +16,9 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Install clang
         if: matrix.cc == 'clang'
         run: sudo apt-get update && sudo apt-get install -y clang
@@ -29,7 +31,9 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       # The suites push multi-gigabit loopback UDP; the stock 208 KiB socket
       # buffer ceiling makes the throughput-gated WAN tests needlessly noisy.
       - name: Raise socket buffer limits
@@ -43,16 +47,19 @@ jobs:
     name: sanitizers (ASan + UBSan)
     runs-on: ubuntu-24.04
     env:
+      CC: clang
       ASAN_OPTIONS: verify_asan_link_order=0:detect_leaks=0
       UBSAN_OPTIONS: print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Raise socket buffer limits
         run: sudo sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304
       # The LD_PRELOAD test shims stay uninstrumented; only msc and the
       # harnesses carry the sanitizers.
       - name: Build the test shims
-        run: make shims/wan_shim.so shims/storage_fault_shim.so shims/listen_count_shim.so udp_offload_shim.so
+        run: make shims/wan_shim.so shims/storage_fault_shim.so shims/listen_count_shim.so shims/fsync_fault_shim.so udp_offload_shim.so
       # The throughput-gated wanshim suite is left out: sanitizer slowdown
       # would trip its floors without saying anything about memory safety.
       - name: Run the suites under ASan + UBSan
@@ -62,11 +69,51 @@ jobs:
         run: |
           make udp_parity
           make resume_suite
+          make udp_regressions
+
+  udp-races:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: make -j2 CFLAGS='-O1 -g -Werror' udp_test udp_offload_shim.so
+      - run: make helgrind_udp
+
+  source-archive:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Build and install from a source archive
+        run: |
+          archive_dir=$(mktemp -d)
+          git archive --format=tar --prefix=msc/ -o "$archive_dir/msc.tar" HEAD
+          if tar -tf "$archive_dir/msc.tar" | grep -E '^msc/(docs/(performance-release-review|implementation-results)\.md|benchmarks/(results|proposals)/|benchmarks/thread_failure_shim\.c)'; then
+            echo 'Internal engineering files must not appear in the release archive' >&2
+            exit 1
+          fi
+          tar -xf "$archive_dir/msc.tar" -C "$archive_dir"
+          test -f "$archive_dir/msc/CHANGELOG.md"
+          test -f "$archive_dir/msc/SECURITY.md"
+          make -C "$archive_dir/msc" -j2 CFLAGS='-O2 -g -Werror'
+          make -C "$archive_dir/msc" install DESTDIR="$archive_dir/stage" PREFIX=/usr
+          "$archive_dir/stage/usr/bin/msc" --version
+          test "$("$archive_dir/stage/usr/bin/msc" --probe)" = MSC-PROBE-OK
+          make -C "$archive_dir/msc" uninstall DESTDIR="$archive_dir/stage" PREFIX=/usr
+          test ! -e "$archive_dir/stage/usr/bin/msc"
 
   shellcheck:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: |
           shellcheck -s sh -S warning *.sh contrib/slurm/msc-srun
           shellcheck -S warning contrib/slurm/msc-slurm-smoke.sh
+          python3 -m py_compile udp_regression_test.py benchmarks/benchmark.py benchmarks/wired.py benchmarks/link_utilization.py

@@ -52,6 +52,8 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <limits.h>
+#include <linux/udp.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -560,6 +562,80 @@ static int classify(int fd, const struct iovec *iov, int iovcnt,
 }
 
 /* ===== intercepted syscalls =============================================== */
+/* Impair wire datagrams, not GSO superpackets. Preserve every other ancillary
+ * setting (notably IP_TOS/ECN) when splitting a scatter/gather UDP_SEGMENT send.
+ * Allocations finish before any packet is accepted, so allocation failure does
+ * not silently bypass impairment or leave a partially queued batch. */
+static ssize_t impaired_sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+   size_t total = 0, i, off;
+   uint16_t segment = 0;
+   struct cmsghdr *c;
+   for (i = 0; i < msg->msg_iovlen; i++)
+   {
+      if (msg->msg_iov[i].iov_len > (size_t)SSIZE_MAX - total)
+      { errno = EMSGSIZE; return -1; }
+      total += msg->msg_iov[i].iov_len;
+   }
+   for (c = CMSG_FIRSTHDR(msg); c != NULL; c = CMSG_NXTHDR((struct msghdr *)msg, c))
+      if (c->cmsg_level == IPPROTO_UDP && c->cmsg_type == UDP_SEGMENT)
+      {
+         if (c->cmsg_len != CMSG_LEN(sizeof(segment)))
+         { errno = EINVAL; return -1; }
+         memcpy(&segment, CMSG_DATA(c), sizeof(segment));
+      }
+   if (segment != 0 && total > segment)
+   {
+      unsigned char *data = malloc(total);
+      unsigned char *control = malloc(msg->msg_controllen);
+      struct msghdr part = *msg;
+      struct iovec iov;
+      if (data == NULL || control == NULL)
+      { free(data); free(control); errno = ENOMEM; return -1; }
+      for (i = 0, off = 0; i < msg->msg_iovlen; i++)
+      {
+         memcpy(data + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
+         off += msg->msg_iov[i].iov_len;
+      }
+      memcpy(control, msg->msg_control, msg->msg_controllen);
+      part.msg_control = control;
+      /* Explicitly disable segmentation on these individual datagrams. This
+       * also overrides a socket-level UDP_SEGMENT setting if one is present. */
+      for (c = CMSG_FIRSTHDR(&part); c != NULL; c = CMSG_NXTHDR(&part, c))
+         if (c->cmsg_level == IPPROTO_UDP && c->cmsg_type == UDP_SEGMENT)
+         {
+            uint16_t zero = 0;
+            memcpy(CMSG_DATA(c), &zero, sizeof(zero));
+         }
+      part.msg_iov = &iov;
+      part.msg_iovlen = 1;
+      for (off = 0; off < total; off += iov.iov_len)
+      {
+         iov.iov_base = data + off;
+         iov.iov_len = total - off < segment ? total - off : segment;
+         if (classify(fd, &iov, 1, part.msg_name, part.msg_namelen,
+                      control, part.msg_controllen, flags) == 0)
+         {
+            if (real_sendmsg(fd, &part, flags) < 0)
+            {
+               int saved = errno;
+               free(control); free(data); errno = saved;
+               return -1;
+            }
+            atomic_fetch_add(&g_n_immediate, 1);
+         }
+      }
+      free(control); free(data);
+      return (ssize_t)total;
+   }
+   if (classify(fd, msg->msg_iov, (int)msg->msg_iovlen,
+                msg->msg_name, msg->msg_namelen,
+                msg->msg_control, msg->msg_controllen, flags) != 0)
+      return (ssize_t)total;
+   atomic_fetch_add(&g_n_immediate, 1);
+   return real_sendmsg(fd, msg, flags);
+}
+
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
 {
@@ -599,23 +675,10 @@ ssize_t send(int fd, const void *buf, size_t len, int flags)
 
 ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
 {
-   size_t total = 0;
-   size_t i;
    if (!real_sendmsg) init_reals();
    if (!g_active || !is_dgram(fd))
       return real_sendmsg(fd, msg, flags);
-   for (i = 0; i < (size_t)msg->msg_iovlen; i++)
-      total += msg->msg_iov[i].iov_len;
-   switch (classify(fd, msg->msg_iov, (int)msg->msg_iovlen,
-                    msg->msg_name, msg->msg_namelen,
-                    msg->msg_control, msg->msg_controllen, flags))
-   {
-   case 1:  return (ssize_t)total;
-   case -1: return (ssize_t)total;
-   default: break;
-   }
-   atomic_fetch_add(&g_n_immediate, 1);
-   return real_sendmsg(fd, msg, flags);
+   return impaired_sendmsg(fd, msg, flags);
 }
 
 /* sendmmsg is MSC UDP's default (non-GSO) fresh-send batch path. Each element is an
@@ -631,26 +694,10 @@ int sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
       return real_sendmmsg(fd, msgvec, vlen, flags);
    for (i = 0; i < vlen; i++)
    {
-      struct msghdr *m = &msgvec[i].msg_hdr;
-      size_t total = 0, j;
-      int fate;
-      for (j = 0; j < (size_t)m->msg_iovlen; j++)
-         total += m->msg_iov[j].iov_len;
-      fate = classify(fd, m->msg_iov, (int)m->msg_iovlen,
-                      m->msg_name, m->msg_namelen,
-                      m->msg_control, m->msg_controllen, flags);
-      if (fate == 1 || fate == -1)     /* dropped or queued: report accepted */
-      {
-         msgvec[i].msg_len = (unsigned)total;
-         continue;
-      }
-      {
-         ssize_t s = real_sendmsg(fd, m, flags);
-         if (s < 0)
-            return i > 0 ? (int)i : -1;   /* errno already set by real_sendmsg */
-         atomic_fetch_add(&g_n_immediate, 1);
-         msgvec[i].msg_len = (unsigned)s;
-      }
+      ssize_t s = impaired_sendmsg(fd, &msgvec[i].msg_hdr, flags);
+      if (s < 0)
+         return i > 0 ? (int)i : -1;
+      msgvec[i].msg_len = (unsigned)s;
    }
    return (int)vlen;
 }

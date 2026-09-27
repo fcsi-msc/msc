@@ -24,13 +24,20 @@
 #define UDP_GRO 104
 #endif
 
+static ssize_t (*real_sendmsg)(int, const struct msghdr *, int);
+static int (*real_setsockopt)(int, int, int, const void *, socklen_t);
+
+/* Resolve before workers start; lazy writes to static function pointers race
+ * when several flows encounter unsupported offloads at the same time. */
+__attribute__((constructor)) static void init(void)
+{
+   real_sendmsg = dlsym(RTLD_NEXT, "sendmsg");
+   real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
+}
+
 ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
 {
-   static ssize_t (*real)(int, const struct msghdr *, int);
    struct cmsghdr *c;
-   if (real == NULL)
-      real = (ssize_t (*)(int, const struct msghdr *, int))
-             dlsym(RTLD_NEXT, "sendmsg");
    for (c = CMSG_FIRSTHDR((struct msghdr *)msg); c != NULL;
         c = CMSG_NXTHDR((struct msghdr *)msg, c))
       if (c->cmsg_level == SOL_UDP && c->cmsg_type == UDP_SEGMENT)
@@ -38,20 +45,16 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
          errno = EINVAL;
          return -1;
       }
-   return real(fd, msg, flags);
+   return real_sendmsg(fd, msg, flags);
 }
 
 int setsockopt(int fd, int level, int optname, const void *optval,
                socklen_t optlen)
 {
-   static int (*real)(int, int, int, const void *, socklen_t);
-   if (real == NULL)
-      real = (int (*)(int, int, int, const void *, socklen_t))
-             dlsym(RTLD_NEXT, "setsockopt");
    if (level == SOL_UDP && optname == UDP_GRO)
    {
       errno = ENOPROTOOPT;
       return -1;
    }
-   return real(fd, level, optname, optval, optlen);
+   return real_setsockopt(fd, level, optname, optval, optlen);
 }

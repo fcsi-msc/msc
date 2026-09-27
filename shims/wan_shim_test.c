@@ -19,7 +19,9 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <linux/udp.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,7 +50,8 @@ struct rxctx
    int         n;
    char       *arrived;    /* arrived[seq] != 0 */
    uint64_t   *delay_ns;   /* recv - send, per arrived seq */
-   volatile int done;      /* set by main once all sends have drained */
+   atomic_int done;        /* set by main once all sends have drained */
+   int bad_tos;
 };
 
 static void *rx_thread(void *arg)
@@ -59,9 +62,19 @@ static void *rx_thread(void *arg)
    for (;;)
    {
       struct payload p;
-      ssize_t r = recv(c->fd, &p, sizeof(p), 0);
+      struct iovec iov = { &p, sizeof(p) };
+      unsigned char control[CMSG_SPACE(sizeof(int))];
+      struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+         .msg_control = control, .msg_controllen = sizeof(control) };
+      ssize_t r = recvmsg(c->fd, &msg, 0);
       if (r == (ssize_t)sizeof(p) && (int)p.seq < c->n)
       {
+         struct cmsghdr *cm;
+         int tos = -1;
+         for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm))
+            if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_TOS)
+               tos = *(unsigned char *)CMSG_DATA(cm);
+         if (tos != 2) c->bad_tos++;
          c->arrived[p.seq] = 1;
          c->delay_ns[p.seq] = now_ns() - p.send_ns;
       }
@@ -84,6 +97,8 @@ int main(int argc, char **argv)
    struct sockaddr_in addr;
    socklen_t alen = sizeof(addr);
    int rcvbuf = 8 * 1024 * 1024;
+   int tos = 2, one = 1;
+   const char *style = getenv("MSC_TEST_SEND_STYLE");
    struct rxctx ctx;
    pthread_t rx;
    double mean_ms = 0, min_ms = 1e30, max_ms = 0, drop_pct;
@@ -105,6 +120,9 @@ int main(int argc, char **argv)
    if (getsockname(rxfd, (struct sockaddr *)&addr, &alen) < 0) { perror("getsockname"); return 2; }
 
    ctx.fd = rxfd;
+   ctx.bad_tos = 0;
+   setsockopt(rxfd, IPPROTO_IP, IP_RECVTOS, &one, sizeof(one));
+   setsockopt(txfd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
    ctx.n = n;
    ctx.arrived = calloc(n, 1);
    ctx.delay_ns = calloc(n, sizeof(uint64_t));
@@ -112,13 +130,49 @@ int main(int argc, char **argv)
    if (!ctx.arrived || !ctx.delay_ns) { perror("calloc"); return 2; }
    if (pthread_create(&rx, NULL, rx_thread, &ctx) != 0) { perror("pthread"); return 2; }
 
-   for (i = 0; i < n; i++)
+   for (i = 0; i < n; )
    {
-      struct payload p;
-      p.seq = (uint32_t)i;
-      p.send_ns = now_ns();
-      sendto(txfd, &p, sizeof(p), 0, (struct sockaddr *)&addr, sizeof(addr));
-      if ((i & 511) == 511)
+      struct payload p[32];
+      int count = style ? (n - i < 32 ? n - i : 32) : 1;
+      int k;
+      for (k = 0; k < count; k++)
+      { p[k].seq = (uint32_t)(i + k); p[k].send_ns = now_ns(); }
+      if (style)
+      {
+         /* Split in the middle of the first packet: impairment must gather
+          * iovecs before segmenting, and preserve the IP_TOS control message. */
+         struct iovec iov[2] = { { p, 5 },
+            { (char *)p + 5, (size_t)count * sizeof(*p) - 5 } };
+         union { struct cmsghdr align;
+            char bytes[CMSG_SPACE(sizeof(uint16_t)) + CMSG_SPACE(sizeof(int))]; } ctl;
+         struct mmsghdr m = { .msg_hdr = {
+            .msg_name = &addr, .msg_namelen = sizeof(addr),
+            .msg_iov = iov, .msg_iovlen = 2,
+            .msg_control = ctl.bytes, .msg_controllen = sizeof(ctl.bytes) } };
+         struct cmsghdr *cm;
+         uint16_t segment = sizeof(*p);
+         ssize_t sent;
+         memset(&ctl, 0, sizeof(ctl));
+         cm = CMSG_FIRSTHDR(&m.msg_hdr);
+         cm->cmsg_level = IPPROTO_UDP; cm->cmsg_type = UDP_SEGMENT;
+         cm->cmsg_len = CMSG_LEN(sizeof(segment));
+         memcpy(CMSG_DATA(cm), &segment, sizeof(segment));
+         cm = CMSG_NXTHDR(&m.msg_hdr, cm);
+         cm->cmsg_level = IPPROTO_IP; cm->cmsg_type = IP_TOS;
+         cm->cmsg_len = CMSG_LEN(sizeof(tos));
+         memcpy(CMSG_DATA(cm), &tos, sizeof(tos));
+         if (strcmp(style, "mmsg") == 0)
+            sent = sendmmsg(txfd, &m, 1, 0) == 1 ? (ssize_t)m.msg_len : -1;
+         else
+            sent = sendmsg(txfd, &m.msg_hdr, 0);
+         if (sent != (ssize_t)((size_t)count * sizeof(*p)))
+         { perror("GSO send"); return 2; }
+      }
+      else if (sendto(txfd, p, sizeof(*p), 0,
+                      (struct sockaddr *)&addr, sizeof(addr)) != sizeof(*p))
+      { perror("sendto"); return 2; }
+      i += count;
+      if ((i & 511) == 0)
          usleep(200);   /* light pacing so the loopback rx buffer keeps up */
    }
 
@@ -127,6 +181,8 @@ int main(int argc, char **argv)
    usleep((useconds_t)((delay_ms + jitter_ms) * 1000) + 1500000);
    ctx.done = 1;
    pthread_join(rx, NULL);
+   if (ctx.bad_tos)
+   { fprintf(stderr, "IP_TOS was lost on %d datagrams\n", ctx.bad_tos); return 1; }
 
    for (i = 0; i < n; i++)
       if (ctx.arrived[i])

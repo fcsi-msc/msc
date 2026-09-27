@@ -129,16 +129,13 @@ struct msc_progress
 /* --- UDP transport (-U) --------------------------------------------------- */
 #define DEFAULT_UDP_PAYLOAD 1400      /* default file-data bytes per datagram */
 #define DEFAULT_UDP_FLOWS 8           /* MSC UDP transport default */
-/* Workload-shaped implicit -n defaults, chosen from a stream-count sweep on a
- * Lustre scratch file system (3 reps per setting). Recursive transfers scale to 64 with no
- * measured penalty on a 12288-small-file tree and +27% (TCP) / +129% (UDP)
- * on an 8x1GB tree; single-file TCP peaks at 8 streams (+17..23% vs the
- * flat 30); single-file UDP is best at 30 flows (the only setting beating the
- * old 8-flow default at every size, +21..29%). Pipe mode (no -i) was not
- * measured and keeps DEFAULT_STREAMS. Explicit -n always wins. */
-#define DEFAULT_TREE_STREAMS 64       /* -R, TCP and UDP */
+/* Eight UDP flows fit the default eight sockets without demux contention.
+ * Larger Lustre transfers can still opt into -n30 or -R -n64; explicit -n
+ * always wins. TCP retains the defaults from its storage workload sweep. */
+#define DEFAULT_TREE_STREAMS 64       /* recursive TCP */
+#define DEFAULT_UDP_TREE_FLOWS 8      /* recursive UDP */
 #define DEFAULT_SINGLE_STREAMS 8      /* single-file TCP */
-#define DEFAULT_UDP_SINGLE_FLOWS 30   /* single-file UDP */
+#define DEFAULT_UDP_SINGLE_FLOWS 8    /* single-file UDP */
 #define MAX_UDP_FLOWS 256             /* MSC UDP protocol limit */
 
 struct segment_header

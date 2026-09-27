@@ -49,7 +49,16 @@ Thread-race pass (separate, because Helgrind is noisy):
 
 ```bash
 make helgrind
+make helgrind_udp
 ```
+
+`helgrind_udp` enables receiver statistics and checks both dedicated data sockets
+and a shared socket with forced GSO/GRO fallback. It fails on detected races and
+compares the resulting bytes. This is also a CI gate; it uses unique temporary
+fixtures and a bounded timeout.
+The suppression file excludes glibc's internal timed-wait replacement signal,
+which Helgrind 3.22 reports as an unlocked application signal. It matches the
+immediate libc frames only; application data races remain errors.
 
 Overridable make variables: `VALGRIND` (binary/wrapper), `VG_DIR` (fixture dir,
 default `/tmp/mscvg`).

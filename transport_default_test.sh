@@ -21,8 +21,6 @@ trap 'rm -rf "$work"' EXIT
 head -c 1048576 /dev/urandom > "$work/src"
 
 # ---- the flag -x prints, which is the contract for restart command lines ----
-# -x must not be argv[1]: parse.c routes a leading -x to the findzero helper,
-# which never reaches the partition printer.
 expect_flag()
 {
    want="$1"; shift
@@ -41,6 +39,39 @@ expect_flag -U -U
 expect_flag -T -U -T
 expect_flag -U -T -U
 
+# A leading -x is the public partition printer when followed by normal CLI
+# options; the private findzero invocation has a short positional argument
+# list. Dynamic words in printed commands must survive shell tokenization.
+python3 - "$MSC" "$work" <<'PY'
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+binary, work = sys.argv[1], Path(sys.argv[2])
+source = work / "a'b $(id) source.bin"
+destination = work / "copy 'here' file.bin"
+remote_binary = "/tmp/msc's peer"
+source.write_bytes(b"partition command quoting test")
+result = subprocess.run([binary, "-x", "-n3", "-l", "localhost",
+                         "-r", "127.0.0.1", "-u", "test'user",
+                         "-B", remote_binary, "-i", str(source),
+                         "-o", str(destination)], capture_output=True, text=True)
+assert result.returncode == 0, result.stderr
+lines = result.stdout.splitlines()
+assert len(lines) == 1, lines
+words = shlex.split(lines[0])
+assert words[:2] == ["msc", "-U"], words
+for flag, value in (("-l", "localhost"), ("-r", "127.0.0.1"),
+                    ("-q", "1"), ("-u", "test'user"),
+                    ("-B", remote_binary), ("-n", "3"),
+                    ("-i", str(source)), ("-o", str(destination))):
+    assert words[words.index(flag) + 1] == value, (flag, words)
+print("ok: leading -x prints shell-safe restart commands with account and peer binary")
+PY
+test "$("$MSC" -x 1 "$work/nonexistent-findzero-destination" 0)" = '0,0'
+echo 'ok: private positional -x findzero invocation still works'
+
 # ---- end to end.  There is no sshd on a build host, so MSC_SSH substitutes a
 # stand-in that runs the remote command locally with ssh's stdin/stdout wiring.
 cat > "$work/fakessh" <<'EOF'
@@ -51,6 +82,28 @@ exec /bin/sh -c "$*"
 EOF
 chmod +x "$work/fakessh"
 MSC_SSH="$work/fakessh"; export MSC_SSH
+
+python3 - "$MSC" "$work" <<'PY'
+from pathlib import Path
+import os
+import subprocess
+import sys
+
+binary, work = sys.argv[1], Path(sys.argv[2])
+source = work / "copy's input file.bin"
+destination = work / "copy's destination file.bin"
+source.write_bytes(b"restart command executes with quoted paths")
+printed = subprocess.check_output([binary, "-x", "-n4", "-l", "localhost",
+                                   "-r", "localhost", "-B", str(Path(binary).resolve()),
+                                   "-i", str(source), "-o", str(destination)], text=True)
+env = os.environ.copy()
+env["PATH"] = str(Path(binary).resolve().parent) + os.pathsep + env.get("PATH", "")
+result = subprocess.run(["sh", "-c", printed], env=env, capture_output=True,
+                        text=True, timeout=120)
+assert result.returncode == 0, result.stderr
+assert destination.read_bytes() == source.read_bytes()
+print("ok: a printed restart command executes and preserves quoted file bytes")
+PY
 
 transfer()      # label, then the transport flag(s) under test
 {

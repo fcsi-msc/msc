@@ -13,16 +13,21 @@ flows can increase concurrency and outstanding data; more sockets can distribute
 packet processing across demultiplexer threads. Neither improves a saturated
 storage device or link indefinitely.
 
-The CLI defaults are 30 flows for a single UDP file, 64 streams/flows for a
-tree, and eight streams for a regular TCP file. Explicit `-n` overrides those
+The CLI defaults are eight UDP flows for files and trees, 64 streams for a
+TCP tree, and eight streams for a regular TCP file. Explicit `-n` overrides those
 defaults. Default UDP sockets are `min(N,8)`. A direct session-API caller can
 choose different values, so report the effective configuration in benchmarks.
 
-Each active sender flow has a retransmission payload cache proportional to
-`16384 * payload_bytes`, plus metadata and I/O buffers. At a 1,400-byte payload,
-that cache is about 21.9 MiB per flow; at 9,000 bytes it is about 140.6 MiB.
-Actual payload is constrained by the path probe. Receiver bitmaps, socket/GRO
+Sender retransmission caches and their ring metadata share a 512 MiB budget
+(`MSC_UDP_RETRANSMIT_MB`). Each flow gets a power-of-two ring of at most 16,384
+slots, reduced to fit its share of the budget and its data. One slot stays empty
+to prevent overwriting outstanding data. A smaller budget can limit throughput
+on paths with a large bandwidth-delay product. Receiver queues, I/O and socket
 buffers, file mappings, and recursive descriptors add separate costs.
+
+The eight-flow UDP default avoids shared-socket demux work on ordinary transfers.
+Storage-heavy Lustre workloads can benefit from additional flows; try explicit
+`-n30` / `-R -n64` and measure on the actual storage system.
 
 ## Path MTU discovery
 
@@ -30,11 +35,24 @@ MSC probes candidate datagram sizes at session setup, with fragmentation
 disabled, and uses receiver confirmation of arrival. Local send success alone
 does not prove that a downstream link carried the datagram.
 
-An implicit payload starts from 1,400 file-data bytes and can be raised to the
-confirmed ceiling. Explicit `-s` is never raised and can be clamped down. The
+An implicit payload uses the confirmed ceiling. The probe ladder includes
+548-byte UDP datagrams (500 file bytes) for paths below Ethernet MTU. If no
+usable size is confirmed, setup fails rather than sending oversized file data.
+With probing disabled, the fallback is 1,400 file bytes. Explicit `-s` is never
+raised and can be clamped down. The
 MSC CLI sets `MSC_UDP_PMTUD_CAP=9000` when absent; the underlying engine's
 compiled cap is 2,016. These are file-payload limits: MSC's 48-byte packet
 header and UDP/IP headers also consume MTU space.
+
+At an IPv4 MTU of 1,500 bytes, a full datagram carries at most 1,424 file
+bytes after the IP, UDP, and MSC headers. Including standard Ethernet framing
+and interframe overhead, the ideal file-payload ceiling on a 1 GbE link is
+about 926 Mbit/s, before ACKs or retransmissions. A saturated NIC can
+therefore report a rate near 1,000 Mbit/s while file throughput is lower.
+Longer transfers amortize setup costs but do not remove this packet overhead.
+Larger MTUs raise the ceiling only when the entire path supports them. They do
+not guarantee higher application throughput; measure the whole transfer and
+the sender NIC rate after any MTU change.
 
 The probe runs at session opening, not continuously for every data packet. A
 changed path during a long session may require restarting with a smaller
@@ -77,6 +95,11 @@ storage backpressure need not first become packet loss. See
 For eligible whole-file writes, MSC normally uses a shared mapping on non-Lustre
 filesystems and coalesced `pwritev` on Lustre. Consecutive units for the same file
 can share a vectored write; reordering and file boundaries break runs.
+MSC reserves destination storage with `fallocate` before mapping, so an initial
+ENOSPC is reported as a destination error rather than a write-time SIGBUS.
+Filesystems that do not support allocation use the vectored path. Late device
+errors, external truncation, and thin-provisioned storage still need filesystem
+and operational safeguards.
 Offsets, supplied file descriptors, and mapping eligibility can select the
 vectored path. `MSC_UDP_NO_MMAP=1` forces it; `MSC_UDP_FORCE_MMAP=1` requests
 mapping on eligible paths even on Lustre.

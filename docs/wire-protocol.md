@@ -8,8 +8,9 @@ manifest and resume records also use [msc.h](../msc.h),
 
 ## Versions and carriers
 
-The session protocol version is **5** (`MSC_UDP_PROTO_VERSION`). Version 5 adds
-the requested destination stripe count to the greeting. Both peers require the
+The session protocol version is **6** (`MSC_UDP_PROTO_VERSION`). Version 5 added
+the requested destination stripe count to the greeting; version 6 adds a random
+initial transfer ID to the sender's HELLO. Both peers require the
 same session version; HELLO rejects a mismatch before file data. Feature bits
 are intersected only after version agreement. They do not make incompatible
 record layouts interoperable.
@@ -30,7 +31,11 @@ padding to the wire format.
 1. Establish the chosen control carrier after SSH rendezvous.
 2. Advertise receiver data ports as `PORTS`, a u32 count, and that many u32
    ports. In `one` mode, the control socket already supplies the data endpoint.
-3. Exchange `HELLO`, version, and feature mask (three u32 fields each way).
+3. The sender sends `HELLO`, version, and feature mask (three u32 fields), then
+   the initial transfer ID (u64). The receiver replies with `HELLO`, version,
+   and its feature mask (three u32 fields). Transfer IDs advance per transfer
+   within this session; the random starting value rejects stale data from an
+   earlier session. It is not cryptographic authentication.
 4. Run negotiated MTU and/or pre-data RTT probes and the control `MTU` exchange.
 5. Exchange single-file greeting, or the manifest/readiness/table records for
    a tree. Checkpointed transfers also perform their resume negotiation.
@@ -45,6 +50,8 @@ Control teardown and SSH child status remain part of successful orchestration.
 ## Data-plane header
 
 DATA uses a 48-byte `msc_udp_packet_header` followed by `length` bytes.
+Its C definition is packed so consecutive packets at odd payload strides do not
+require naturally aligned header addresses; the fixed wire size is asserted.
 
 | Byte offset | Type | Field | Meaning |
 | ---: | --- | --- | --- |
@@ -105,7 +112,7 @@ state, not by a generic length prefix.
 | 4 | PUBLISH | Sender's checksum approval. |
 | 5 | ABORT | Abort instead of accepting completion. |
 | 6–8 | TREE_FILE, TREE_DIR, TREE_DONE | Allocated legacy tags; current recursive manifests use the shared directory-record format. |
-| 9 | HELLO | u32 session version, u32 feature mask. |
+| 9 | HELLO | u32 session version, u32 feature mask; sender also appends u64 initial transfer ID. Reply has no ID field. |
 | 10 | MTU | u32 probe bound/confirmed size; includes the MSC packet header. |
 | 11 | TREE_READY | Receiver has materialized the manifest and opened its file table. |
 | 12 | TABLE_BEGIN | u64 transfer ID, file-entry count, total file bytes. |

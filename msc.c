@@ -93,7 +93,7 @@ int main(int argc, char **argv)
       for (set = 0; set < Argdata.numsets; set++)
       {
          totalxfer += Argdata.childinfo[set].xfercount;
-         printf("msc job %d machine %s to %s size %lld\n", set, 
+         printf("msc job %u machine %s to %s size %lld\n", set,
                    Argdata.childinfo[set].localmachine, 
                    Argdata.childinfo[set].remotemachine, 
                    Argdata.childinfo[set].xfercount);
