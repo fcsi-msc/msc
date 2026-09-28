@@ -24,5 +24,6 @@ addresses unless necessary and agreed with the maintainers.
 
 Fixes target the current development branch and the latest published release;
 no older-version backport commitment is established. Install matching protocol
-versions on both peers. Maintainers should enable the private reporting feature
-before publishing the first release governed by this policy.
+versions on both peers. The reporting link becomes available once the repository
+is public and private vulnerability reporting is enabled. Maintainers should
+verify it before publishing the first release governed by this policy.

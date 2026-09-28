@@ -47,8 +47,10 @@ when changing defaults or completion guarantees.
    the intended storage, and impairment recovery. When the wire and checkpoint
    versions are unchanged, test old/new peers in both sender directions,
    including small files, trees, and a resumed transfer. Retain logs and hashes.
-4. Review [SECURITY.md](SECURITY.md), enable private vulnerability reporting on
-   GitHub, and confirm the supported configurations and known limits.
+4. Review [SECURITY.md](SECURITY.md) and confirm the supported configurations
+   and known limits. After approval to make the repository public, enable
+   GitHub private vulnerability reporting and verify that the link in
+   `SECURITY.md` opens the reporting form before publishing the release.
 5. Tag the reviewed commit and create the source archive with `git archive`.
    Check that it contains the changelog and security policy and excludes local
    engineering reports and raw benchmark results. Publish the archive's SHA-256
