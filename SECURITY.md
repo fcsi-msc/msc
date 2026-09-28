@@ -15,7 +15,7 @@ during a copy. Recursive reception writes into its destination tree in place.
 
 ## Reporting a vulnerability
 
-Use the repository's [private vulnerability reporting page](https://github.com/ojaroker/msc/security/advisories/new)
+Use the repository's [private vulnerability reporting page](https://github.com/fcsi-msc/msc/security/advisories/new)
 when enabled. If it is unavailable, open an issue requesting a private contact
 route, without including exploit details or sensitive data. Include the commit
 or version, kernel, reproduction steps, impact, and a minimized example in the
