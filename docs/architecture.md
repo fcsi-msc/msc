@@ -74,16 +74,16 @@ See [performance](performance.md) for the write-path and layout tradeoffs.
 
 | File | Responsibility |
 | --- | --- |
-| [msc.c](../msc.c), [parse.c](../parse.c), [man.c](../man.c) | Entry point, CLI, defaults, embedded manual. |
-| [local_single.c](../local_single.c), [local_multiple.c](../local_multiple.c), [fork.c](../fork.c) | SSH orchestration, worker pairs, child status, retries. |
-| [local_sockets.c](../local_sockets.c), [remote.c](../remote.c) | TCP send/receive workers and receiver launch. |
-| [udp_transport.c](../udp_transport.c) | UDP bridge for CLI, manifests, checkpoints, and errors. |
-| [udp_session.c](../udp_session.c), [udp_session.h](../udp_session.h) | Data protocol, flow state machines, congestion, pacing, PMTUD, offloads. |
-| [udp_control.c](../udp_control.c), [port_spec.c](../port_spec.c) | Control carriers, demultiplexing, port specification. |
-| [udp_io.c](../udp_io.c) | Private I/O/checksum helpers and optional Lustre integration. |
-| [recursive.c](../recursive.c), [resume.c](../resume.c) | Manifests, tree transfer, checkpoints, reused-range verification. |
-| [udp_stats.c](../udp_stats.c), [progress.c](../progress.c) | Transport telemetry and user progress. |
-| [cancellation.c](../cancellation.c), [netutil.c](../netutil.c) | Signal state and bounded network I/O helpers. |
+| [msc.c](../src/msc.c), [parse.c](../src/parse.c), [man.c](../src/man.c) | Entry point, CLI, defaults, embedded manual. |
+| [local_single.c](../src/local_single.c), [local_multiple.c](../src/local_multiple.c), [fork.c](../src/fork.c) | SSH orchestration, worker pairs, child status, retries. |
+| [local_sockets.c](../src/local_sockets.c), [remote.c](../src/remote.c) | TCP send/receive workers and receiver launch. |
+| [udp_transport.c](../src/udp_transport.c) | UDP bridge for CLI, manifests, checkpoints, and errors. |
+| [udp_session.c](../src/udp_session.c), [udp_session.h](../src/udp_session.h) | Data protocol, flow state machines, congestion, pacing, PMTUD, offloads. |
+| [udp_control.c](../src/udp_control.c), [port_spec.c](../src/port_spec.c) | Control carriers, demultiplexing, port specification. |
+| [udp_io.c](../src/udp_io.c) | Private I/O/checksum helpers and optional Lustre integration. |
+| [recursive.c](../src/recursive.c), [resume.c](../src/resume.c) | Manifests, tree transfer, checkpoints, reused-range verification. |
+| [udp_stats.c](../src/udp_stats.c), [progress.c](../src/progress.c) | Transport telemetry and user progress. |
+| [cancellation.c](../src/cancellation.c), [netutil.c](../src/netutil.c) | Signal state and bounded network I/O helpers. |
 
 ## Implementation and validation
 

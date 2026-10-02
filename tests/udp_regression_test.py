@@ -7,7 +7,7 @@ import re
 import subprocess
 import tempfile
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 BASE = {k: v for k, v in os.environ.items() if not k.startswith("MSC_")}
 BASE.pop("LD_PRELOAD", None)
 
@@ -29,7 +29,7 @@ def run(args, settings=None, expected=0):
 
 def main():
     version = re.search(r"#define MSC_UDP_PROTO_VERSION\s+(\d+)",
-                        (ROOT / "udp_session.h").read_text()).group(1)
+                        (ROOT / "src/udp_session.h").read_text()).group(1)
     documented = re.search(r"protocol version is \*\*(\d+)\*\*",
                            (ROOT / "docs/wire-protocol.md").read_text()).group(1)
     assert version == documented, (version, documented)
@@ -37,8 +37,8 @@ def main():
         work = Path(directory)
         source = work / "source"
         source.write_bytes(os.urandom(1024 * 1024))
-        wan = str(ROOT / "shims/wan_shim.so")
-        fault = str(ROOT / "shims/fsync_fault_shim.so")
+        wan = str(ROOT / "build/wan_shim.so")
+        fault = str(ROOT / "build/fsync_fault_shim.so")
         # Test automatic PMTUD with both the GSO and sendmmsg transmit paths.
         for mtu in (1280, 548):
             for offload in (True, False):
@@ -47,9 +47,9 @@ def main():
                        "MSC_UDP_STATS": "1"}
                 if not offload:
                     env.update(MSC_TEST_NO_GSO="1", MSC_TEST_NO_GRO="1")
-                run([ROOT / "udp_test", source, dest, "2"], env)
+                run([ROOT / "build/udp_test", source, dest, "2"], env)
                 assert dest.read_bytes() == source.read_bytes()
-        out = run([ROOT / "udp_test", source, work / "no-path", "1"],
+        out = run([ROOT / "build/udp_test", source, work / "no-path", "1"],
                   {"LD_PRELOAD": wan, "MSC_UDP_WANSHIM_MTU": "100"}, expected=6)
         assert "no usable payload" in out
         print("ok: reduced MTU with/without offloads; unconfirmed path fails", flush=True)
@@ -60,7 +60,7 @@ def main():
         large.write_bytes(source.read_bytes() * 32)
         for controller in ("rate", "reno", "cubic"):
             dest = work / f"ring-{controller}"
-            run([ROOT / "udp_test", large, dest, "8", "1"],
+            run([ROOT / "build/udp_test", large, dest, "8", "1"],
                 {"MSC_UDP_RETRANSMIT_MB": "1", "MSC_UDP_PAYLOAD": "1400",
                  "MSC_UDP_CC": controller, "MSC_UDP_STATS": "1"})
             assert dest.read_bytes() == large.read_bytes()
@@ -74,7 +74,7 @@ def main():
         for call in range(2, 6):
             dest = work / f"thread-{call}"
             record = work / f"fsync-{call}.log"
-            out = run([ROOT / "udp_test", tree, dest, "1"],
+            out = run([ROOT / "build/udp_test", tree, dest, "1"],
                       {"LD_PRELOAD": fault, "MSC_TEST_FAIL_THREAD_AT": str(call),
                        "MSC_TEST_FSYNC_LOG": str(record), "MSC_UDP_FSYNC_THREADS": "4"})
             assert f"injected thread failure at {call}" in out
@@ -134,7 +134,7 @@ def main():
             os.link(origin, links / "b" / str(i))
             (links / f"ordinary-{i}").write_bytes(b"ordinary")
         dest = work / "links-copy"
-        run([ROOT / "udp_test", links, dest, "4"])
+        run([ROOT / "build/udp_test", links, dest, "4"])
         for i in range(512):
             a, b = dest / "a" / str(i), dest / "b" / str(i)
             assert a.read_bytes() == (links / "a" / str(i)).read_bytes()

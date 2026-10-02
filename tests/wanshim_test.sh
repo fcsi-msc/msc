@@ -1,5 +1,5 @@
 #!/bin/sh
-# WAN-emulated gates for MSC's UDP engine via shims/wan_shim.so (privilege-free
+# WAN-emulated gates for MSC's UDP engine via build/wan_shim.so (privilege-free
 # LD_PRELOAD emulator; delays/drops UDP only, TCP control passes clean).
 #
 #   smoke  4 MiB at 15ms/2% loss: byte-verify, and prove the shim actually
@@ -25,7 +25,7 @@
 set -eu
 
 profile=${1:?usage: wanshim_test.sh smoke|wan|mtu}
-SHIM=${MSC_WANSHIM_SO:-./shims/wan_shim.so}
+SHIM=${MSC_WANSHIM_SO:-./build/wan_shim.so}
 
 ROOT=${TMPDIR:-/tmp}/msc-wanshim.$$
 trap 'rm -rf "$ROOT"' EXIT HUP INT TERM
@@ -59,7 +59,7 @@ smoke)
    LD_PRELOAD=$SHIM MSC_UDP_WANSHIM_DELAY_MS=15 \
       MSC_UDP_WANSHIM_JITTER_MS=3 MSC_UDP_WANSHIM_LOSS_PCT=2 \
       MSC_UDP_WANSHIM_SEED=0x5eed1234 MSC_UDP_WANSHIM_TRACE=1 \
-      ./udp_test "$ROOT/src" "$ROOT/out" 4 2>"$ROOT/shim.log"
+      ./build/udp_test "$ROOT/src" "$ROOT/out" 4 2>"$ROOT/shim.log"
    cat "$ROOT/shim.log" >&2
    cmp "$ROOT/src" "$ROOT/out"
    check_shim_counters "$ROOT/shim.log"
@@ -82,7 +82,7 @@ wan)
       MSC_UDP_WANSHIM_JITTER_MS=5 MSC_UDP_WANSHIM_LOSS_PCT=0.1 \
       MSC_UDP_WANSHIM_SEED=0x5eed1234 MSC_UDP_WANSHIM_TRACE=1 \
       MSC_UDP_STATS=1 \
-      timeout 90 ./udp_test "$ROOT/src" "$ROOT/out" 8 2>"$ROOT/shim.log" || rc=$?
+      timeout 90 ./build/udp_test "$ROOT/src" "$ROOT/out" 8 2>"$ROOT/shim.log" || rc=$?
    end=$(date +%s.%N)
    grep -E 'wan_shim:|sender flow' "$ROOT/shim.log" >&2 || true
    if [ "$rc" -eq 124 ]; then

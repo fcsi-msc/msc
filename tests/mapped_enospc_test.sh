@@ -16,7 +16,7 @@ exec /bin/sh -c "$*"
 EOF
    chmod +x "$work/ssh"
    sudo -n timeout -k 2 30 unshare --mount --propagation private \
-      sh "$PWD/mapped_enospc_test.sh" --inside "$work" "$PWD" "$(id -un)"
+      sh "$PWD/tests/mapped_enospc_test.sh" --inside "$work" "$PWD" "$(id -un)"
    exit
 fi
 

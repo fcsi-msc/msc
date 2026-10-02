@@ -5,6 +5,19 @@ POSIX shell. OpenSSH is needed for real peers; local tests use a stand-in.
 Optional tools are ShellCheck and Valgrind. Lustre builds require its development
 headers and library (`make LUSTRE=1`). See [supported configurations](docs/support.md).
 
+## Layout
+
+| Path | Contents |
+| --- | --- |
+| `src/` | The msc program (see the [source map](docs/architecture.md#source-map)). |
+| `tests/` | C test harnesses, shell and Python suites, Valgrind suppressions. |
+| `tests/shims/` | Test-only `LD_PRELOAD` shims (WAN emulator, fault injectors). |
+| `build/` | Every build product except `msc` itself (ignored by git). |
+| `benchmarks/`, `contrib/`, `docs/` | Benchmark runners, Slurm launcher, documentation. |
+
+Run the suites and harnesses from the repository root, for example
+`make udp_test` and then `./build/udp_test`.
+
 ## Development
 
 Describe the failure or workload a change addresses. Preserve the stable exit
@@ -16,7 +29,7 @@ metadata. Compare received bytes independently of MSC's own checksums.
 make clean
 make -j8 CFLAGS='-O2 -g -Werror' all
 make check
-shellcheck -s sh -S warning *.sh contrib/slurm/msc-srun
+shellcheck -s sh -S warning tests/*.sh contrib/slurm/msc-srun
 shellcheck -S warning contrib/slurm/msc-slurm-smoke.sh
 ```
 
@@ -40,7 +53,7 @@ when changing defaults or completion guarantees.
 ## Preparing a release
 
 1. Resolve release-blocking failures and update `CHANGELOG.md`. Choose the
-   release version in `msc.h`; the uncommitted working tree is not a release.
+   release version in `src/msc.h`; the uncommitted working tree is not a release.
 2. Pass GCC/Clang warning builds, `make check`, sanitizers, and `make helgrind_udp`.
    CI also builds a Git source archive and verifies staged installation.
 3. Test the release candidate on two hosts. Verify bytes, interruption/resume,

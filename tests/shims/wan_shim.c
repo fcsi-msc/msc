@@ -13,7 +13,7 @@
  * binary is running: the same wan_shim.so impairs `msc` and its loopback test
  * harness (udp_test) identically. Usage is a one-liner with no source changes:
  *
- *   LD_PRELOAD=./shims/wan_shim.so MSC_UDP_WANSHIM_DELAY_MS=35 \
+ *   LD_PRELOAD=./build/wan_shim.so MSC_UDP_WANSHIM_DELAY_MS=35 \
  *     MSC_UDP_WANSHIM_JITTER_MS=5 MSC_UDP_WANSHIM_LOSS_PCT=0.5 \
  *     msc -l nodeA -r nodeB -i src -o dst
  *

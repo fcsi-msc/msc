@@ -1,10 +1,10 @@
 # UDP wire protocol
 
 This reference describes the current UDP session framing. The serializers and
-parsers in [udp_session.c](../udp_session.c) and record definitions in
-[udp_session.h](../udp_session.h) are the implementation reference. Shared
-manifest and resume records also use [msc.h](../msc.h),
-[recursive.c](../recursive.c), and [resume.c](../resume.c).
+parsers in [udp_session.c](../src/udp_session.c) and record definitions in
+[udp_session.h](../src/udp_session.h) are the implementation reference. Shared
+manifest and resume records also use [msc.h](../src/msc.h),
+[recursive.c](../src/recursive.c), and [resume.c](../src/resume.c).
 
 ## Versions and carriers
 
@@ -161,8 +161,8 @@ Receivers validate packet identity and expected geometry before writing.
 Senders validate advertised ports and ACK bounds. These checks prevent many
 accidental cross-session/layout errors; they are not cryptographic validation.
 
-[udp_protocol_test.c](../udp_protocol_test.c) checks version rejection.
-[udp_recursive_ctl_test.sh](../udp_recursive_ctl_test.sh) exercises recursive
-handoff and repeated table behavior; [udp_parity_test.sh](../udp_parity_test.sh)
+[udp_protocol_test.c](../tests/udp_protocol_test.c) checks version rejection.
+[udp_recursive_ctl_test.sh](../tests/udp_recursive_ctl_test.sh) exercises recursive
+handoff and repeated table behavior; [udp_parity_test.sh](../tests/udp_parity_test.sh)
 checks normal transfers, ports, and malformed/incompatible cases represented
 in the suite. Add targeted cases when extending a wire record.

@@ -176,11 +176,11 @@ transport. Add useful state to `flow_sample` telemetry.
 
 ## Implementation and validation
 
-- [udp_session.c](../udp_session.c): `msc_udp_cc_ops`, `loss_cc_on_ack`,
+- [udp_session.c](../src/udp_session.c): `msc_udp_cc_ops`, `loss_cc_on_ack`,
   `loss_cc_on_loss`, `loss_cc_on_rto`, `rate_sample`, `rate_update`,
   `rate_on_ack_cwnd`, `pace_grant`, and `fair_reserve`.
-- [udp_session.h](../udp_session.h): controller constants.
-- [udp_parity_test.sh](../udp_parity_test.sh): rate/CUBIC transfer checks.
-- [env_preset_test.sh](../env_preset_test.sh) and [wanshim_test.sh](../wanshim_test.sh):
+- [udp_session.h](../src/udp_session.h): controller constants.
+- [udp_parity_test.sh](../tests/udp_parity_test.sh): rate/CUBIC transfer checks.
+- [env_preset_test.sh](../tests/env_preset_test.sh) and [wanshim_test.sh](../tests/wanshim_test.sh):
   preset and impaired-path checks. These are not comprehensive algorithm or
   cross-traffic fairness tests.

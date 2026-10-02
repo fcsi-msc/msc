@@ -9,8 +9,8 @@
  * that contaminates a real measurement.
  *
  *   make shim_check          (from the top-level directory), or by hand:
- *   LD_PRELOAD=$PWD/shims/wan_shim.so MSC_UDP_WANSHIM_DELAY_MS=20 MSC_UDP_WANSHIM_JITTER_MS=4 \
- *     MSC_UDP_WANSHIM_LOSS_PCT=10 ./wan_shim_test [count]
+ *   LD_PRELOAD=$PWD/build/wan_shim.so MSC_UDP_WANSHIM_DELAY_MS=20 MSC_UDP_WANSHIM_JITTER_MS=4 \
+ *     MSC_UDP_WANSHIM_LOSS_PCT=10 ./build/wan_shim_test [count]
  *
  * With no MSC_UDP_WANSHIM_* set it is a passthrough sanity check (expect ~0 loss,
  * ~0 delay). It prints a sorted "DROPPED: ..." line so two runs with the same

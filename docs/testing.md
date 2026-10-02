@@ -44,7 +44,7 @@ Avoid `make clean` in a checkout where another process is building or testing.
 Use an independent copy/worktree when changing compiler flags or running
 multiple development experiments.
 
-With noninteractive sudo and mount-namespace support, `sh mapped_enospc_test.sh`
+With noninteractive sudo and mount-namespace support, `sh tests/mapped_enospc_test.sh`
 tests real ENOSPC on a private 1 MiB tmpfs. MSC runs as the invoking user; only
 namespace creation/mounting uses root. The mount never propagates to the host,
 is bounded by a timeout, and is removed on exit. This optional test is separate
@@ -54,10 +54,10 @@ from `make check`, which needs no administrative access.
 
 | Harness | Invocation |
 | --- | --- |
-| `udp_test` | `./udp_test SRC DST FLOWS [DROP_PERCENT]` |
-| `segmented_test` | `./segmented_test SRC DST STREAMS SEGMENT_BYTES EXPECT_SUCCESS` |
-| `recursive_test` | `./recursive_test SOURCE_DIR DEST_DIR STREAMS SEGMENT_BYTES` |
-| `resume_test` | `./resume_test SRC DST` |
+| `udp_test` | `./build/udp_test SRC DST FLOWS [DROP_PERCENT]` |
+| `segmented_test` | `./build/segmented_test SRC DST STREAMS SEGMENT_BYTES EXPECT_SUCCESS` |
+| `recursive_test` | `./build/recursive_test SOURCE_DIR DEST_DIR STREAMS SEGMENT_BYTES` |
+| `resume_test` | `./build/resume_test SRC DST` |
 | `retry_test`, `exit_code_test`, `stall_timeout_test`, `child_status_test` | No arguments. |
 
 The harnesses construct `argdata` directly and bypass `parseargs`. For example,
@@ -72,13 +72,13 @@ Always compare outputs even when an internal checksum is enabled.
 | --- | --- |
 | `MSC_UDP_DROP` or `udp_test` drop argument | Integer-percent synthetic sender packet loss; disables GSO to preserve packet-level injection. |
 | `MSC_UDP_CONTROL_DROP` | Loss in the optional UDP control shim, including handshake/ACK/FIN frames. |
-| [wan_shim.c](../shims/wan_shim.c) | Preload-based UDP delay, jitter, independent loss, duplication, initial ACK/FIN drops, and MTU black holes. |
-| [storage_fault_shim.c](../shims/storage_fault_shim.c) | Destination write failures after a byte threshold; used with the non-mapped write path. |
-| [fsync_fault_shim.c](../shims/fsync_fault_shim.c) | Worker creation failures, fsync recording, and forced file/directory sync errors. |
-| [udp_offload_shim.c](../udp_offload_shim.c) | Unsupported GSO/GRO fallback paths. |
-| [listen_count_shim.c](../shims/listen_count_shim.c) | Records TCP `listen()` calls to verify the stdio port footprint. |
+| [wan_shim.c](../tests/shims/wan_shim.c) | Preload-based UDP delay, jitter, independent loss, duplication, initial ACK/FIN drops, and MTU black holes. |
+| [storage_fault_shim.c](../tests/shims/storage_fault_shim.c) | Destination write failures after a byte threshold; used with the non-mapped write path. |
+| [fsync_fault_shim.c](../tests/shims/fsync_fault_shim.c) | Worker creation failures, fsync recording, and forced file/directory sync errors. |
+| [udp_offload_shim.c](../tests/shims/udp_offload_shim.c) | Unsupported GSO/GRO fallback paths. |
+| [listen_count_shim.c](../tests/shims/listen_count_shim.c) | Records TCP `listen()` calls to verify the stdio port footprint. |
 
-Build the WAN shim with `make shims/wan_shim.so`. Its controls are:
+Build the WAN shim with `make build/wan_shim.so`. Its controls are:
 
 | Variable | Meaning |
 | --- | --- |
@@ -105,7 +105,7 @@ ordinary remote use.
 
 ## Real-system validation
 
-[lustre_dest_stripe_test.sh](../lustre_dest_stripe_test.sh) requires an actual
+[lustre_dest_stripe_test.sh](../tests/lustre_dest_stripe_test.sh) requires an actual
 Lustre filesystem and tools; read its setup before running. Local tests cannot
 validate NIC offload performance, firewall/NAT policy, real SSH authentication,
 multi-host shared storage, or fairness against competing traffic. Verify these

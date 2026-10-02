@@ -142,10 +142,10 @@ turning an isolated throughput result into a general fairness claim.
 
 ## Implementation and validation
 
-- [udp_session.c](../udp_session.c): `pick_payload`, PMTUD probes, socket buffer
+- [udp_session.c](../src/udp_session.c): `pick_payload`, PMTUD probes, socket buffer
   setup, `fire_fresh`, `flush_run`, `receiver_run_flows`, and `fsync_table`.
-- [udp_io.c](../udp_io.c): Lustre queries and destination creation.
-- [udp_parity_test.sh](../udp_parity_test.sh): payload policy and offload fallback.
-- [dest_stripe_test.sh](../dest_stripe_test.sh) and
-  [lustre_dest_stripe_test.sh](../lustre_dest_stripe_test.sh): layout forwarding
+- [udp_io.c](../src/udp_io.c): Lustre queries and destination creation.
+- [udp_parity_test.sh](../tests/udp_parity_test.sh): payload policy and offload fallback.
+- [dest_stripe_test.sh](../tests/dest_stripe_test.sh) and
+  [lustre_dest_stripe_test.sh](../tests/lustre_dest_stripe_test.sh): layout forwarding
   and actual Lustre placement respectively.

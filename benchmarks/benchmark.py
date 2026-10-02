@@ -3,7 +3,7 @@
 
 Run suites serially on an otherwise idle host. This measures warm-cache local
 completion, not physical NIC performance or real SSH setup. Requires GNU time,
-cmp, and a built msc; the WAN suite also requires shims/wan_shim.so.
+cmp, and a built msc; the WAN suite also requires build/wan_shim.so.
 """
 
 import argparse
@@ -182,7 +182,7 @@ def main():
            if not k.startswith("MSC_") and k != "LD_PRELOAD"}
     env["LC_ALL"] = "C"
     if args.suite == "wan":
-        shim = (ROOT / "shims/wan_shim.so").resolve(strict=True)
+        shim = (ROOT / "build/wan_shim.so").resolve(strict=True)
         env.update(LD_PRELOAD=str(shim), MSC_UDP_WANSHIM_DELAY_MS="25",
                    MSC_UDP_WANSHIM_LOSS_PCT="0.1", MSC_UDP_WANSHIM_SEED="12345",
                    MSC_UDP_WANSHIM_TRACE="1", MSC_UDP_WANSHIM_MTU="1448",

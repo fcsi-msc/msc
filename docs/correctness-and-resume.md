@@ -142,14 +142,14 @@ network path when confidentiality or adversarial integrity is required.
 
 ## Implementation and validation
 
-- [udp_transport.c](../udp_transport.c): checkpoint handshakes, chunk durability,
+- [udp_transport.c](../src/udp_transport.c): checkpoint handshakes, chunk durability,
   recursive resume, and CLI-to-session integration.
-- [udp_session.c](../udp_session.c): data completion, checksums, ordinary UDP publication.
-- [resume.c](../resume.c): format v2, atomic checkpoint writes, and SHA-256 range verification.
-- [remote.c](../remote.c) and [recursive.c](../recursive.c): TCP resume and tree materialization.
-- [udp_resume_test.sh](../udp_resume_test.sh),
-  [udp_recursive_resume_test.sh](../udp_recursive_resume_test.sh), and
-  [resume_test.sh](../resume_test.sh): interruption, mutation, storage errors,
+- [udp_session.c](../src/udp_session.c): data completion, checksums, ordinary UDP publication.
+- [resume.c](../src/resume.c): format v2, atomic checkpoint writes, and SHA-256 range verification.
+- [remote.c](../src/remote.c) and [recursive.c](../src/recursive.c): TCP resume and tree materialization.
+- [udp_resume_test.sh](../tests/udp_resume_test.sh),
+  [udp_recursive_resume_test.sh](../tests/udp_recursive_resume_test.sh), and
+  [resume_test.sh](../tests/resume_test.sh): interruption, mutation, storage errors,
   changed UDP packet geometry, signals, and metadata recovery.
 
 Fault injection verifies software ordering and error handling. It does not

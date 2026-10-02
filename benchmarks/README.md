@@ -11,7 +11,7 @@ Repeat and interleave comparisons; one fast run does not establish a gain.
 Build MSC and the WAN shim before measuring:
 
 ```sh
-make -j8 all shims/wan_shim.so
+make -j8 all build/wan_shim.so
 python3 benchmarks/benchmark.py --suite local --size-mib 256 --repeats 3 \
   --output /tmp/msc-local-results
 python3 benchmarks/benchmark.py --suite tree --tree-files 1024 --repeats 3 \
@@ -73,8 +73,8 @@ analyzer; background traffic on the interface also appears in the samples.
 
 ## Directory-manifest scans
 
-`make benchmarks/manifest_scan` builds a read-only manifest benchmark. Run
-`/usr/bin/time benchmarks/manifest_scan SOURCE_DIRECTORY` on a generated tree
+`make build/manifest_scan` builds a read-only manifest benchmark. Run
+`/usr/bin/time build/manifest_scan SOURCE_DIRECTORY` on a generated tree
 to isolate scanning from transfer and destination work. It prints regular-file
 count, total bytes, and manifest fingerprint. Compare fingerprints when
 benchmarking a code change, especially for trees containing hard links.

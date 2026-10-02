@@ -8,10 +8,11 @@
 # file comes out striped over the requested number of OSTs, whatever the source
 # was striped over, and that the bytes are still identical.  That needs OSTs.
 #
-# Run it on a cluster node whose /scratch is Lustre, with a peer it can ssh to:
+# Run it from the repository root on a cluster node whose /scratch is Lustre,
+# with a peer it can ssh to:
 #
 #   make LUSTRE=1 all
-#   REMOTE=otherhost sh ./lustre_dest_stripe_test.sh
+#   REMOTE=otherhost sh tests/lustre_dest_stripe_test.sh
 #
 # Environment:
 #   REMOTE  peer host for the transfer (default: this host, i.e. loopback ssh)

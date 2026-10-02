@@ -4,7 +4,7 @@
 # These arms exist to transfer a file while opening NO listening TCP port, so
 # this asserts two things per arm: the bytes arrive intact, and nothing in the
 # msc process tree ever calls listen() on a TCP socket (recorded by
-# shims/listen_count_shim.so, which catches even a listener that lives for a
+# build/listen_count_shim.so, which catches even a listener that lives for a
 # few milliseconds -- polling `ss` cannot).  An explicit tcp
 # arm is included as a control -- it MUST show a listener, otherwise the probe
 # is broken and the stdio result would be vacuously true.  Select tcp by SETTING
@@ -16,8 +16,8 @@
 set -e
 
 MSC="${MSC:-./msc}"
-LISTEN_SHIM="${MSC_LISTEN_SHIM_SO:-./shims/listen_count_shim.so}"
-test -r "$LISTEN_SHIM" || { echo "FAIL: no $LISTEN_SHIM; make shims/listen_count_shim.so"; exit 1; }
+LISTEN_SHIM="${MSC_LISTEN_SHIM_SO:-./build/listen_count_shim.so}"
+test -r "$LISTEN_SHIM" || { echo "FAIL: no $LISTEN_SHIM; make build/listen_count_shim.so"; exit 1; }
 LISTEN_SHIM="$(cd "$(dirname "$LISTEN_SHIM")" && pwd)/$(basename "$LISTEN_SHIM")"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -143,7 +143,7 @@ fi
 # wan_shim delays UDP only and leaves the pipe alone, which reproduces exactly
 # that asymmetry: without the correction this run reports profile=lan and
 # nothing else.
-SHIM=${MSC_WANSHIM_SO:-./shims/wan_shim.so}
+SHIM=${MSC_WANSHIM_SO:-./build/wan_shim.so}
 if [ -f "$SHIM" ]; then
    MSC_SSH="$work/fakessh" MSC_UDP_CTL=stdio MSC_UDP_STATS=1 \
    LD_PRELOAD="$SHIM" MSC_UDP_WANSHIM_DELAY_MS=25 MSC_UDP_WANSHIM_JITTER_MS=2 \
@@ -163,7 +163,7 @@ if [ -f "$SHIM" ]; then
       sed -n 's/.*profile=wan rtt_ms=\([0-9.]*\).*handshake said \([0-9.]*\) ms.*/ (\2 ms handshake -> \1 ms path)/p' \
          "$work/profile.log" | head -1)"
 else
-   echo "stdio: SKIP profile check (no $SHIM; build it with make shims/wan_shim.so)"
+   echo "stdio: SKIP profile check (no $SHIM; build it with make build/wan_shim.so)"
 fi
 
 # A remote that dies during launch must be REPORTED, not waited on forever.

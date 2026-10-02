@@ -131,12 +131,12 @@ byte stream directly and does not wrap its records in this UDP shim.
 
 ## Implementation and validation
 
-- [udp_control.c](../udp_control.c): `msc_udp_ctl_mode`, control shim, queues,
+- [udp_control.c](../src/udp_control.c): `msc_udp_ctl_mode`, control shim, queues,
   and demultiplexer.
-- [udp_session.c](../udp_session.c): `resolve_nports`, `sender_check_ports`,
+- [udp_session.c](../src/udp_session.c): `resolve_nports`, `sender_check_ports`,
   `sockset_build`, and socket ownership.
-- [port_spec.c](../port_spec.c): exact/scan parsing and resolution.
-- [remote.c](../remote.c) and [local_single.c](../local_single.c): SSH rendezvous.
-- [stdio_ctl_test.sh](../stdio_ctl_test.sh): byte checks and TCP-listener
-  instrumentation; [udp_parity_test.sh](../udp_parity_test.sh): port selection;
-  [udp_recursive_ctl_test.sh](../udp_recursive_ctl_test.sh): control-mode coverage.
+- [port_spec.c](../src/port_spec.c): exact/scan parsing and resolution.
+- [remote.c](../src/remote.c) and [local_single.c](../src/local_single.c): SSH rendezvous.
+- [stdio_ctl_test.sh](../tests/stdio_ctl_test.sh): byte checks and TCP-listener
+  instrumentation; [udp_parity_test.sh](../tests/udp_parity_test.sh): port selection;
+  [udp_recursive_ctl_test.sh](../tests/udp_recursive_ctl_test.sh): control-mode coverage.
