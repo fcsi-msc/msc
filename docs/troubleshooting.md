@@ -99,7 +99,7 @@ and sender/receiver logs. State whether a checkpoint or final destination remain
 
 ## Implementation and validation
 
-[udp_stats.c](../udp_stats.c) and [udp_stats.h](../udp_stats.h) define sampling;
-[udp_session.c](../udp_session.c) emits flow counters.
-[exit_code_test.c](../exit_code_test.c), [retry_test.c](../retry_test.c), and
-[stall_timeout_test.c](../stall_timeout_test.c) cover the exit/recovery contract.
+[udp_stats.c](../src/udp_stats.c) and [udp_stats.h](../src/udp_stats.h) define sampling;
+[udp_session.c](../src/udp_session.c) emits flow counters.
+[exit_code_test.c](../tests/exit_code_test.c), [retry_test.c](../tests/retry_test.c), and
+[stall_timeout_test.c](../tests/stall_timeout_test.c) cover the exit/recovery contract.

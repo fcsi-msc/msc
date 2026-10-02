@@ -8,7 +8,7 @@ the test harness. You can try an algorithm on loopback without SSH, a second
 machine, root access, or a wire-protocol change.
 
 The extension interface is `struct msc_udp_cc_ops` in
-[udp_session.c](../udp_session.c). Controllers currently compile into that
+[udp_session.c](../src/udp_session.c). Controllers currently compile into that
 translation unit; there is no runtime shared-library loader or stable binary
 plugin ABI.
 
@@ -135,15 +135,15 @@ The clean/loss helper checks registration and byte delivery. Then use the WAN
 shim for delay, jitter, loss, and MTU experiments without privileges:
 
 ```sh
-make shims/wan_shim.so
+make build/wan_shim.so
 work=$(mktemp -d)
 head -c 8M /dev/urandom > "$work/input.bin"
-timeout 90 env LD_PRELOAD="$PWD/shims/wan_shim.so" \
+timeout 90 env LD_PRELOAD="$PWD/build/wan_shim.so" \
   MSC_UDP_CC=mycc MSC_UDP_CTL=stdio MSC_UDP_PROFILE=wan \
   MSC_UDP_STATS=1 MSC_UDP_WANSHIM_DELAY_MS=15 \
   MSC_UDP_WANSHIM_JITTER_MS=3 MSC_UDP_WANSHIM_LOSS_PCT=1 \
   MSC_UDP_WANSHIM_SEED=12345 MSC_UDP_WANSHIM_TRACE=1 \
-  ./udp_test "$work/input.bin" "$work/output.bin" 2 2>"$work/wan.log"
+  ./build/udp_test "$work/input.bin" "$work/output.bin" 2 2>"$work/wan.log"
 cmp "$work/input.bin" "$work/output.bin"
 ```
 

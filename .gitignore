@@ -1,22 +1,8 @@
-# Build outputs
-*.o
-*.so
+# Build outputs: everything but msc goes to build/
+/build/
 /msc
-/recursive_test
-/segmented_test
-/child_status_test
-/udp_test
-/udp_protocol_test
-/resume_test
-/retry_test
-/exit_code_test
-/stall_timeout_test
-/port_spec_test
-/port_squat
-/shims/wan_shim_test
 __pycache__/
 *.pyc
-/benchmarks/manifest_scan
 
 # Local engineering notes and measurement artifacts; keep source releases clean.
 /docs/performance-release-review.md

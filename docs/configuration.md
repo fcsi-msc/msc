@@ -195,10 +195,10 @@ retroactively change that SSH process's options.
 
 ## Implementation and validation
 
-[parse.c](../parse.c) and [msc.h](../msc.h) define CLI defaults;
-[udp_transport.c](../udp_transport.c) applies options and forwarding;
-[udp_session.c](../udp_session.c) reads engine knobs and profiles;
-[netutil.c](../netutil.c) chooses SSH budgets.
-[transport_default_test.sh](../transport_default_test.sh),
-[env_preset_test.sh](../env_preset_test.sh), and
-[port_spec_test.c](../port_spec_test.c) cover important configuration paths.
+[parse.c](../src/parse.c) and [msc.h](../src/msc.h) define CLI defaults;
+[udp_transport.c](../src/udp_transport.c) applies options and forwarding;
+[udp_session.c](../src/udp_session.c) reads engine knobs and profiles;
+[netutil.c](../src/netutil.c) chooses SSH budgets.
+[transport_default_test.sh](../tests/transport_default_test.sh),
+[env_preset_test.sh](../tests/env_preset_test.sh), and
+[port_spec_test.c](../tests/port_spec_test.c) cover important configuration paths.

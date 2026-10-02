@@ -6,12 +6,12 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 head -c 2097152 /dev/urandom > "$work/source"
 for mode in direct shared; do
    if [ "$mode" = shared ]; then
-      export MSC_UDP_PORTS=1 LD_PRELOAD="$PWD/udp_offload_shim.so"
+      export MSC_UDP_PORTS=1 LD_PRELOAD="$PWD/build/udp_offload_shim.so"
    fi
    MSC_UDP_STATS=1 MSC_TEST_STALL_TIMEOUT_MS=120000 \
       timeout 180 "${VALGRIND:-valgrind}" --tool=helgrind --error-exitcode=99 \
-      --suppressions="$PWD/valgrind.supp" \
-      --log-file="$work/$mode.%p.log" ./udp_test "$work/source" "$work/$mode" 2 \
+      --suppressions="$PWD/tests/valgrind.supp" \
+      --log-file="$work/$mode.%p.log" ./build/udp_test "$work/source" "$work/$mode" 2 \
       >"$work/$mode.transfer" 2>&1 && rc=0 || rc=$?
    unset LD_PRELOAD MSC_UDP_PORTS
    cat "$work/$mode.transfer"

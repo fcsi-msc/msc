@@ -11,12 +11,12 @@
 set -eu
 
 MSC="${MSC:-./msc}"
-SHIM="${MSC_WANSHIM_SO:-./shims/wan_shim.so}"
+SHIM="${MSC_WANSHIM_SO:-./build/wan_shim.so}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 if [ ! -f "$SHIM" ]; then
-   echo "env preset test: SKIP (no $SHIM; make shims/wan_shim.so)"
+   echo "env preset test: SKIP (no $SHIM; make build/wan_shim.so)"
    exit 0
 fi
 

@@ -150,12 +150,12 @@ control.
 
 ## Implementation and validation
 
-- [udp_session.c](../udp_session.c): `sender_take_acknowledgment`,
+- [udp_session.c](../src/udp_session.c): `sender_take_acknowledgment`,
   `flow_reorder_wait_ns`, `flow_rto_ns`, `flush_run`, sender/receiver workers.
-- [udp_session.h](../udp_session.h): packet records and timing constants.
-- [udp_parity_test.sh](../udp_parity_test.sh): delivery under loss, slices,
+- [udp_session.h](../src/udp_session.h): packet records and timing constants.
+- [udp_parity_test.sh](../tests/udp_parity_test.sh): delivery under loss, slices,
   publication, PMTUD, and offload fallback.
-- [wanshim_test.sh](../wanshim_test.sh): impaired-path regression coverage.
+- [wanshim_test.sh](../tests/wanshim_test.sh): impaired-path regression coverage.
 
 These suites check concrete delivery cases. They do not constitute an exhaustive
 proof of all packet interleavings or congestion behavior.

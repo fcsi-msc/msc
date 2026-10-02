@@ -75,7 +75,7 @@ head -c 16M /dev/urandom > /tmp/mscvg/in.bin
 
 valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
          --num-callers=40 --error-exitcode=1 \
-         ./segmented_test /tmp/mscvg/in.bin /tmp/mscvg/out.bin 8 1048576 1
+         ./build/segmented_test /tmp/mscvg/in.bin /tmp/mscvg/out.bin 8 1048576 1
 ```
 
 Harness arguments:
@@ -98,7 +98,7 @@ head -c 5M /dev/urandom > /tmp/mscvg/rsrc/a.bin
 head -c 1M /dev/urandom > /tmp/mscvg/rsrc/sub1/b.bin
 head -c 3M /dev/urandom > /tmp/mscvg/rsrc/sub2/deep/c.bin
 : > /tmp/mscvg/rsrc/empty.bin
-valgrind --leak-check=full --track-origins=yes ./recursive_test /tmp/mscvg/rsrc /tmp/mscvg/rdst 8 1048576
+valgrind --leak-check=full --track-origins=yes ./build/recursive_test /tmp/mscvg/rsrc /tmp/mscvg/rdst 8 1048576
 diff -r /tmp/mscvg/rsrc /tmp/mscvg/rdst && echo MATCH
 ```
 
@@ -137,7 +137,7 @@ race pass once Memcheck is clean:
 ```bash
 make helgrind
 # or manually:
-valgrind --tool=helgrind --num-callers=40 ./segmented_test /tmp/mscvg/in.bin /tmp/mscvg/out.bin 8 1048576 1
+valgrind --tool=helgrind --num-callers=40 ./build/segmented_test /tmp/mscvg/in.bin /tmp/mscvg/out.bin 8 1048576 1
 ```
 
 Inspect full stacks to distinguish runtime-library reports from MSC ownership

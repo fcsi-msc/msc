@@ -45,7 +45,7 @@ verify_tree()
 echo "recursive+many: clean"
 rm -rf "$ROOT/clean"
 timeout 60 env MSC_UDP_CTL=many MSC_UDP_PORTS=2 \
-   ./udp_test "$SRC" "$ROOT/clean" 4
+   ./build/udp_test "$SRC" "$ROOT/clean" 4
 verify_tree "$ROOT/clean"
 
 # 2. Deterministic defect-1 guard: drop the TABLE_BEGIN record on its first
@@ -56,7 +56,7 @@ echo "recursive+many: TABLE_BEGIN dropped once, drain must recover"
 rm -rf "$ROOT/dropped"
 timeout 60 env MSC_UDP_CTL=many MSC_UDP_PORTS=2 \
    MSC_TEST_DROP_TABLE_BEGIN=1 MSC_TEST_STALL_TIMEOUT_MS=8000 \
-   ./udp_test "$SRC" "$ROOT/dropped" 4
+   ./build/udp_test "$SRC" "$ROOT/dropped" 4
 verify_tree "$ROOT/dropped"
 
 # 3. Defect-2 guard (the orphan watchdog): the sender vanishes at the handoff
@@ -71,7 +71,7 @@ rm -rf "$ROOT/orphan"
 set +e
 timeout 30 env MSC_UDP_CTL=many MSC_UDP_PORTS=2 \
    MSC_TEST_SILENT_AFTER_MANIFEST=1 MSC_TEST_STALL_TIMEOUT_MS=3000 \
-   ./udp_test "$SRC" "$ROOT/orphan" 4 > "$ROOT/orphan.log" 2>&1
+   ./build/udp_test "$SRC" "$ROOT/orphan" 4 > "$ROOT/orphan.log" 2>&1
 code=$?
 set -e
 if [ "$code" -ne 6 ]; then

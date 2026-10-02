@@ -10,22 +10,22 @@ run_file()
 {
    name=$1
    shift
-   env "$@" ./udp_test "$ROOT/input.bin" "$ROOT/$name.bin" 4
+   env "$@" ./build/udp_test "$ROOT/input.bin" "$ROOT/$name.bin" 4
    cmp "$ROOT/input.bin" "$ROOT/$name.bin"
 }
 
 run_file clean
-./udp_test "$ROOT/input.bin" "$ROOT/loss.bin" 4 10
+./build/udp_test "$ROOT/input.bin" "$ROOT/loss.bin" 4 10
 cmp "$ROOT/input.bin" "$ROOT/loss.bin"
 
 if MSC_TEST_STALL_TIMEOUT_MS=200 timeout 5 \
-   ./udp_test "$ROOT/input.bin" "$ROOT/stalled.bin" 4 100; then
+   ./build/udp_test "$ROOT/input.bin" "$ROOT/stalled.bin" 4 100; then
    echo "100% UDP loss unexpectedly outlived the stall timeout" >&2
    exit 1
 fi
 
 MSC_TEST_SRC_OFFSET=262144 MSC_TEST_DST_OFFSET=524288 MSC_TEST_LENGTH=524288 \
-./udp_test "$ROOT/input.bin" "$ROOT/offset.out" 4
+./build/udp_test "$ROOT/input.bin" "$ROOT/offset.out" 4
 dd if="$ROOT/input.bin" of="$ROOT/offset.src" bs=1 skip=262144 count=524288 status=none
 dd if="$ROOT/offset.out" of="$ROOT/offset.dst" bs=1 skip=524288 count=524288 status=none
 cmp "$ROOT/offset.src" "$ROOT/offset.dst"
@@ -37,7 +37,7 @@ dd if=/dev/urandom of="$ROOT/tree/a/b/deep.bin" bs=32K count=3 status=none
 : > "$ROOT/tree/a/empty"
 chmod 640 "$ROOT/tree/root.bin"
 chmod 750 "$ROOT/tree/a"
-./udp_test "$ROOT/tree" "$ROOT/tree.out" 4
+./build/udp_test "$ROOT/tree" "$ROOT/tree.out" 4
 diff -r "$ROOT/tree" "$ROOT/tree.out"
 
 # A manifest bigger than the soft fd limit: msc must raise its own soft
@@ -46,12 +46,12 @@ diff -r "$ROOT/tree" "$ROOT/tree.out"
 mkdir -p "$ROOT/manytree"
 i=1; while [ $i -le 300 ]; do printf x > "$ROOT/manytree/f$i"; i=$((i+1)); done
 # shellcheck disable=SC3045 # ulimit -S: supported by dash, bash, and busybox sh
-( ulimit -S -n 128 && exec ./udp_test "$ROOT/manytree" "$ROOT/manytree.out" 2 )
+( ulimit -S -n 128 && exec ./build/udp_test "$ROOT/manytree" "$ROOT/manytree.out" 2 )
 diff -r "$ROOT/manytree" "$ROOT/manytree.out"
 
 dd if=/dev/zero of="$ROOT/slice.out" bs=1M count=4 status=none
 MSC_TEST_MULTI=1 MSC_TEST_SRC_OFFSET=524288 MSC_TEST_DST_OFFSET=2097152 \
-MSC_TEST_LENGTH=1048576 ./udp_test "$ROOT/input.bin" "$ROOT/slice.out" 4
+MSC_TEST_LENGTH=1048576 ./build/udp_test "$ROOT/input.bin" "$ROOT/slice.out" 4
 dd if="$ROOT/input.bin" of="$ROOT/slice.src" bs=1 skip=524288 count=1048576 status=none
 dd if="$ROOT/slice.out" of="$ROOT/slice.dst" bs=1 skip=2097152 count=1048576 status=none
 cmp "$ROOT/slice.src" "$ROOT/slice.dst"
@@ -59,12 +59,12 @@ test "$(od -An -tu1 -N1 "$ROOT/slice.out")" -eq 0
 test "$(od -An -tu1 -j 3145728 -N1 "$ROOT/slice.out")" -eq 0
 
 printf keep > "$ROOT/existing.bin"
-if MSC_TEST_NO_FORCE=1 ./udp_test "$ROOT/input.bin" "$ROOT/existing.bin" 2; then
+if MSC_TEST_NO_FORCE=1 ./build/udp_test "$ROOT/input.bin" "$ROOT/existing.bin" 2; then
    echo "no-force publication unexpectedly succeeded" >&2
    exit 1
 fi
 test "$(cat "$ROOT/existing.bin")" = keep
-if MSC_UDP_RX_NOWRITE=1 ./udp_test "$ROOT/input.bin" "$ROOT/corrupt.bin" 2; then
+if MSC_UDP_RX_NOWRITE=1 ./build/udp_test "$ROOT/input.bin" "$ROOT/corrupt.bin" 2; then
    echo "checksum mismatch unexpectedly published" >&2
    exit 1
 fi
@@ -89,7 +89,7 @@ flow_units()
 {
    name=$1
    shift
-   env "$@" MSC_UDP_STATS=1 ./udp_test "$ROOT/input.bin" "$ROOT/$name.bin" 4 \
+   env "$@" MSC_UDP_STATS=1 ./build/udp_test "$ROOT/input.bin" "$ROOT/$name.bin" 4 \
       2> "$ROOT/$name.stats" > /dev/null
    cmp "$ROOT/input.bin" "$ROOT/$name.bin"
    sed -n 's/.*flow [0-9][0-9]*: units \([0-9][0-9]*\) .*/\1/p' \
@@ -111,13 +111,13 @@ test "$(head -1 "$ROOT/lowcap.units")" -gt 300
 # bounds the test; the checkpoint is already durable either way.
 if MSC_TEST_CHECKPOINT="$ROOT/resume.ckpt" MSC_TEST_INTERRUPT_AFTER_CHECKPOINTS=1 \
    MSC_UDP_CHECKPOINT_BYTES=524288 \
-   timeout 30 ./udp_test "$ROOT/input.bin" "$ROOT/resume.bin" 4; then
+   timeout 30 ./build/udp_test "$ROOT/input.bin" "$ROOT/resume.bin" 4; then
    echo "interrupted resumable transfer unexpectedly succeeded" >&2
    exit 1
 fi
 test -e "$ROOT/resume.ckpt"
 MSC_TEST_CHECKPOINT="$ROOT/resume.ckpt" MSC_TEST_RESUME=1 MSC_UDP_PMTUD_CAP=1400 \
-MSC_UDP_CHECKPOINT_BYTES=524288 ./udp_test "$ROOT/input.bin" "$ROOT/resume.bin" 4
+MSC_UDP_CHECKPOINT_BYTES=524288 ./build/udp_test "$ROOT/input.bin" "$ROOT/resume.bin" 4
 cmp "$ROOT/input.bin" "$ROOT/resume.bin"
 test ! -e "$ROOT/resume.ckpt"
 test ! -e "$ROOT/resume.bin.msc-part"
@@ -125,8 +125,8 @@ test ! -e "$ROOT/resume.bin.msc-part"
 # A kernel without UDP_SEGMENT/UDP_GRO (the shim fails both syscalls): GSO
 # must log a single fallback and finish via sendmmsg, GRO must silently
 # no-op, and the bytes must still be correct.
-LD_PRELOAD="$PWD/udp_offload_shim.so" \
-   ./udp_test "$ROOT/input.bin" "$ROOT/noffload.bin" 4 2> "$ROOT/noffload.stats"
+LD_PRELOAD="$PWD/build/udp_offload_shim.so" \
+   ./build/udp_test "$ROOT/input.bin" "$ROOT/noffload.bin" 4 2> "$ROOT/noffload.stats"
 cmp "$ROOT/input.bin" "$ROOT/noffload.bin"
 grep -q "falling back to sendmmsg" "$ROOT/noffload.stats"
 test "$(grep -c "falling back to sendmmsg" "$ROOT/noffload.stats")" -eq 1
@@ -165,7 +165,7 @@ in_window()
 squat()   # squat <port>... ; sets SQUAT_PID
 {
    : > "$ROOT/squat.out"
-   ./port_squat "$@" > "$ROOT/squat.out" &
+   ./build/port_squat "$@" > "$ROOT/squat.out" &
    SQUAT_PID=$!
    tries=0
    while [ ! -s "$ROOT/squat.out" ] && [ $tries -lt 500 ]; do
@@ -180,7 +180,7 @@ squat()   # squat <port>... ; sets SQUAT_PID
 unsquat() { kill "$SQUAT_PID" 2>/dev/null || true; wait "$SQUAT_PID" 2>/dev/null || true; }
 
 # Default: K = min(flows, 8) ports scanned from 17400, window 4*K.
-./udp_test "$ROOT/input.bin" "$ROOT/ports.bin" 4 \
+./build/udp_test "$ROOT/input.bin" "$ROOT/ports.bin" 4 \
    2> "$ROOT/ports.err" > "$ROOT/ports.out"
 cmp "$ROOT/input.bin" "$ROOT/ports.bin"
 grep -q "^MSC UDP receiver: 4 data ports: " "$ROOT/ports.err"
@@ -197,14 +197,14 @@ reported_ports "$ROOT/ports.err" sender > "$ROOT/ports.tx"
 cmp "$ROOT/ports.rx" "$ROOT/ports.tx"
 
 # K below the flow count: 8 flows over 2 sockets, with the mapping spelled out.
-MSC_UDP_PORTS=2 ./udp_test "$ROOT/input.bin" "$ROOT/k2.bin" 8 2> "$ROOT/k2.err"
+MSC_UDP_PORTS=2 ./build/udp_test "$ROOT/input.bin" "$ROOT/k2.bin" 8 2> "$ROOT/k2.err"
 cmp "$ROOT/input.bin" "$ROOT/k2.bin"
 grep -q "^MSC UDP receiver: 2 data ports: .* (8 flows, flow f -> socket f mod 2)" "$ROOT/k2.err"
 test "$(reported_ports "$ROOT/k2.err" receiver | wc -l)" -eq 2
 
 # Exact ports, honored verbatim and in order.
 MSC_UDP_PORT_LIST=21500,21502-21504 \
-   ./udp_test "$ROOT/input.bin" "$ROOT/list.bin" 4 2> "$ROOT/list.err"
+   ./build/udp_test "$ROOT/input.bin" "$ROOT/list.bin" 4 2> "$ROOT/list.err"
 cmp "$ROOT/input.bin" "$ROOT/list.bin"
 test "$(reported_ports "$ROOT/list.err" receiver | tr '\n' ' ')" = "21500 21502 21503 21504 "
 
@@ -212,7 +212,7 @@ test "$(reported_ports "$ROOT/list.err" receiver | tr '\n' ' ')" = "21500 21502 
 # it, and leave nothing bound.
 squat 21502
 if MSC_UDP_PORT_LIST=21500,21502-21504 \
-   ./udp_test "$ROOT/input.bin" "$ROOT/busy.bin" 4 2> "$ROOT/busy.err"; then
+   ./build/udp_test "$ROOT/input.bin" "$ROOT/busy.bin" 4 2> "$ROOT/busy.err"; then
    unsquat
    echo "a busy exact port list unexpectedly transferred" >&2
    exit 1
@@ -225,7 +225,7 @@ test ! -e "$ROOT/busy.bin"
 # Scanning steps over a busy port instead of failing -- this is what lets two
 # users transfer at once without agreeing on anything.
 squat 21600 21601
-MSC_UDP_PORT_BASE=21600 ./udp_test "$ROOT/input.bin" "$ROOT/scan.bin" 4 \
+MSC_UDP_PORT_BASE=21600 ./build/udp_test "$ROOT/input.bin" "$ROOT/scan.bin" 4 \
    2> "$ROOT/scan.err"
 unsquat
 cmp "$ROOT/input.bin" "$ROOT/scan.bin"
@@ -234,7 +234,7 @@ test "$(reported_ports "$ROOT/scan.err" receiver | tr '\n' ' ')" = "21602 21603 
 # ... but a window with too few free ports fails, naming the window.
 squat 21701
 if MSC_UDP_PORT_BASE=21700 MSC_UDP_PORT_SPAN=4 \
-   ./udp_test "$ROOT/input.bin" "$ROOT/narrow.bin" 4 2> "$ROOT/narrow.err"; then
+   ./build/udp_test "$ROOT/input.bin" "$ROOT/narrow.bin" 4 2> "$ROOT/narrow.err"; then
    unsquat
    echo "an exhausted port window unexpectedly transferred" >&2
    exit 1
@@ -244,12 +244,12 @@ grep -q "could not find 4 free data ports in 21700-21703" "$ROOT/narrow.err"
 
 # span 0 is the exact-block escape hatch (the pre-scan --udp-port-base contract).
 MSC_UDP_PORT_BASE=21800 MSC_UDP_PORT_SPAN=0 \
-   ./udp_test "$ROOT/input.bin" "$ROOT/block.bin" 4 2> "$ROOT/block.err"
+   ./build/udp_test "$ROOT/input.bin" "$ROOT/block.bin" 4 2> "$ROOT/block.err"
 cmp "$ROOT/input.bin" "$ROOT/block.bin"
 test "$(reported_ports "$ROOT/block.err" receiver | tr '\n' ' ')" = "21800 21801 21802 21803 "
 squat 21802
 if MSC_UDP_PORT_BASE=21800 MSC_UDP_PORT_SPAN=0 \
-   ./udp_test "$ROOT/input.bin" "$ROOT/block2.bin" 4 2> "$ROOT/block2.err"; then
+   ./build/udp_test "$ROOT/input.bin" "$ROOT/block2.bin" 4 2> "$ROOT/block2.err"; then
    unsquat
    echo "a busy exact block unexpectedly transferred" >&2
    exit 1
@@ -259,7 +259,7 @@ grep -q "requested data port 21802 is in use by another transfer" "$ROOT/block2.
 
 # A malformed request is refused, not silently defaulted.
 if MSC_UDP_PORT_LIST=21900,21900 \
-   ./udp_test "$ROOT/input.bin" "$ROOT/dup.bin" 2 2> "$ROOT/dup.err"; then
+   ./build/udp_test "$ROOT/input.bin" "$ROOT/dup.bin" 2 2> "$ROOT/dup.err"; then
    echo "a duplicated port list unexpectedly transferred" >&2
    exit 1
 fi
@@ -269,7 +269,7 @@ grep -q "port 21900 appears twice" "$ROOT/dup.err"
 # the whole isolation mechanism, so three at once must take disjoint ports and
 # all complete.
 for i in 1 2 3; do
-   ( ./udp_test "$ROOT/input.bin" "$ROOT/conc$i.bin" 4 2> "$ROOT/conc$i.err" ) &
+   ( ./build/udp_test "$ROOT/input.bin" "$ROOT/conc$i.bin" 4 2> "$ROOT/conc$i.err" ) &
 done
 wait
 for i in 1 2 3; do
@@ -283,7 +283,7 @@ test "$(sort "$ROOT/conc.all" | wc -l)" -eq "$(sort -u "$ROOT/conc.all" | wc -l)
 # Once on the default control mode, once on tcp: the version check itself is
 # mode-independent, but the rendezvous it rides is not, and everything above
 # this line now runs on the default only.
-./udp_protocol_test
-MSC_UDP_CTL=tcp ./udp_protocol_test
+./build/udp_protocol_test
+MSC_UDP_CTL=tcp ./build/udp_protocol_test
 
 echo "MSC UDP parity tests passed"
