@@ -115,8 +115,14 @@ def main():
                    "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000",
                    "MSC_UDP_STATS": "1"})
         assert dest.read_bytes() == source4.read_bytes()
-        rto = re.findall(r"MSC UDP sender flow \d+: .*? rtxrto (\d+) ", out)
-        assert len(rto) == 2 and set(rto) == {"0"}, out
+        # The sender's flows start only once the receiver is ready: its own
+        # prepare phase covers the receiver's 2.4 s of reservation. (Counting
+        # retransmissions instead would also catch ordinary data-phase loss on
+        # hosts with small socket buffers.)
+        prepare = {m.group(1): float(m.group(2)) for m in re.finditer(
+            r"MSC UDP (sender|receiver) phases: .* prepare (\d+\.\d+)s", out)}
+        assert set(prepare) == {"sender", "receiver"}, out
+        assert prepare["receiver"] >= 2.3 and prepare["sender"] >= 2.3, out
         # Preparation that stops advancing is still a stall: with a reservation
         # step hung for 4 s under a 1 s timeout, the sender gives up. (This
         # harness runs the receiver in-process, so the run itself lasts until
