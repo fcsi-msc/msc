@@ -2,6 +2,20 @@
 
 Notable user-facing changes are recorded here.
 
+## Unreleased
+
+### Added
+
+- `contrib/slurm`: `B_NODE` and `MSC_SRUN_EXTRA` let the smoke test and
+  `msc-srun` run in heterogeneous jobs, for partitions that allow only one
+  node per job.
+
+### Fixed
+
+- `contrib/slurm/msc-slurm-smoke.sh` keeps a job step running on the receiving
+  node. Where systemd-logind removes a user's `/dev/shm` files between job
+  steps, transfers and checksums no longer fail.
+
 ## 1.0.0 - 2026-09-26
 
 ### Added
