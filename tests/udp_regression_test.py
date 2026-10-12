@@ -93,8 +93,14 @@ def main():
             assert abs(parts - float(m.group("total"))) < 0.01, m.group(0)
         assert float(sides["receiver"].group("prepare")) >= 0.9, out
         assert float(sides["receiver"].group("data")) < 0.9, out
-        print("ok: phase timings charge a slow reservation to the receiver's prepare",
-              flush=True)
+        # A failed transfer still reports both sides' phases; a stall caused
+        # by losing every data packet fails the transfer.
+        out = run([ROOT / "build/udp_test", source, work / "phases-failed", "2", "100"],
+                  {"MSC_TEST_STALL_TIMEOUT_MS": "500", "MSC_UDP_STATS": "1"}, expected=6)
+        failed = set(re.findall(r"MSC UDP (sender|receiver) phases: ", out))
+        assert failed == {"sender", "receiver"}, out
+        print("ok: phase timings charge a slow reservation to the receiver's prepare; "
+              "failures report them too", flush=True)
 
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and
         # retransmission-cache reuse. Compare bytes independently of MSC.

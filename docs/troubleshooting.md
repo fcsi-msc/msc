@@ -38,8 +38,8 @@ delayed ACKs, or an earlier receive layer may be responsible.
 
 ### Phase timings
 
-When the session closes, each side prints one line accounting for its whole
-lifetime, for example:
+When the session closes, including after a failed transfer, each side prints
+one line accounting for its whole lifetime, for example:
 
 ```text
 MSC UDP receiver phases: start 0.010s open 0.011s probe 0.045s setup 0.000s prepare 1.561s data 1.335s finish 0.157s close 0.003s total 3.122s transfers 1

@@ -1619,10 +1619,13 @@ void udp_send(struct argdata *AD)
          cfg.src_offset = base;
          cfg.xferlen = AD->xferlen > 0 ? (uint64_t)AD->xferlen : 0;
          if (msc_udp_sender_send(session, &cfg) != 0)
+         {
+            udp_abort_sender_session(session);   /* also reports its phases */
             udp_exit_with(
                udp_exit_status_valid(cfg.error_code)
                   ? cfg.error_code : MSC_EXIT_NETWORK,
                "sender failed");
+         }
          bytes = cfg.bytes_done;
          __atomic_store_n(&current, bytes, __ATOMIC_RELAXED);
          msc_progress_finish(&progress, 1,
