@@ -52,7 +52,27 @@ def main():
         out = run([ROOT / "build/udp_test", source, work / "no-path", "1"],
                   {"LD_PRELOAD": wan, "MSC_UDP_WANSHIM_MTU": "100"}, expected=6)
         assert "no usable payload" in out
-        print("ok: reduced MTU with/without offloads; unconfirmed path fails", flush=True)
+        # With UDP_GRO the kernel can deliver one round's largest probe and the
+        # next round's smallest as a single buffer. The ceiling must still come
+        # from one probe: on a 2016-byte path, 2016 and not 2016 + 548.
+        gro = str(ROOT / "build/gro_coalesce_shim.so")
+        dest = work / "gro-probes"
+        out = run([ROOT / "build/udp_test", source, dest, "2"],
+                  {"LD_PRELOAD": f"{wan} {gro}", "MSC_UDP_WANSHIM_MTU": "2016",
+                   "MSC_UDP_STATS": "1"})
+        assert dest.read_bytes() == source.read_bytes()
+        assert "PMTUD saw payload 2016 " in out, out
+        # A receiver that still reports the summed size (an older release)
+        # must not push the sender above the largest size it actually probed.
+        dest = work / "gro-probes-as-one"
+        out = run([ROOT / "build/udp_test", source, dest, "2"],
+                  {"LD_PRELOAD": f"{wan} {gro}", "MSC_UDP_WANSHIM_MTU": "2016",
+                   "MSC_TEST_COALESCE_AS_ONE": "1", "MSC_UDP_STATS": "1"})
+        assert dest.read_bytes() == source.read_bytes()
+        assert "PMTUD saw payload 2564 " in out, out
+        assert re.search(r"confirmed_payload 2016 -> payload ceiling 1968\b", out), out
+        print("ok: reduced MTU with/without offloads; unconfirmed path fails; "
+              "coalesced probes", flush=True)
 
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and
         # retransmission-cache reuse. Compare bytes independently of MSC.

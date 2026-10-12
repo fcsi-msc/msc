@@ -2173,6 +2173,21 @@ static void pmtud_probe_sender(int udpfd, int controlfd,
       confirmed = 0;
    }
    if (do_pmtud && confirmed > hdr)
+   {
+      /* Adopt only a size that was actually probed. A receiver can report
+       * more than any single probe carried (older receivers summed
+       * GRO-coalesced probes), and a payload above the path ceiling
+       * fragments or stalls the whole transfer. */
+      uint32_t reported = confirmed;
+      confirmed = 0;
+      for (i = 0; i < n; i++)
+         if ((uint32_t)cand[i] <= reported && (uint32_t)cand[i] > confirmed)
+            confirmed = (uint32_t)cand[i];
+      if (confirmed != reported && g_stats)
+         fprintf(stderr, "MSC UDP sender: PMTUD receiver reported %u, which is not "
+                 "a probed size; using %u\n", reported, confirmed);
+   }
+   if (do_pmtud && confirmed > hdr)
       g_payload_probe = (size_t)confirmed - hdr;
    disc = IP_PMTUDISC_WANT;   /* back to the default for the data phase */
    if (do_pmtud)
@@ -2325,9 +2340,17 @@ static void pmtud_probe_receiver(int udpfd, int controlfd,
          }
          if (do_pmtud && ntohl(h->magic) == MSC_UDP_MAGIC && type == MSC_UDP_PROBE)
          {
+            /* With UDP_GRO on this socket, one read can return back-to-back
+             * probes coalesced into a single buffer, such as one round's
+             * largest rung followed by the next round's smallest. Count only
+             * the first probe: the size its own header declares. */
+            uint32_t size = (uint32_t)got;
+            uint32_t declared = (uint32_t)hdr + ntohl(h->length);
+            if (declared < size)
+               size = declared;
             last_probe_ns = msc_udp_now_ns();   /* arms the idle-gap exit */
-            if ((uint32_t)got > max_seen)
-               max_seen = (uint32_t)got;
+            if (size > max_seen)
+               max_seen = size;
          }
          continue;   /* keep draining while data is flowing */
       }
