@@ -160,6 +160,40 @@ def main():
         assert re.search(r"receiver rx: 0 bytes in \d+ ms, avg 0\.00 Gbit/s", out), out
         print("ok: receiver rx summary reports bytes received, not the planned size", flush=True)
 
+        # PMTUD stats must tell a rung the local stack refused (EMSGSIZE from a
+        # smaller interface: never on the wire) from one lost downstream. Each
+        # limit alone, at the same size, must still settle on the same payload.
+        stats = {}
+        for name, limits in (("local", {"MSC_UDP_WANSHIM_LOCAL_MTU": "2044"}),
+                             ("remote", {"MSC_UDP_WANSHIM_MTU": "2044"}),
+                             ("both", {"MSC_UDP_WANSHIM_LOCAL_MTU": "2044",
+                                       "MSC_UDP_WANSHIM_MTU": "1500"})):
+            dest = work / f"pmtud-{name}"
+            out = run([ROOT / "build/udp_test", source, dest, "2"],
+                      dict(limits, LD_PRELOAD=wan, MSC_UDP_PMTUD_CAP="9000",
+                           MSC_UDP_STATS="1", MSC_UDP_WANSHIM_TRACE="1"))
+            assert dest.read_bytes() == source.read_bytes()
+            line = re.search(r"MSC UDP sender: PMTUD seed_mtu .*", out)
+            assert line, out
+            stats[name] = {key.replace(" ", "_"): int(value) for key, value in re.findall(
+                r"(confirmed_payload|payload ceiling|ladder|probe_losses|probe_unsendable) (\d+)",
+                line.group(0))}
+            shim = dict(re.findall(r"(mtu_drops|local_mtu_refusals)=(\d+)", out))
+            for limit, counter in (("MSC_UDP_WANSHIM_LOCAL_MTU", "local_mtu_refusals"),
+                                   ("MSC_UDP_WANSHIM_MTU", "mtu_drops")):
+                assert (int(shim[counter]) > 0) == (limit in limits), (name, shim, out)
+        local, remote, both = stats["local"], stats["remote"], stats["both"]
+        assert local["probe_losses"] == 0, ("refused rungs counted as losses", local)
+        assert local["probe_unsendable"] > 0, local
+        assert remote["probe_unsendable"] == 0, remote
+        assert remote["probe_losses"] == local["probe_unsendable"], (local, remote)
+        for key in ("confirmed_payload", "payload_ceiling", "ladder"):
+            assert local[key] == remote[key], (key, local, remote)
+        assert both["confirmed_payload"] < local["confirmed_payload"], (both, local)
+        assert both["probe_losses"] > 0, both
+        assert both["probe_unsendable"] == local["probe_unsendable"], (both, local)
+        print("ok: PMTUD stats separate locally unsendable probes from path losses", flush=True)
+
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and
         # retransmission-cache reuse. Compare bytes independently of MSC.
         large = work / "large"

@@ -2327,6 +2327,7 @@ static void pmtud_probe_sender(int udpfd, int controlfd,
                                int do_pmtud)
 {
    size_t cand[12];
+   int sent[sizeof(cand) / sizeof(cand[0])] = { 0 };   /* rung left the host */
    int seed_mtu = 0, n, round, i;
    uint32_t tag = 0, confirmed = 0;
    size_t hdr = sizeof(struct msc_udp_packet_header);
@@ -2384,7 +2385,8 @@ static void pmtud_probe_sender(int udpfd, int controlfd,
          h->seq = msc_udp_hton64((uint64_t)cand[i]); /* identifies the probe size */
          h->offset = msc_udp_hton64(0);
          h->send_tsc = msc_udp_hton64(msc_udp_now_ns());
-         (void)send(udpfd, buf, cand[i], 0);    /* EMSGSIZE = size unsendable */
+         if (send(udpfd, buf, cand[i], 0) >= 0)   /* EMSGSIZE = size unsendable */
+            sent[i] = 1;
       }
       /* This inter-round pause used to be a blind sleep. Spend it draining
        * instead: the receiver is still inside its probe loop (it has not seen
@@ -2480,15 +2482,22 @@ static void pmtud_probe_sender(int udpfd, int controlfd,
    }
    if (g_stats && do_pmtud)
    {
-      /* probe_losses: ladder rungs at/above the confirmed ceiling that never
-       * came back -- i.e. the width of the black-hole above the working size.
-       * A high count next to a low ceiling is the signature of a capped path. */
-      int probe_losses = 0;
+      /* probe_losses: ladder rungs above the confirmed ceiling that were sent
+       * but never came back -- i.e. the width of the black-hole above the
+       * working size. A high count next to a low ceiling is the signature of a
+       * capped path. probe_unsendable: rungs above the ceiling whose every send
+       * failed locally (EMSGSIZE from a smaller local interface MTU). They never
+       * reached the wire, so they say nothing about the path. */
+      int probe_losses = 0, probe_unsendable = 0;
       for (i = 0; i < n; i++)
-         if ((uint32_t)cand[i] > confirmed) probe_losses++;
+         if ((uint32_t)cand[i] > confirmed)
+         {
+            if (sent[i]) probe_losses++;
+            else probe_unsendable++;
+         }
       fprintf(stderr, "MSC UDP sender: PMTUD seed_mtu %d confirmed_payload %u -> "
-              "payload ceiling %zu (ladder %d, probe_losses %d)\n",
-              seed_mtu, confirmed, g_payload_probe, n, probe_losses);
+              "payload ceiling %zu (ladder %d, probe_losses %d, probe_unsendable %d)\n",
+              seed_mtu, confirmed, g_payload_probe, n, probe_losses, probe_unsendable);
    }
 }
 

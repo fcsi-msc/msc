@@ -30,6 +30,13 @@
  *                              a local send succeeding proves only the LOCAL
  *                              interface could carry it, which is the whole
  *                              distinction PMTUD exists to discover
+ *   MSC_UDP_WANSHIM_LOCAL_MTU  smaller local interface: fail any datagram
+ *                              larger than this many bytes with EMSGSIZE, as
+ *                              the sending host's own stack does for a DF-set
+ *                              datagram its interface cannot carry.  The
+ *                              opposite of MSC_UDP_WANSHIM_MTU: the send FAILS,
+ *                              so nothing reaches the wire.  Only sends are
+ *                              refused; the IP_MTU route seed is unchanged
  *   MSC_UDP_WANSHIM_SEED       RNG seed for a reproducible run; unset => per-run
  *   MSC_UDP_WANSHIM_TRACE      1 => log the applied config at start and a
  *                              send/delay/drop tally at exit
@@ -100,6 +107,11 @@ static unsigned g_drop_fins;      /* targeted MSC UDP FIN drops */
  * LOCAL interface could carry it, which is exactly the distinction PMTUD has
  * to discover and exactly what a local-only check cannot emulate. */
 static size_t   g_mtu;            /* 0 = unlimited */
+/* Smaller local interface: refuse any datagram larger than this with EMSGSIZE,
+ * as the sender's own stack does to a DF-set datagram that exceeds its
+ * interface MTU.  The caller sees the failure and knows the datagram never left
+ * the host -- the case a remote black hole (g_mtu) must not be confused with. */
+static size_t   g_local_mtu;      /* 0 = unlimited */
 static atomic_uint g_acks_seen;
 static atomic_uint g_fins_seen;
 static int      g_trace;
@@ -124,6 +136,7 @@ struct wan_shim_counters
    atomic_ullong forced_ack_drops;
    atomic_ullong forced_fin_drops;
    atomic_ullong mtu_drops;
+   atomic_ullong local_mtu_refusals;
 };
 static struct wan_shim_counters *g_ctr;      /* shared page; never NULL once init ran */
 static struct wan_shim_counters g_ctr_local; /* fallback if the mmap fails */
@@ -137,6 +150,7 @@ static pid_t g_ctr_owner;                    /* only this pid prints the summary
 #define g_n_forced_ack_drops (g_ctr->forced_ack_drops)
 #define g_n_forced_fin_drops (g_ctr->forced_fin_drops)
 #define g_n_mtu_drops (g_ctr->mtu_drops)
+#define g_n_local_mtu_refusals (g_ctr->local_mtu_refusals)
 
 /* ===== monotonic time ===================================================== */
 static uint64_t now_ns(void)
@@ -561,6 +575,18 @@ static int classify(int fd, const struct iovec *iov, int iovcnt,
    return 0;      /* enqueue failed: fall back to a live send */
 }
 
+/* Local interface MTU check on one wire datagram, made before it is delayed,
+ * dropped or sent: an oversized datagram is refused synchronously, exactly as
+ * the kernel refuses it. Returns 1 with errno = EMSGSIZE if it is refused. */
+static int local_mtu_refuses(size_t len)
+{
+   if (g_local_mtu == 0 || len <= g_local_mtu)
+      return 0;
+   atomic_fetch_add(&g_n_local_mtu_refusals, 1);
+   errno = EMSGSIZE;
+   return 1;
+}
+
 /* ===== intercepted syscalls =============================================== */
 /* Impair wire datagrams, not GSO superpackets. Preserve every other ancillary
  * setting (notably IP_TOS/ECN) when splitting a scatter/gather UDP_SEGMENT send.
@@ -584,6 +610,9 @@ static ssize_t impaired_sendmsg(int fd, const struct msghdr *msg, int flags)
          { errno = EINVAL; return -1; }
          memcpy(&segment, CMSG_DATA(c), sizeof(segment));
       }
+   /* the local stack checks each wire datagram (one GSO segment) */
+   if (local_mtu_refuses(segment != 0 && total > segment ? segment : total))
+      return -1;
    if (segment != 0 && total > segment)
    {
       unsigned char *data = malloc(total);
@@ -643,6 +672,8 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
    if (!real_sendto) init_reals();
    if (!g_active || !is_dgram(fd))
       return real_sendto(fd, buf, len, flags, addr, addrlen);
+   if (local_mtu_refuses(len))
+      return -1;
    iov.iov_base = (void *)buf;
    iov.iov_len = len;
    switch (classify(fd, &iov, 1, addr, addrlen, NULL, 0, flags))
@@ -661,6 +692,8 @@ ssize_t send(int fd, const void *buf, size_t len, int flags)
    if (!real_send) init_reals();
    if (!g_active || !is_dgram(fd))
       return real_send(fd, buf, len, flags);
+   if (local_mtu_refuses(len))
+      return -1;
    iov.iov_base = (void *)buf;
    iov.iov_len = len;
    switch (classify(fd, &iov, 1, NULL, 0, NULL, 0, flags))
@@ -773,6 +806,7 @@ static void wan_shim_init(void)
    g_drop_acks = (unsigned)env_double("MSC_UDP_WANSHIM_DROP_ACKS");
    g_drop_fins = (unsigned)env_double("MSC_UDP_WANSHIM_DROP_FINS");
    g_mtu     = (size_t)env_double("MSC_UDP_WANSHIM_MTU");
+   g_local_mtu = (size_t)env_double("MSC_UDP_WANSHIM_LOCAL_MTU");
    g_trace   = getenv("MSC_UDP_WANSHIM_TRACE") != NULL;
 
    if (delay_ms  < 0) delay_ms  = 0;
@@ -787,7 +821,8 @@ static void wan_shim_init(void)
    g_loss_frac = loss_pct / 100.0;
    g_dup_frac = dup_pct / 100.0;
    g_active = (g_delay_ns || g_jitter_ns || g_loss_frac > 0.0 ||
-               g_dup_frac > 0.0 || g_drop_acks || g_drop_fins || g_mtu != 0);
+               g_dup_frac > 0.0 || g_drop_acks || g_drop_fins || g_mtu != 0 ||
+               g_local_mtu != 0);
 
    seed = getenv("MSC_UDP_WANSHIM_SEED");
    if (seed && *seed)
@@ -833,7 +868,7 @@ static void wan_shim_fini(void)
    if (g_trace && getpid() == g_ctr_owner)
       fprintf(stderr, "wan_shim: sent=%llu delayed=%llu dropped=%llu "
               "duplicated=%llu reordered=%llu forced_ack_drops=%llu "
-              "forced_fin_drops=%llu mtu_drops=%llu\n",
+              "forced_fin_drops=%llu mtu_drops=%llu local_mtu_refusals=%llu\n",
               (unsigned long long)atomic_load(&g_n_immediate),
               (unsigned long long)atomic_load(&g_n_delayed),
               (unsigned long long)atomic_load(&g_n_dropped),
@@ -841,5 +876,6 @@ static void wan_shim_fini(void)
               (unsigned long long)atomic_load(&g_n_reordered),
               (unsigned long long)atomic_load(&g_n_forced_ack_drops),
               (unsigned long long)atomic_load(&g_n_forced_fin_drops),
-              (unsigned long long)atomic_load(&g_n_mtu_drops));
+              (unsigned long long)atomic_load(&g_n_mtu_drops),
+              (unsigned long long)atomic_load(&g_n_local_mtu_refusals));
 }

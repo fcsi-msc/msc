@@ -95,7 +95,7 @@ Keep log consumers draining: a blocked sink can slow transfer workers.
 | --- | --- |
 | Remote launch fails or reports an argument mismatch | Confirm SSH access and use `-B /absolute/path/to/msc`; install matching builds. |
 | TCP works, UDP stalls | Check inbound receiver UDP ports and return ACK traffic. Default stdio removes only the extra TCP control listener. |
-| Stalls depend on packet size | Try `-s 1200` and inspect PMTUD output. |
+| Stalls depend on packet size | Try `-s 1200` and inspect PMTUD output: `probe_losses` counts probe sizes sent but never confirmed, `probe_unsendable` sizes the local interface refused. |
 | Offload-dependent behavior | Try `--no-gso --no-gro`. |
 | High socket or demux drops | Compare lower `-n`, and separately change `--udp-data-ports`; inspect granted buffers. |
 | Small receive window or high write stalls | Compare destination storage and write path; inspect flush time. |
