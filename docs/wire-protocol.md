@@ -122,7 +122,7 @@ state, not by a generic length prefix.
 | 12 | TABLE_BEGIN | u64 transfer ID, file-entry count, total file bytes. |
 | 13 | ERROR | u32 stable receiver failure status. |
 | 14 | READY | Receiver has prepared the destination; the sender may start its data flows. No fields. |
-| 15 | PREPARING | Receiver is still preparing the destination. No fields. Sent at a quarter of the stall timeout (within 100 ms to 5 s) so the sender's control reads do not time out. |
+| 15 | PREPARING | Receiver's preparation of the destination has advanced since the previous record. No fields. Sent at most every quarter of the stall timeout (within 100 ms to 5 s). The sender gives up when neither PREPARING nor READY arrives for a stall timeout, so a hung preparation fails the transfer instead of stalling it indefinitely. |
 
 | Feature bit | Name | Purpose |
 | ---: | --- | --- |

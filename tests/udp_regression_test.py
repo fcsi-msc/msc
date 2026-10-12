@@ -6,6 +6,7 @@ import signal
 import re
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = {k: v for k, v in os.environ.items() if not k.startswith("MSC_")}
@@ -102,17 +103,29 @@ def main():
         print("ok: phase timings charge a slow reservation to the receiver's prepare; "
               "failures report them too", flush=True)
 
-        # The sender waits until the receiver has prepared the destination:
-        # preparation longer than the stall timeout is not a stall, and no
-        # data is sent (and lost) while the receiver cannot take it.
+        # The sender waits until the receiver has prepared the destination.
+        # Preparation that keeps advancing may outlast the stall timeout (four
+        # 1 MiB reservation steps of 0.6 s under a 1 s timeout), and no data is
+        # sent, and lost, while the receiver cannot take it.
         dest = work / "slow-prepare"
-        out = run([ROOT / "build/udp_test", source, dest, "2"],
-                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "3000",
-                   "MSC_TEST_STALL_TIMEOUT_MS": "2000", "MSC_UDP_STATS": "1"})
-        assert dest.read_bytes() == source.read_bytes()
+        source4 = work / "source4"
+        source4.write_bytes(os.urandom(4 * 1024 * 1024))
+        out = run([ROOT / "build/udp_test", source4, dest, "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "600",
+                   "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000",
+                   "MSC_UDP_STATS": "1"})
+        assert dest.read_bytes() == source4.read_bytes()
         rto = re.findall(r"MSC UDP sender flow \d+: .*? rtxrto (\d+) ", out)
         assert len(rto) == 2 and set(rto) == {"0"}, out
-        print("ok: the sender waits for a slow destination without stalling", flush=True)
+        # Preparation that stops advancing is still a stall: with a reservation
+        # step hung for 4 s under a 1 s timeout, the sender gives up. (This
+        # harness runs the receiver in-process, so the run itself lasts until
+        # the hung step returns; the CLI case below checks how fast msc exits.)
+        out = run([ROOT / "build/udp_test", source, work / "stuck-prepare", "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "4000",
+                   "MSC_TEST_STALL_TIMEOUT_MS": "1000"}, expected=6)
+        assert "no progress preparing the destination for 1.0 seconds" in out, out
+        print("ok: the sender waits for a slow destination, not a stuck one", flush=True)
 
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and
         # retransmission-cache reuse. Compare bytes independently of MSC.
@@ -182,6 +195,35 @@ def main():
                 assert "write-path: mmap 0 pwritev 1" in out
                 assert dest.read_bytes() == source.read_bytes()
         print("ok: mmap reserves space; ENOSPC fails cleanly; unsupported allocation uses pwritev", flush=True)
+
+        # A receiver stuck preparing the destination must not hang msc: it
+        # gives up after the stall timeout instead of waiting out the 10 s hang.
+        # Time msc itself; the hung receiver keeps the output pipe open, so
+        # log to a file and kill what is left of the process group afterwards.
+        storage = str(ROOT / "build/storage_fault_shim.so")
+        log = work / "stuck-cli.log"
+        with open(log, "w") as sink:
+            started = time.monotonic()
+            process = subprocess.Popen(
+                [str(ROOT / "msc"), "-n1", "--stall-timeout", "1s",
+                 "-l", "localhost", "-r", "127.0.0.1", "-B", str(ROOT / "msc"),
+                 "-i", str(source), "-o", str(work / "stuck-cli")],
+                cwd=ROOT, stdout=sink, stderr=subprocess.STDOUT, start_new_session=True,
+                env=dict(BASE, MSC_SSH=str(fake), LD_PRELOAD=storage,
+                         MSC_TEST_FALLOCATE_DELAY_MS="10000"))
+            try:
+                code = process.wait(timeout=30)
+                elapsed = time.monotonic() - started
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        out = log.read_text()
+        assert code == 6 and elapsed < 6, (code, elapsed, out)
+        assert "no progress preparing the destination" in out, out
+        print("ok: a receiver stuck preparing the destination fails the CLI promptly",
+              flush=True)
 
         # Grow and rehash the inode index; links span subdirectories and are
         # interleaved with ordinary files. Receiver inode identity must match.

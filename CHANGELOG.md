@@ -29,8 +29,10 @@ Notable user-facing changes are recorded here.
 
 - A UDP sender now waits until the receiver has created and reserved the
   destination before sending data, when both ends support it. Preparing a large
-  destination on slow storage no longer trips the stall timeout, and no data is
-  sent and dropped while the receiver cannot take it.
+  destination on slow storage no longer trips the stall timeout as long as the
+  preparation keeps advancing, and no data is sent and dropped while the
+  receiver cannot take it. Preparation that stops advancing for a stall timeout
+  still fails the transfer.
 
 ## 1.0.0 - 2026-09-26
 

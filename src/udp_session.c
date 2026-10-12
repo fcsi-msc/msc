@@ -957,15 +957,17 @@ struct msc_udp_phases
 };
 
 /* Receiver side of MSC_UDP_FEAT_READY. From the greeting until the destination
- * is prepared, a helper thread sends MSC_UDP_CTL_PREPARING often enough that
- * the waiting sender's control reads never reach the stall timeout; the
- * transfer then sends MSC_UDP_CTL_READY. The control channel is single-
- * threaded, so the helper is joined before anything else writes to it. */
+ * is prepared, a helper thread sends MSC_UDP_CTL_PREPARING, but only while
+ * preparation keeps advancing: a step that hangs stops the heartbeat, and the
+ * waiting sender gives up after its stall timeout as it would for stalled
+ * data. The transfer then sends MSC_UDP_CTL_READY. The control channel is
+ * single-threaded, so the helper is joined before anything else writes to it. */
 struct ready_signal
 {
    int fd;
    int running;            /* the helper thread was started */
    atomic_int stop;
+   atomic_ullong progress; /* bumped by the receiver at each preparation step */
    pthread_t thread;
 };
 
@@ -1391,27 +1393,39 @@ static void *ready_heartbeat_main(void *arg)
    struct ready_signal *r = arg;
    uint64_t period = ready_heartbeat_ns();
    uint64_t next = msc_udp_now_ns() + period;
+   unsigned long long announced = 0;
    struct timespec slice = { 0, 20 * 1000 * 1000 };   /* stop latency */
 
    while (!atomic_load(&r->stop))
    {
+      unsigned long long now_progress;
       nanosleep(&slice, NULL);
       if (atomic_load(&r->stop) || msc_udp_now_ns() < next)
          continue;
+      now_progress = atomic_load(&r->progress);
+      if (now_progress == announced)
+         continue;   /* nothing new: let the sender's stall timer run */
       if (send_u32(r->fd, MSC_UDP_CTL_PREPARING) != 0)
          break;
-      next += period;
+      announced = now_progress;
+      next = msc_udp_now_ns() + period;
    }
    return NULL;
 }
 
 /* Start announcing that the destination is being prepared. Without the helper
- * thread the final READY alone still works on carriers with no read timeout. */
+ * thread a slow preparation can still trip the sender's stall timer. */
 static void ready_begin(struct ready_signal *r, int fd)
 {
    r->fd = fd;
    atomic_init(&r->stop, 0);
+   atomic_init(&r->progress, 0);
    r->running = pthread_create(&r->thread, NULL, ready_heartbeat_main, r) == 0;
+}
+
+static void ready_progress(struct ready_signal *r)
+{
+   if (r != NULL) atomic_fetch_add(&r->progress, 1);
 }
 
 /* Stop the helper; afterwards the caller owns the control channel again. */
@@ -1427,6 +1441,54 @@ static int ready_send(struct ready_signal *r)
 {
    ready_quiesce(r);
    return send_u32(r->fd, MSC_UDP_CTL_READY);
+}
+
+/* Sender side: read control records until one other than MSC_UDP_CTL_PREPARING
+ * arrives. Unlike a plain control read this is bounded on every carrier,
+ * including pipes with no read timeout: going a stall timeout without a
+ * record (the receiver's preparation stopped advancing) fails the transfer,
+ * as stalled data would. 0 disables the bound. */
+static int recv_ready(int fd, volatile sig_atomic_t *cancel, uint32_t *tag)
+{
+   struct msc_udp_control_channel *channel = msc_udp_control_channel_lookup(fd);
+   uint64_t deadline = g_stall_timeout_ns != 0 ? msc_udp_now_ns() + g_stall_timeout_ns : 0;
+
+   for (;;)
+   {
+      int r;
+      if (cancel != NULL && *cancel)
+         return -1;
+      if (channel != NULL)
+         r = msc_udp_control_channel_wait_readable(channel, 100);
+      else
+      {
+         struct pollfd p;
+         p.fd = fd;
+         p.events = POLLIN;
+         r = poll(&p, 1, 100);
+         if (r < 0 && errno == EINTR)
+            r = 0;
+      }
+      if (r < 0)
+         return -1;
+      if (r == 0)
+      {
+         if (deadline != 0 && msc_udp_now_ns() >= deadline)
+         {
+            fprintf(stderr, "MSC UDP sender: no progress preparing the destination "
+                    "for %.1f seconds, giving up\n", (double)g_stall_timeout_ns / 1e9);
+            return -1;
+         }
+         continue;
+      }
+      *tag = 0;
+      if (recv_u32(fd, tag) != 0)
+         return -1;
+      if (*tag != MSC_UDP_CTL_PREPARING)
+         return 0;
+      if (deadline != 0)
+         deadline = msc_udp_now_ns() + g_stall_timeout_ns;
+   }
 }
 static int recv_u64(int fd, uint64_t *v)
 {
@@ -5843,12 +5905,37 @@ static void *rx_sampler_thread(void *arg)
    return NULL;
 }
 
+#define MSC_UDP_RESERVE_CHUNK_MB 256   /* fallocate step while preparing a destination */
+
+/* Reserve [0, size) one chunk at a time. The result matches a single call, but
+ * each step counts as progress for a sender waiting on MSC_UDP_CTL_READY, so a
+ * large reservation on slow storage is told apart from a hung one. errno is
+ * left from the failing call. MSC_TEST_RESERVE_CHUNK_MB shrinks the step. */
+static int reserve_destination(int fd, uint64_t size, struct ready_signal *ready)
+{
+   uint64_t chunk = (uint64_t)MSC_UDP_RESERVE_CHUNK_MB << 20, off = 0;
+   const char *test = getenv("MSC_TEST_RESERVE_CHUNK_MB");
+   if (test != NULL && atoll(test) > 0)
+      chunk = (uint64_t)atoll(test) << 20;
+   while (off < size)
+   {
+      uint64_t len = size - off < chunk ? size - off : chunk;
+      if (fallocate(fd, 0, (off_t)off, (off_t)len) != 0)
+         return -1;
+      off += len;
+      ready_progress(ready);
+   }
+   return 0;
+}
+
 static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_sockset *ss)
 {
    struct receiver_flow *flows;
    pthread_t *threads;
    int created = 0, f, rc = 0, ready = 0;
    uint64_t i;
+
+   ready_progress(x->ready);   /* the destination is open and sized */
 
    /* mmap each destination so flows memcpy in parallel instead of serializing on
     * the per-inode pwritev lock (measured ~2.25x on a single big file). Only when
@@ -5870,7 +5957,7 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
          void *m = MAP_FAILED;
          if (ftruncate(x->files[i].fd, (off_t)x->files[i].size) == 0)
          {
-            if (fallocate(x->files[i].fd, 0, 0, (off_t)x->files[i].size) == 0)
+            if (reserve_destination(x->files[i].fd, x->files[i].size, x->ready) == 0)
                m = mmap(NULL, (size_t)x->files[i].size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, x->files[i].fd, 0);
             else if (errno == ENOSPC || errno == EDQUOT || errno == EIO)
@@ -6330,15 +6417,14 @@ static int sender_send_file(void *session, struct msc_udp_config *cfg)
    if (!s->ready_done && (g_feat_agreed & MSC_UDP_FEAT_READY))
    {
       s->ready_done = 1;
-      /* MSC_UDP_CTL_PREPARING keeps each read inside the control carrier's
-       * timeout however long the preparation takes; a receiver that falls
-       * silent still fails the read. */
-      do
+      /* Bounded by the stall timeout between records, so a receiver whose
+       * preparation stops advancing fails the transfer instead of hanging it. */
+      tag = 0;
+      if (recv_ready(s->controlfd, cfg->cancel_flag, &tag) != 0)
       {
-         tag = 0;
-         if (recv_u32(s->controlfd, &tag) != 0)
-            break;
-      } while (tag == MSC_UDP_CTL_PREPARING);
+         rc = -1;   /* the timeout, cancellation or read error is already reported */
+         goto out;
+      }
       if (tag != MSC_UDP_CTL_READY)
       {
          uint32_t status;
@@ -6349,7 +6435,8 @@ static int sender_send_file(void *session, struct msc_udp_config *cfg)
             fprintf(stderr, "MSC UDP sender: receiver reported exit %d\n", error_code);
          }
          else
-            fprintf(stderr, "MSC UDP sender: receiver did not report ready\n");
+            fprintf(stderr, "MSC UDP sender: receiver sent control record %u "
+                    "instead of ready\n", tag);
          rc = -1;
          goto out;
       }
