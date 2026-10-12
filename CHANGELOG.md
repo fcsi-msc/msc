@@ -12,6 +12,9 @@ Notable user-facing changes are recorded here.
 
 ### Fixed
 
+- UDP path-MTU discovery no longer overestimates the path when the kernel's
+  UDP GRO delivers two probes in one receive buffer. The overestimate could
+  make transfers fragment heavily or fail.
 - `contrib/slurm/msc-slurm-smoke.sh` keeps a job step running on the receiving
   node. Where systemd-logind removes a user's `/dev/shm` files between job
   steps, transfers and checksums no longer fail.

@@ -35,7 +35,8 @@ TEST_BINS := recursive_test segmented_test child_status_test udp_test \
              udp_protocol_test resume_test retry_test exit_code_test \
              stall_timeout_test port_spec_test port_squat
 SHIMS := $(addprefix $(B)/,wan_shim.so storage_fault_shim.so \
-             listen_count_shim.so fsync_fault_shim.so udp_offload_shim.so)
+             listen_count_shim.so fsync_fault_shim.so udp_offload_shim.so \
+             gro_coalesce_shim.so)
 
 all: msc
 
@@ -97,7 +98,8 @@ $(B)/port_squat: $(call o,port_squat)
 
 # Test-only LD_PRELOAD shims (tests/shims/): a privilege-free WAN emulator, a
 # destination-storage fault injector, an fsync/thread fault injector, a
-# listen() recorder, and a no-GSO/GRO kernel. None is linked into msc.
+# listen() recorder, a no-GSO/GRO kernel, and GRO coalescing of PMTUD probes.
+# None is linked into msc.
 shims: $(SHIMS)
 
 $(B)/wan_shim.so: tests/shims/wan_shim.c
@@ -117,6 +119,10 @@ $(B)/fsync_fault_shim.so: tests/shims/fsync_fault_shim.c
 	$(CC) $(CFLAGS) -shared -fPIC -pthread $< -o $@ -ldl
 
 $(B)/udp_offload_shim.so: tests/shims/udp_offload_shim.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -shared -fPIC $< -o $@ -ldl
+
+$(B)/gro_coalesce_shim.so: tests/shims/gro_coalesce_shim.c src/udp_session.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -shared -fPIC $< -o $@ -ldl
 
@@ -148,7 +154,8 @@ shim_check: $(B)/wan_shim.so $(B)/wan_shim_test
 	   test "$$a" = "$$b" || { echo "GSO changed the loss pattern"; exit 1; }; \
 	done
 
-udp_regressions: msc $(B)/udp_test $(B)/wan_shim.so $(B)/fsync_fault_shim.so
+udp_regressions: msc $(B)/udp_test $(B)/wan_shim.so $(B)/fsync_fault_shim.so \
+                 $(B)/gro_coalesce_shim.so
 	python3 tests/udp_regression_test.py
 
 udp_parity: $(B)/udp_test $(B)/udp_protocol_test $(B)/udp_offload_shim.so $(B)/port_spec_test $(B)/port_squat

@@ -2325,9 +2325,17 @@ static void pmtud_probe_receiver(int udpfd, int controlfd,
          }
          if (do_pmtud && ntohl(h->magic) == MSC_UDP_MAGIC && type == MSC_UDP_PROBE)
          {
+            /* With UDP_GRO on this socket, one read can return back-to-back
+             * probes coalesced into a single buffer, such as one round's
+             * largest rung followed by the next round's smallest. Count only
+             * the first probe: the size its own header declares. */
+            uint32_t size = (uint32_t)got;
+            uint32_t declared = (uint32_t)hdr + ntohl(h->length);
+            if (declared < size)
+               size = declared;
             last_probe_ns = msc_udp_now_ns();   /* arms the idle-gap exit */
-            if ((uint32_t)got > max_seen)
-               max_seen = (uint32_t)got;
+            if (size > max_seen)
+               max_seen = size;
          }
          continue;   /* keep draining while data is flowing */
       }
