@@ -38,7 +38,11 @@ padding to the wire format.
    earlier session. It is not cryptographic authentication.
 4. Run negotiated MTU and/or pre-data RTT probes and the control `MTU` exchange.
 5. Exchange single-file greeting, or the manifest/readiness/table records for
-   a tree. Checkpointed transfers also perform their resume negotiation.
+   a tree. Checkpointed transfers also perform their resume negotiation. When
+   both ends advertise READY, the session's first single-file transfer then
+   waits: the receiver creates and reserves the destination, sending
+   `PREPARING` periodically, and releases the sender with `READY` (or reports
+   `ERROR`). Later transfers in the session start their flows directly.
 6. Transfer DATA and ACK packets; finish each flow with final ACK/FIN behavior.
 7. Report transfer byte count using `DONE`, and perform the optional checksum
    approval. Checkpointed modes have additional durable-range acknowledgements.
@@ -117,6 +121,8 @@ state, not by a generic length prefix.
 | 11 | TREE_READY | Receiver has materialized the manifest and opened its file table. |
 | 12 | TABLE_BEGIN | u64 transfer ID, file-entry count, total file bytes. |
 | 13 | ERROR | u32 stable receiver failure status. |
+| 14 | READY | Receiver has prepared the destination; the sender may start its data flows. No fields. |
+| 15 | PREPARING | Receiver is still preparing the destination. No fields. Sent at a quarter of the stall timeout (within 100 ms to 5 s) so the sender's control reads do not time out. |
 
 | Feature bit | Name | Purpose |
 | ---: | --- | --- |
@@ -126,6 +132,7 @@ state, not by a generic length prefix.
 | 3 | FAIR | Sender-local aggregate pacing advertisement. |
 | 4 | DSACK | Duplicate range feedback. |
 | 5 | DATA_RTT | Pre-data UDP RTT probe/response. |
+| 6 | READY | The first single-file transfer waits for `READY` before its data flows start. A peer without this bit keeps the earlier behavior. |
 
 Recursive table transfer IDs must match the session's expected next ID.
 TABLE_BEGIN count and byte total must agree with the materialized file table.

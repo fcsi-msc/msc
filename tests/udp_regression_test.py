@@ -102,6 +102,18 @@ def main():
         print("ok: phase timings charge a slow reservation to the receiver's prepare; "
               "failures report them too", flush=True)
 
+        # The sender waits until the receiver has prepared the destination:
+        # preparation longer than the stall timeout is not a stall, and no
+        # data is sent (and lost) while the receiver cannot take it.
+        dest = work / "slow-prepare"
+        out = run([ROOT / "build/udp_test", source, dest, "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "3000",
+                   "MSC_TEST_STALL_TIMEOUT_MS": "2000", "MSC_UDP_STATS": "1"})
+        assert dest.read_bytes() == source.read_bytes()
+        rto = re.findall(r"MSC UDP sender flow \d+: .*? rtxrto (\d+) ", out)
+        assert len(rto) == 2 and set(rto) == {"0"}, out
+        print("ok: the sender waits for a slow destination without stalling", flush=True)
+
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and
         # retransmission-cache reuse. Compare bytes independently of MSC.
         large = work / "large"

@@ -25,6 +25,13 @@ Notable user-facing changes are recorded here.
 - `contrib/slurm/msc-slurm-smoke.sh` keeps a separate log for each throughput
   run instead of overwriting one shared log.
 
+### Fixed
+
+- A UDP sender now waits until the receiver has created and reserved the
+  destination before sending data, when both ends support it. Preparing a large
+  destination on slow storage no longer trips the stall timeout, and no data is
+  sent and dropped while the receiver cannot take it.
+
 ## 1.0.0 - 2026-09-26
 
 ### Added

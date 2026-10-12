@@ -57,11 +57,13 @@ MSC UDP receiver phases: start 0.010s open 0.011s probe 0.045s setup 0.000s prep
 | `close` | Session teardown. |
 
 The phases sum to `total`, and sessions with several transfers (trees,
-checkpointed files) accumulate them. Compare the two sides: a long receiver
-`prepare` appears as an equally long sender `data`, because the sender's flows
-are already running while the receiver prepares the destination. Time missing
-from both lines but present in the overall transfer time was spent outside the
-session, for example in process exit.
+checkpointed files) accumulate them. Compare the two sides: on a session's
+first single-file transfer the sender waits in `prepare` while the receiver
+creates and reserves the destination, so a slow destination shows up as a long
+`prepare` on both. Against a peer that predates this wait, the sender's flows
+start at once and the receiver's preparation appears as sender `data` instead.
+Time missing from both lines but present in the overall transfer time was spent
+outside the session, for example in process exit.
 
 ## Structured samples
 

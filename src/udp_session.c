@@ -956,6 +956,19 @@ struct msc_udp_phases
    uint64_t transfers;
 };
 
+/* Receiver side of MSC_UDP_FEAT_READY. From the greeting until the destination
+ * is prepared, a helper thread sends MSC_UDP_CTL_PREPARING often enough that
+ * the waiting sender's control reads never reach the stall timeout; the
+ * transfer then sends MSC_UDP_CTL_READY. The control channel is single-
+ * threaded, so the helper is joined before anything else writes to it. */
+struct ready_signal
+{
+   int fd;
+   int running;            /* the helper thread was started */
+   atomic_int stop;
+   pthread_t thread;
+};
+
 struct msc_udp_xfer
 {
    int flow_count;
@@ -986,6 +999,8 @@ struct msc_udp_xfer
    _Atomic uint32_t flows_retired;
    volatile sig_atomic_t *cancel_flag;
    struct msc_udp_phases *phases;   /* the owning session's phase clock */
+   struct ready_signal *ready;      /* receiver: announce MSC_UDP_CTL_READY once the
+                                     * destination is prepared; NULL otherwise */
 };
 
 /* Data-socket topology, shared by both sides. `nports` (K) sockets carry
@@ -1020,6 +1035,7 @@ struct msc_udp_sender
    int flow_count;
    uint64_t next_transfer_id;
    int one_mode;          /* data rides the control socket (MSC_UDP_CTLMODE_ONE) */
+   int ready_done;        /* the first single-file transfer's READY wait is spent */
    struct msc_udp_phases phases;
 };
 
@@ -1030,6 +1046,8 @@ struct msc_udp_receiver
    int flow_count;
    uint64_t next_transfer_id;
    int one_mode;          /* data rides the control socket (MSC_UDP_CTLMODE_ONE) */
+   int ready_done;        /* the first single-file transfer's READY is spent */
+   struct ready_signal ready;
    struct msc_udp_phases phases;
 };
 
@@ -1357,6 +1375,59 @@ static int recv_u32(int fd, uint32_t *v)
    *v = ntohl(n);
    return 0;
 }
+
+/* MSC_UDP_CTL_PREPARING cadence: a quarter of the stall timeout, which bounds
+ * the sender's control reads on socket carriers, within [100 ms, 5 s]. */
+static uint64_t ready_heartbeat_ns(void)
+{
+   uint64_t ns = g_stall_timeout_ns / 4;
+   if (ns == 0 || ns > 5000000000ULL) ns = 5000000000ULL;
+   if (ns < 100000000ULL) ns = 100000000ULL;
+   return ns;
+}
+
+static void *ready_heartbeat_main(void *arg)
+{
+   struct ready_signal *r = arg;
+   uint64_t period = ready_heartbeat_ns();
+   uint64_t next = msc_udp_now_ns() + period;
+   struct timespec slice = { 0, 20 * 1000 * 1000 };   /* stop latency */
+
+   while (!atomic_load(&r->stop))
+   {
+      nanosleep(&slice, NULL);
+      if (atomic_load(&r->stop) || msc_udp_now_ns() < next)
+         continue;
+      if (send_u32(r->fd, MSC_UDP_CTL_PREPARING) != 0)
+         break;
+      next += period;
+   }
+   return NULL;
+}
+
+/* Start announcing that the destination is being prepared. Without the helper
+ * thread the final READY alone still works on carriers with no read timeout. */
+static void ready_begin(struct ready_signal *r, int fd)
+{
+   r->fd = fd;
+   atomic_init(&r->stop, 0);
+   r->running = pthread_create(&r->thread, NULL, ready_heartbeat_main, r) == 0;
+}
+
+/* Stop the helper; afterwards the caller owns the control channel again. */
+static void ready_quiesce(struct ready_signal *r)
+{
+   if (r == NULL || !r->running) return;
+   atomic_store(&r->stop, 1);
+   pthread_join(r->thread, NULL);
+   r->running = 0;
+}
+
+static int ready_send(struct ready_signal *r)
+{
+   ready_quiesce(r);
+   return send_u32(r->fd, MSC_UDP_CTL_READY);
+}
 static int recv_u64(int fd, uint64_t *v)
 {
    uint64_t n;
@@ -1500,6 +1571,7 @@ static uint32_t my_feature_bits(void)
    if (g_fair) bits |= MSC_UDP_FEAT_FAIR;
    if (g_dsack) bits |= MSC_UDP_FEAT_DSACK;
    bits |= MSC_UDP_FEAT_DATA_RTT;
+   bits |= MSC_UDP_FEAT_READY;
    return bits;
 }
 
@@ -5775,7 +5847,7 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
 {
    struct receiver_flow *flows;
    pthread_t *threads;
-   int created = 0, f, rc = 0;
+   int created = 0, f, rc = 0, ready = 0;
    uint64_t i;
 
    /* mmap each destination so flows memcpy in parallel instead of serializing on
@@ -5860,8 +5932,14 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
          samp_on = 1;
    }
 
+   /* The destination is prepared: release a sender waiting on this transfer.
+    * If that fails the control channel is gone, so start no flows. */
+   if (x->ready != NULL && ready_send(x->ready) != 0)
+      fprintf(stderr, "MSC UDP receiver: failed sending ready\n");
+   else
+      ready = 1;
    phase_mark(x->phases, PH_PREPARE);
-   for (f = 0; f < x->flow_count; f++)
+   for (f = 0; ready && f < x->flow_count; f++)
    {
       if (pthread_create(&threads[f], NULL, receiver_flow_worker, &flows[f]) != 0) break;
       created++;
@@ -6205,6 +6283,7 @@ static int sender_send_file(void *session, struct msc_udp_config *cfg)
    x.my_ost_count = cfg->my_ost_count;
    x.cancel_flag = cfg->cancel_flag;
    x.phases = &s->phases;
+   x.ready = NULL;
    atomic_init(&x.flows_retired, 0);   /* stack xfer: field-initialized, not zeroed */
    xfer_index(&x);   /* unit_base/nunits + total_units/total_bytes (stripe-aware) */
 
@@ -6239,6 +6318,41 @@ static int sender_send_file(void *session, struct msc_udp_config *cfg)
       fprintf(stderr, "MSC UDP sender: greeting was not confirmed by the receiver\n");
       rc = -1;
       goto out;
+   }
+
+   /* After the greeting the receiver creates and reserves the destination,
+    * which can take a long time for a large file on slow storage. Data sent
+    * meanwhile is dropped at its socket and retransmitted on timeout, and the
+    * flows' stall timer would count the wait as a dead path. So the session's
+    * first transfer, the one that sets the destination up, waits for the
+    * receiver to say it is ready. Later transfers (checkpoint chunks) reuse
+    * the prepared destination and skip the round trip. */
+   if (!s->ready_done && (g_feat_agreed & MSC_UDP_FEAT_READY))
+   {
+      s->ready_done = 1;
+      /* MSC_UDP_CTL_PREPARING keeps each read inside the control carrier's
+       * timeout however long the preparation takes; a receiver that falls
+       * silent still fails the read. */
+      do
+      {
+         tag = 0;
+         if (recv_u32(s->controlfd, &tag) != 0)
+            break;
+      } while (tag == MSC_UDP_CTL_PREPARING);
+      if (tag != MSC_UDP_CTL_READY)
+      {
+         uint32_t status;
+         if (tag == MSC_UDP_CTL_ERROR &&
+             recv_u32(s->controlfd, &status) == 0 && transfer_status_valid(status))
+         {
+            error_code = (int)status;
+            fprintf(stderr, "MSC UDP sender: receiver reported exit %d\n", error_code);
+         }
+         else
+            fprintf(stderr, "MSC UDP sender: receiver did not report ready\n");
+         rc = -1;
+         goto out;
+      }
    }
 
    if (msc_udp_stats_on)
@@ -6425,6 +6539,7 @@ static int sender_send_table(void *session, struct msc_udp_tree_xfer *t)
    x.stripe_count = 0;    /* -> contiguous unit count + partition */
    x.cancel_flag = t->cancel_flag;
    x.phases = &s->phases;
+   x.ready = NULL;
    atomic_init(&x.flows_retired, 0);   /* stack xfer: field-initialized, not zeroed */
    xfer_index(&x);
    t->total_bytes = x.total_bytes;
@@ -6693,6 +6808,7 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
    struct msc_udp_xfer x;
    struct msc_udp_file onefile;
    int destfd = -1, rc = 0, error_code = 0;
+   struct ready_signal *ready = NULL;
    uint32_t tag, version, nflip, payload, stripe_count = 0, dest_stripes = 0;
    long dest_stripe_count;
    uint64_t filesize, transfer_id, stripe_size = 0, sum = 0;
@@ -6720,6 +6836,15 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
       fprintf(stderr, "MSC UDP receiver: bad greeting from sender\n");
       rc = -1;
       goto out;
+   }
+   /* Mirror of the sender: the session's first transfer announces when the
+    * destination is prepared, and a failure before that point is reported
+    * with MSC_UDP_CTL_ERROR as usual. */
+   if (!s->ready_done && (g_feat_agreed & MSC_UDP_FEAT_READY))
+   {
+      s->ready_done = 1;
+      ready = &s->ready;
+      ready_begin(ready, s->controlfd);
    }
    /* The greeting is authoritative when it carries a request: the sender resolved
     * the flag and the forwarded MSC_DEST_STRIPE_COUNT to one value before
@@ -6775,6 +6900,7 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
    x.my_ost_count = cfg->my_ost_count;
    x.cancel_flag = cfg->cancel_flag;
    x.phases = &s->phases;
+   x.ready = ready;
    atomic_init(&x.flows_retired, 0);   /* stack xfer: field-initialized, not zeroed */
    xfer_index(&x);
 
@@ -6865,6 +6991,7 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
    cfg->bytes_done = x.total_bytes;
 
 out:
+   ready_quiesce(ready);   /* before anything else writes to the control channel */
    if (rc != 0 && error_code == MSC_EXIT_DESTINATION &&
        s != NULL && s->controlfd >= 0)
       (void)msc_udp_send_transfer_error(s->controlfd, error_code);
@@ -6922,6 +7049,7 @@ static int receiver_recv_table(void *session, struct msc_udp_tree_xfer *t)
    x.stripe_count = 0;
    x.cancel_flag = t->cancel_flag;
    x.phases = &s->phases;
+   x.ready = NULL;
    atomic_init(&x.flows_retired, 0);   /* stack xfer: field-initialized, not zeroed */
    xfer_index(&x);
    t->total_bytes = x.total_bytes;

@@ -156,6 +156,13 @@ extern int msc_port_spec_contains(const struct msc_port_spec *spec, unsigned int
                                            * transfer id, entry count, and byte total */
 #define MSC_UDP_CTL_ERROR 13                   /* receiver -> sender: stable MSC exit
                                                * status for a local failure */
+#define MSC_UDP_CTL_READY 14                   /* receiver -> sender: destination
+                                               * prepared, data flows may start
+                                               * (MSC_UDP_FEAT_READY) */
+#define MSC_UDP_CTL_PREPARING 15               /* receiver -> sender: still preparing
+                                               * the destination; repeated well
+                                               * inside the stall timeout until
+                                               * MSC_UDP_CTL_READY */
 
 /* ----- HELLO feature bits (uint32_t, intersected by both ends) ------------
  * Reserved now so a feature can ship on one end at a time; each bit lights up
@@ -171,6 +178,9 @@ extern int msc_port_spec_contains(const struct msc_port_spec *spec, unsigned int
                                            * them to detect spurious retransmits and
                                            * adapt its reordering window */
 #define MSC_UDP_FEAT_DATA_RTT (1u << 5)       /* pre-data UDP RTT probe/response */
+#define MSC_UDP_FEAT_READY (1u << 6)          /* the session's first single-file
+                                           * transfer waits for MSC_UDP_CTL_READY
+                                           * before its data flows start */
 
 /* ----- transport tunables ------------------------------------------------- */
 #define MSC_UDP_RECV_BATCH   64               /* packets per recvmmsg syscall */
