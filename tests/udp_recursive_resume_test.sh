@@ -216,11 +216,18 @@ MSC_TEST_CHECKPOINT="$ROOT/sigterm.cp" MSC_TEST_RESUME=1 \
    MSC_UDP_CHECKPOINT_BYTES=$CHUNK ./build/udp_test "$SRC" "$ROOT/sigterm" 3
 assert_tree "$SRC" "$ROOT/sigterm"
 
+# The kill lands 20 ms after the first durable chunk, so the rest of the tree
+# must take far longer than that. PACE_BURST=1 makes the 10 Mbit/s cap pace
+# from the first unit: each chunk is a fresh transfer whose pacer starts with
+# a full bucket, and the default 64-unit bucket holds a whole loopback chunk,
+# which let the remainder finish in tens of milliseconds and beat the kill.
+# Paced, the remaining ~2.3 MB needs about two seconds on any machine.
 expect_code 6 env MSC_TEST_CHECKPOINT="$ROOT/killed.cp" \
    MSC_TEST_CHECKPOINT_MARKER="$ROOT/killed.marker" \
    MSC_TEST_KILL_RECEIVER_AFTER_MARKER="$ROOT/killed.marker" \
    MSC_TEST_KILL_RECEIVER_DELAY_MS=20 MSC_UDP_CHECKPOINT_BYTES=$CHUNK \
-   MSC_UDP_PACE_RATE_MBIT=10 MSC_TEST_STALL_TIMEOUT_MS=500 \
+   MSC_UDP_PACE_RATE_MBIT=10 MSC_UDP_PACE_BURST=1 \
+   MSC_TEST_STALL_TIMEOUT_MS=500 \
    ./build/udp_test "$SRC" "$ROOT/killed" 3
 test -e "$ROOT/killed.cp"
 MSC_TEST_CHECKPOINT="$ROOT/killed.cp" MSC_TEST_RESUME=1 \
