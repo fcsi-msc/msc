@@ -212,9 +212,11 @@ verify udp_ctl_tcp 0 "$(file_sum_B "$DST/ctltcp.bin")" "$BIG_SUM" "(UDP data, TC
 # ---- throughput (information only) -------------------------------------------------
 say "== throughput, ${SIZE_MB} MiB memory to memory"
 for args in "-n 1" "-n 8" "" "-T -n 8" "-T"; do
+   name=perf_$(printf '%s' "${args:-default}" | tr -cs 'A-Za-z0-9' '_' | sed 's/^_//')   # own log per run
    onB rm -f "$DST/perf.bin"
+   ENVS=(MSC_UDP_STATS=1)
    # shellcheck disable=SC2086 # $args is a list of msc options
-   msc_run perf $args -i "$SRC/big.bin" -o "$DST/perf.bin"
+   msc_run "$name" $args -i "$SRC/big.bin" -o "$DST/perf.bin"
    say "$(printf '  %-12s exit %-3s %s' "${args:-default}" "$RC" "${RATE:-?}")"
 done
 
