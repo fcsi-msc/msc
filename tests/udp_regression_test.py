@@ -137,10 +137,17 @@ def main():
         started = time.monotonic()
         out = run([ROOT / "build/udp_test", source4, work / "abandoned-prepare", "2"],
                   {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "1500",
-                   "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000"},
-                  expected=6)
+                   "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000",
+                   "MSC_UDP_STATS": "1"}, expected=6)
         assert time.monotonic() - started < 4, out
         assert "abandoning the destination" in out, out
+        # A transfer that never started its flows spent that time preparing.
+        spent = {m.group(1): (float(m.group(2)), float(m.group(3))) for m in re.finditer(
+            r"MSC UDP (sender|receiver) phases: .* prepare (\d+\.\d+)s .* finish (\d+\.\d+)s",
+            out)}
+        assert set(spent) == {"sender", "receiver"}, out
+        assert spent["sender"][0] >= 0.9 and spent["sender"][1] < 0.5, out
+        assert spent["receiver"][0] >= 1.4 and spent["receiver"][1] < 0.5, out
         print("ok: the sender waits for a slow destination, not a stuck one", flush=True)
 
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and

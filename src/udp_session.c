@@ -954,6 +954,7 @@ struct msc_udp_phases
    uint64_t ns[PH_COUNT];
    uint64_t mark;          /* time of the previous phase_mark() */
    uint64_t transfers;
+   int flows_started;      /* the current transfer reached its data flows */
 };
 
 /* Receiver side of MSC_UDP_FEAT_READY. From the greeting until the destination
@@ -1074,6 +1075,22 @@ static void phase_mark(struct msc_udp_phases *p, enum msc_udp_phase phase)
    now = msc_udp_now_ns();
    if (now > p->mark) p->ns[phase] += now - p->mark;
    p->mark = now;
+   if (phase == PH_PREPARE) p->flows_started = 1;
+}
+
+/* Bracket one transfer: time before it is setup; time after its data flows
+ * is finish, unless it never started them, in which case it was all spent
+ * preparing (a failed or abandoned preparation). */
+static void phase_transfer_begin(struct msc_udp_phases *p)
+{
+   phase_mark(p, PH_SETUP);
+   p->flows_started = 0;
+}
+
+static void phase_transfer_end(struct msc_udp_phases *p)
+{
+   phase_mark(p, p->flows_started ? PH_FINISH : PH_PREPARE);
+   p->transfers++;
 }
 
 static void phase_report(const struct msc_udp_phases *p, const char *side)
@@ -6768,16 +6785,15 @@ static int sender_send_table(void *session, struct msc_udp_tree_xfer *t)
    return 0;
 }
 
-/* The public transfer entry points bracket each transfer for the phase clock:
- * time since the previous mark is setup, and everything after the data flows
- * until the transfer returns is finish. */
+/* The public transfer entry points bracket each transfer for the phase clock
+ * (phase_transfer_begin/end). */
 int msc_udp_sender_send(void *session, struct msc_udp_config *cfg)
 {
    struct msc_udp_sender *s = session;
    int rc;
-   if (s != NULL) phase_mark(&s->phases, PH_SETUP);
+   if (s != NULL) phase_transfer_begin(&s->phases);
    rc = sender_send_file(session, cfg);
-   if (s != NULL) { phase_mark(&s->phases, PH_FINISH); s->phases.transfers++; }
+   if (s != NULL) phase_transfer_end(&s->phases);
    return rc;
 }
 
@@ -6785,9 +6801,9 @@ int msc_udp_sender_send_table(void *session, struct msc_udp_tree_xfer *t)
 {
    struct msc_udp_sender *s = session;
    int rc;
-   if (s != NULL) phase_mark(&s->phases, PH_SETUP);
+   if (s != NULL) phase_transfer_begin(&s->phases);
    rc = sender_send_table(session, t);
-   if (s != NULL) { phase_mark(&s->phases, PH_FINISH); s->phases.transfers++; }
+   if (s != NULL) phase_transfer_end(&s->phases);
    return rc;
 }
 
@@ -7250,9 +7266,9 @@ int msc_udp_receiver_recv(void *session, struct msc_udp_config *cfg)
 {
    struct msc_udp_receiver *s = session;
    int rc;
-   if (s != NULL) phase_mark(&s->phases, PH_SETUP);
+   if (s != NULL) phase_transfer_begin(&s->phases);
    rc = receiver_recv_file(session, cfg);
-   if (s != NULL) { phase_mark(&s->phases, PH_FINISH); s->phases.transfers++; }
+   if (s != NULL) phase_transfer_end(&s->phases);
    return rc;
 }
 
@@ -7260,9 +7276,9 @@ int msc_udp_receiver_recv_table(void *session, struct msc_udp_tree_xfer *t)
 {
    struct msc_udp_receiver *s = session;
    int rc;
-   if (s != NULL) phase_mark(&s->phases, PH_SETUP);
+   if (s != NULL) phase_transfer_begin(&s->phases);
    rc = receiver_recv_table(session, t);
-   if (s != NULL) { phase_mark(&s->phases, PH_FINISH); s->phases.transfers++; }
+   if (s != NULL) phase_transfer_end(&s->phases);
    return rc;
 }
 
