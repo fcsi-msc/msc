@@ -6,6 +6,7 @@ import signal
 import re
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = {k: v for k, v in os.environ.items() if not k.startswith("MSC_")}
@@ -73,6 +74,81 @@ def main():
         assert re.search(r"confirmed_payload 2016 -> payload ceiling 1968\b", out), out
         print("ok: reduced MTU with/without offloads; unconfirmed path fails; "
               "coalesced probes", flush=True)
+
+        # MSC_UDP_STATS reports where each side's wall time went, and a slow
+        # destination reservation is charged to the receiver's prepare phase.
+        storage = str(ROOT / "build/storage_fault_shim.so")
+        dest = work / "phases"
+        out = run([ROOT / "build/udp_test", source, dest, "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "1000",
+                   "MSC_UDP_STATS": "1"})
+        assert dest.read_bytes() == source.read_bytes()
+        names = ("start", "open", "probe", "setup", "prepare", "data", "finish", "close")
+        pattern = (r"MSC UDP (sender|receiver) phases: "
+                   + " ".join(rf"{n} (?P<{n}>\d+\.\d{{3}})s" for n in names)
+                   + r" total (?P<total>\d+\.\d{3})s transfers 1\n")
+        sides = {m.group(1): m for m in re.finditer(pattern, out)}
+        assert set(sides) == {"sender", "receiver"}, out
+        for m in sides.values():
+            parts = sum(float(m.group(n)) for n in names)
+            assert abs(parts - float(m.group("total"))) < 0.01, m.group(0)
+        assert float(sides["receiver"].group("prepare")) >= 0.9, out
+        assert float(sides["receiver"].group("data")) < 0.9, out
+        # A failed transfer still reports both sides' phases; a stall caused
+        # by losing every data packet fails the transfer.
+        out = run([ROOT / "build/udp_test", source, work / "phases-failed", "2", "100"],
+                  {"MSC_TEST_STALL_TIMEOUT_MS": "500", "MSC_UDP_STATS": "1"}, expected=6)
+        failed = set(re.findall(r"MSC UDP (sender|receiver) phases: ", out))
+        assert failed == {"sender", "receiver"}, out
+        print("ok: phase timings charge a slow reservation to the receiver's prepare; "
+              "failures report them too", flush=True)
+
+        # The sender waits until the receiver has prepared the destination.
+        # Preparation that keeps advancing may outlast the stall timeout (four
+        # 1 MiB reservation steps of 0.6 s under a 1 s timeout), and no data is
+        # sent, and lost, while the receiver cannot take it.
+        dest = work / "slow-prepare"
+        source4 = work / "source4"
+        source4.write_bytes(os.urandom(4 * 1024 * 1024))
+        out = run([ROOT / "build/udp_test", source4, dest, "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "600",
+                   "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000",
+                   "MSC_UDP_STATS": "1"})
+        assert dest.read_bytes() == source4.read_bytes()
+        # The sender's flows start only once the receiver is ready: its own
+        # prepare phase covers the receiver's 2.4 s of reservation. (Counting
+        # retransmissions instead would also catch ordinary data-phase loss on
+        # hosts with small socket buffers.)
+        prepare = {m.group(1): float(m.group(2)) for m in re.finditer(
+            r"MSC UDP (sender|receiver) phases: .* prepare (\d+\.\d+)s", out)}
+        assert set(prepare) == {"sender", "receiver"}, out
+        assert prepare["receiver"] >= 2.3 and prepare["sender"] >= 2.3, out
+        # Preparation that stops advancing is still a stall: with a reservation
+        # step hung for 4 s under a 1 s timeout, the sender gives up. (This
+        # harness runs the receiver in-process, so the run itself lasts until
+        # the hung step returns; the CLI case below checks how fast msc exits.)
+        out = run([ROOT / "build/udp_test", source, work / "stuck-prepare", "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "4000",
+                   "MSC_TEST_STALL_TIMEOUT_MS": "1000"}, expected=6)
+        assert "no progress preparing the destination for 1.0 seconds" in out, out
+        # Once the sender has given up, the receiver abandons the preparation at
+        # its next step instead of finishing it: four 1.5 s steps (6 s in all)
+        # under a 1 s timeout end after the first.
+        started = time.monotonic()
+        out = run([ROOT / "build/udp_test", source4, work / "abandoned-prepare", "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "1500",
+                   "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000",
+                   "MSC_UDP_STATS": "1"}, expected=6)
+        assert time.monotonic() - started < 4, out
+        assert "abandoning the destination" in out, out
+        # A transfer that never started its flows spent that time preparing.
+        spent = {m.group(1): (float(m.group(2)), float(m.group(3))) for m in re.finditer(
+            r"MSC UDP (sender|receiver) phases: .* prepare (\d+\.\d+)s .* finish (\d+\.\d+)s",
+            out)}
+        assert set(spent) == {"sender", "receiver"}, out
+        assert spent["sender"][0] >= 0.9 and spent["sender"][1] < 0.5, out
+        assert spent["receiver"][0] >= 1.4 and spent["receiver"][1] < 0.5, out
+        print("ok: the sender waits for a slow destination, not a stuck one", flush=True)
 
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and
         # retransmission-cache reuse. Compare bytes independently of MSC.
@@ -142,6 +218,35 @@ def main():
                 assert "write-path: mmap 0 pwritev 1" in out
                 assert dest.read_bytes() == source.read_bytes()
         print("ok: mmap reserves space; ENOSPC fails cleanly; unsupported allocation uses pwritev", flush=True)
+
+        # A receiver stuck preparing the destination must not hang msc: it
+        # gives up after the stall timeout instead of waiting out the 10 s hang.
+        # Time msc itself; the hung receiver keeps the output pipe open, so
+        # log to a file and kill what is left of the process group afterwards.
+        storage = str(ROOT / "build/storage_fault_shim.so")
+        log = work / "stuck-cli.log"
+        with open(log, "w") as sink:
+            started = time.monotonic()
+            process = subprocess.Popen(
+                [str(ROOT / "msc"), "-n1", "--stall-timeout", "1s",
+                 "-l", "localhost", "-r", "127.0.0.1", "-B", str(ROOT / "msc"),
+                 "-i", str(source), "-o", str(work / "stuck-cli")],
+                cwd=ROOT, stdout=sink, stderr=subprocess.STDOUT, start_new_session=True,
+                env=dict(BASE, MSC_SSH=str(fake), LD_PRELOAD=storage,
+                         MSC_TEST_FALLOCATE_DELAY_MS="10000"))
+            try:
+                code = process.wait(timeout=30)
+                elapsed = time.monotonic() - started
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        out = log.read_text()
+        assert code == 6 and elapsed < 6, (code, elapsed, out)
+        assert "no progress preparing the destination" in out, out
+        print("ok: a receiver stuck preparing the destination fails the CLI promptly",
+              flush=True)
 
         # Grow and rehash the inode index; links span subdirectories and are
         # interleaved with ordinary files. Receiver inode identity must match.

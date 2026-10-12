@@ -29,11 +29,41 @@ replacement is intended. The receiver directory must exist.
 | Demultiplexer `drop` | Bounded userspace queue overflow after kernel receipt. |
 | `writes`, `avgwrite`, `wstall` | Receiver write granularity and stalls/backpressure. |
 | `fairwait` | Fresh sending waited for aggregate pacing tokens. |
+| `phases` | Where each side's wall time went; see below. |
 
 Host `UdpRcvbufErrors` is an OS counter, not a per-transfer proof of loss origin.
 Other UDP applications can affect it. Zero socket/demultiplexer drops also does
 not establish that all retransmissions came from the network: reordering,
 delayed ACKs, or an earlier receive layer may be responsible.
+
+### Phase timings
+
+When the session closes, including after a failed transfer, each side prints
+one line accounting for its whole lifetime, for example:
+
+```text
+MSC UDP receiver phases: start 0.010s open 0.011s probe 0.045s setup 0.000s prepare 1.561s data 1.335s finish 0.157s close 0.003s total 3.122s transfers 1
+```
+
+| Phase | Time spent |
+| --- | --- |
+| `start` | From process start until the session opens. On the sender this includes launching the remote side. |
+| `open` | Control connection, data ports and the protocol handshake. |
+| `probe` | Path-MTU discovery and the pre-data RTT probe. |
+| `setup` | Between transfers and before close, such as manifest and checkpoint exchanges. |
+| `prepare` | Each transfer's preamble up to starting its data flows. On the receiver this includes creating and reserving the destination. A transfer that fails before its flows start is charged here in full. |
+| `data` | Data flows running. |
+| `finish` | After the data until the transfer completes: sync, final acknowledgement, checksum and publication. |
+| `close` | Session teardown. |
+
+The phases sum to `total`, and sessions with several transfers (trees,
+checkpointed files) accumulate them. Compare the two sides: on a session's
+first single-file transfer the sender waits in `prepare` while the receiver
+creates and reserves the destination, so a slow destination shows up as a long
+`prepare` on both. Against a peer that predates this wait, the sender's flows
+start at once and the receiver's preparation appears as sender `data` instead.
+Time missing from both lines but present in the overall transfer time was spent
+outside the session, for example in process exit.
 
 ## Structured samples
 

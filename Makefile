@@ -155,7 +155,7 @@ shim_check: $(B)/wan_shim.so $(B)/wan_shim_test
 	done
 
 udp_regressions: msc $(B)/udp_test $(B)/wan_shim.so $(B)/fsync_fault_shim.so \
-                 $(B)/gro_coalesce_shim.so
+                 $(B)/gro_coalesce_shim.so $(B)/storage_fault_shim.so
 	python3 tests/udp_regression_test.py
 
 udp_parity: $(B)/udp_test $(B)/udp_protocol_test $(B)/udp_offload_shim.so $(B)/port_spec_test $(B)/port_squat

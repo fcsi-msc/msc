@@ -6,6 +6,10 @@ Notable user-facing changes are recorded here.
 
 ### Added
 
+- With `MSC_UDP_STATS=1`, each side prints a phase-timing line when its UDP
+  session closes, including after a failure, showing how its wall time divided
+  between launch, handshake, path probing, destination preparation, data,
+  completion and teardown.
 - `contrib/slurm`: `B_NODE` and `MSC_SRUN_EXTRA` let the smoke test and
   `msc-srun` run in heterogeneous jobs, for partitions that allow only one
   node per job.
@@ -15,6 +19,13 @@ Notable user-facing changes are recorded here.
 - UDP path-MTU discovery no longer overestimates the path when the kernel's
   UDP GRO delivers two probes in one receive buffer. The overestimate could
   make transfers fragment heavily or fail.
+- A UDP sender now waits until the receiver has created and reserved the
+  destination before sending data, when both ends support it. Preparing a large
+  destination on slow storage no longer trips the stall timeout as long as the
+  preparation keeps advancing, and no data is sent and dropped while the
+  receiver cannot take it. Preparation that stops advancing for a stall timeout
+  still fails the transfer, and the receiver then abandons the destination
+  instead of finishing its preparation.
 - `contrib/slurm/msc-slurm-smoke.sh` keeps a job step running on the receiving
   node. Where systemd-logind removes a user's `/dev/shm` files between job
   steps, transfers and checksums no longer fail.
