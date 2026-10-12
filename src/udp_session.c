@@ -4857,6 +4857,7 @@ struct receiver_flow
    int have_addr;
 
    uint64_t rx_units, dup_units, acknowledgments_sent;
+   uint64_t rx_bytes;       /* payload bytes of those rx_units (MSC_UDP_STATS summary) */
    /* Only the sampler sees this snapshot; publish once per receive batch. */
    pthread_mutex_t sample_lock;
    uint64_t sampled_rx_units;
@@ -5076,6 +5077,7 @@ static int flush_run(struct receiver_flow *cf, const struct recv_item *run,
       {
          cf->received++;
          cf->rx_units++;
+         cf->rx_bytes += run[i].len;
          *new_units = 1;
       }
    return 0;
@@ -6115,6 +6117,8 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
       double secs = (double)elapsed / 1e9;
       long rcvbuf_after = snmp_udp_stat("RcvbufErrors");
       long inerr_after = snmp_udp_stat("InErrors");
+      uint64_t rx_bytes = 0;   /* what arrived, not x->total_bytes: a failed run is short */
+      for (f = 0; f < x->flow_count; f++) rx_bytes += flows[f].rx_bytes;
       pthread_mutex_lock(&samp.lock);
       samp.stop = 1;
       pthread_cond_signal(&samp.wake);
@@ -6122,8 +6126,8 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
       pthread_join(samp_thread, NULL);
       fprintf(stderr, "MSC UDP receiver rx: %llu bytes in %.0f ms, avg %.2f Gbit/s, "
               "peak %.2f Gbit/s, UdpRcvbufErrors +%ld, UdpInErrors +%ld\n",
-              (unsigned long long)x->total_bytes, secs * 1000.0,
-              secs > 0 ? (double)x->total_bytes * 8.0 / secs / 1e9 : 0.0,
+              (unsigned long long)rx_bytes, secs * 1000.0,
+              secs > 0 ? (double)rx_bytes * 8.0 / secs / 1e9 : 0.0,
               samp.peak_bps / 1e9,
               rcvbuf_before >= 0 && rcvbuf_after >= 0 ? rcvbuf_after - rcvbuf_before : -1,
               inerr_before >= 0 && inerr_after >= 0 ? inerr_after - inerr_before : -1);

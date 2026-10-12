@@ -150,6 +150,16 @@ def main():
         assert spent["receiver"][0] >= 1.4 and spent["receiver"][1] < 0.5, out
         print("ok: the sender waits for a slow destination, not a stuck one", flush=True)
 
+        # The receiver's stats summary counts bytes that arrived, not the planned
+        # size: a complete transfer reports all of it, a fully lost one none.
+        out = run([ROOT / "build/udp_test", source, work / "rx-summary", "2"],
+                  {"MSC_UDP_STATS": "1"})
+        assert f"receiver rx: {source.stat().st_size} bytes in " in out, out
+        out = run([ROOT / "build/udp_test", source, work / "rx-summary-lost", "2", "100"],
+                  {"MSC_UDP_STATS": "1", "MSC_TEST_STALL_TIMEOUT_MS": "500"}, expected=6)
+        assert re.search(r"receiver rx: 0 bytes in \d+ ms, avg 0\.00 Gbit/s", out), out
+        print("ok: receiver rx summary reports bytes received, not the planned size", flush=True)
+
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and
         # retransmission-cache reuse. Compare bytes independently of MSC.
         large = work / "large"

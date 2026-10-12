@@ -26,6 +26,9 @@ Notable user-facing changes are recorded here.
   receiver cannot take it. Preparation that stops advancing for a stall timeout
   still fails the transfer, and the receiver then abandons the destination
   instead of finishing its preparation.
+- The `MSC_UDP_STATS` receiver summary now reports the bytes actually received
+  and an average computed from them. A failed transfer no longer reports its
+  full planned size.
 - `contrib/slurm/msc-slurm-smoke.sh` keeps a job step running on the receiving
   node. Where systemd-logind removes a user's `/dev/shm` files between job
   steps, transfers and checksums no longer fail.
