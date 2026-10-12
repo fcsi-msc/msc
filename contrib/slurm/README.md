@@ -33,6 +33,21 @@ MSC_SSH=$PWD/contrib/slurm/msc-srun MSC_SRUN_NODE=node02 ./msc -B "$PWD/msc" \
     -l localhost -r 192.168.10.2 -i /dev/shm/src.bin -o /dev/shm/dst.bin
 ```
 
+### Heterogeneous jobs
+
+Some partitions allow only one node per job. Request the two nodes as a
+heterogeneous job instead, and tell the scripts which node receives and which
+component it belongs to:
+
+```sh
+salloc -N1 : -N1 -t 1:00:00      # add -p, --exclusive or --mem to each component as your site needs
+B_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST_HET_GROUP_1") \
+MSC_SRUN_EXTRA=--het-group=1 bash contrib/slurm/msc-slurm-smoke.sh
+```
+
+`msc-srun` passes `MSC_SRUN_EXTRA` to srun too, so a manual transfer works the
+same way with `MSC_SRUN_EXTRA=--het-group=1` and `MSC_SRUN_NODE` set.
+
 ## Smoke test
 
 Build msc (`make -j all`), then from inside a two-node allocation:
@@ -48,7 +63,7 @@ both nodes, prints PASS/FAIL and memory-to-memory throughput, and removes its
 test data. The report and per-test logs are kept in `~/msc-results/<time>`. It
 takes a few minutes. Settings: `SIZE_MB` (large file size, default 2048),
 `B_IP` (receiver's address, default its InfiniBand IPv4 if it has one), `OUT`,
-and `MSC_DIR`.
+`MSC_DIR`, and, for heterogeneous jobs, `B_NODE` and `MSC_SRUN_EXTRA`.
 
 Test data lives in `/dev/shm`, about six times `SIZE_MB` on the receiving node
 at its peak. Without `--exclusive`, request enough memory with `--mem` (for
@@ -64,3 +79,10 @@ the job on many sites.
   both nodes. A ceiling far below 4 MiB can hold UDP back.
 - Shared nodes make throughput numbers noisy. Use `--exclusive` for
   measurements you intend to compare.
+- systemd-logind removes a user's `/dev/shm` files when it considers that user
+  logged out of the node (`RemoveIPC=yes`, the systemd default). On sites where
+  each job step counts as a login session, that can happen between steps. The
+  smoke test keeps a step running on the receiving node for its whole run.
+  When you transfer into `/dev/shm` by hand, keep a step running there
+  yourself until you have used the data (for example
+  `srun --overlap -N1 -n1 -w node02 sleep infinity &`), or write somewhere else.

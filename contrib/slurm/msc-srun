@@ -19,10 +19,17 @@
 #
 #     MSC_SSH=/path/to/msc-srun MSC_SRUN_NODE=node02 msc -l localhost -r 192.168.10.2 ...
 #
+# MSC_SRUN_EXTRA holds extra srun options, split on whitespace.  In a
+# heterogeneous job, where the receiving node belongs to another component, it
+# names that component:
+#
+#     MSC_SSH=/path/to/msc-srun MSC_SRUN_EXTRA=--het-group=1 msc -l localhost -r node02 ...
+#
 # ssh's -o options have no srun equivalent and are skipped, and the user@ part
 # is ignored: the job step already runs as you.  --overlap (Slurm 20.11 or
 # later) lets this step share the allocation with the step msc runs in.
 while [ "$1" = "-o" ]; do shift 2; done
 host=${1#*@}
 shift
-exec srun --overlap -N1 -n1 -w "${MSC_SRUN_NODE:-$host}" -u /bin/sh -c "$*"
+# shellcheck disable=SC2086 # MSC_SRUN_EXTRA is a list of srun options
+exec srun --overlap ${MSC_SRUN_EXTRA:-} -N1 -n1 -w "${MSC_SRUN_NODE:-$host}" -u /bin/sh -c "$*"

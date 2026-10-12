@@ -21,6 +21,11 @@
 #   B_IP      the receiver's data address       (default: its InfiniBand IPv4
 #             address if it has one, else its node name)
 #   OUT       where to keep the results         (default: ~/msc-results/<time>)
+#   B_NODE    the receiving node's Slurm name   (default: the allocation's
+#             other node; set it in a heterogeneous job, where the receiver
+#             is in another component)
+#   MSC_SRUN_EXTRA  extra srun options for steps on the receiving node, such
+#             as --het-group=1 in a heterogeneous job; msc-srun uses it too
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -41,13 +46,14 @@ die() { say "STOP: $*"; exit 1; }
 [ -x "$MSC" ] || die "no msc binary at $MSC -- build it first: cd $MSC_DIR && make -j all"
 
 A=${SLURMD_NODENAME:-$(hostname -s)}
-B=""
-for n in $(scontrol show hostnames "$SLURM_JOB_NODELIST"); do
+B=${B_NODE:-}
+[ -n "$B" ] || for n in $(scontrol show hostnames "$SLURM_JOB_NODELIST"); do
    [ "$n" != "$A" ] && B=$n
 done
-[ -n "$B" ] || die "no second node in allocation $SLURM_JOB_NODELIST"
+[ -n "$B" ] || die "no second node in allocation $SLURM_JOB_NODELIST (set B_NODE in a heterogeneous job)"
 
-onB() { srun --overlap -N1 -n1 -w "$B" "$@"; }   # run one command on node B
+# shellcheck disable=SC2086 # MSC_SRUN_EXTRA is a list of srun options
+onB() { srun --overlap ${MSC_SRUN_EXTRA:-} -N1 -n1 -w "$B" "$@"; }   # run one command on node B
 
 if [ -z "${B_IP:-}" ]; then
    B_IP=$(onB sh -c "ip -4 -o addr show | awk '\$2 ~ /^ib/ {split(\$4, a, \"/\"); print a[1]; exit}'")
@@ -58,7 +64,21 @@ fi
 [ -x "$HERE/msc-srun" ] || die "msc-srun is missing from $HERE"
 export MSC_SSH=$HERE/msc-srun MSC_SRUN_NODE=$B
 
-cleanup() { rm -rf "$SRC"; onB rm -rf "$DST" 2>/dev/null; }
+# systemd-logind removes a user's /dev/shm files when it considers the user
+# logged out of the node (RemoveIPC=yes, the default), which on some sites
+# happens whenever no job step of the user's is running there.  Every onB call
+# is a separate short step, so hold one step open on B for the whole run, or
+# DST can vanish between the steps that create, fill and check it.  srun is started directly, not through onB, so that $! is srun itself:
+# killing a backgrounded function's subshell would orphan the step.  Wait only
+# on specific PIDs from here on: a bare wait would block on this step forever.
+# shellcheck disable=SC2086 # MSC_SRUN_EXTRA is a list of srun options
+srun --overlap ${MSC_SRUN_EXTRA:-} -N1 -n1 -w "$B" sleep infinity < /dev/null > /dev/null 2>&1 &
+KEEPALIVE=$!
+sleep 3   # let the step start before the first files land on B
+cleanup() {
+   rm -rf "$SRC"; onB rm -rf "$DST" 2>/dev/null
+   kill "$KEEPALIVE" 2>/dev/null; wait "$KEEPALIVE" 2>/dev/null
+}
 trap cleanup EXIT
 
 say "== environment"
@@ -192,9 +212,11 @@ verify udp_ctl_tcp 0 "$(file_sum_B "$DST/ctltcp.bin")" "$BIG_SUM" "(UDP data, TC
 # ---- throughput (information only) -------------------------------------------------
 say "== throughput, ${SIZE_MB} MiB memory to memory"
 for args in "-n 1" "-n 8" "" "-T -n 8" "-T"; do
+   name=perf_$(printf '%s' "${args:-default}" | tr -cs 'A-Za-z0-9' '_' | sed 's/^_//')   # own log per run
    onB rm -f "$DST/perf.bin"
+   ENVS=(MSC_UDP_STATS=1)
    # shellcheck disable=SC2086 # $args is a list of msc options
-   msc_run perf $args -i "$SRC/big.bin" -o "$DST/perf.bin"
+   msc_run "$name" $args -i "$SRC/big.bin" -o "$DST/perf.bin"
    say "$(printf '  %-12s exit %-3s %s' "${args:-default}" "$RC" "${RATE:-?}")"
 done
 
