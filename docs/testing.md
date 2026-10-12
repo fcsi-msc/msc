@@ -75,7 +75,7 @@ Always compare outputs even when an internal checksum is enabled.
 | [wan_shim.c](../tests/shims/wan_shim.c) | Preload-based UDP delay, jitter, independent loss, duplication, initial ACK/FIN drops, and MTU black holes. |
 | [storage_fault_shim.c](../tests/shims/storage_fault_shim.c) | Destination write failures after a byte threshold; used with the non-mapped write path. |
 | [fsync_fault_shim.c](../tests/shims/fsync_fault_shim.c) | Worker creation failures, fsync recording, and forced file/directory sync errors. |
-| [udp_offload_shim.c](../tests/shims/udp_offload_shim.c) | Unsupported GSO/GRO fallback paths. |
+| [udp_offload_shim.c](../tests/shims/udp_offload_shim.c) | Unsupported GSO/GRO fallback paths; a single GSO send failing with a chosen errno, with sent-datagram counts. |
 | [listen_count_shim.c](../tests/shims/listen_count_shim.c) | Records TCP `listen()` calls to verify the stdio port footprint. |
 
 Build the WAN shim with `make build/wan_shim.so`. Its controls are:

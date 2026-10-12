@@ -4310,15 +4310,19 @@ static void fill_header(struct msc_udp_packet_header *h, struct sender_flow *g,
  * well under that and split a batch into several sends if needed. */
 #define MSC_UDP_GSO_MAX_BYTES 60000
 
-static atomic_int g_gso_logged = 0;   /* log the first failure once */
+static atomic_int g_gso_logged = 0;   /* log the first fallback once */
 
 /* GSO send: lay the k packets out contiguously as [hdr|payload], each exactly
  * gso_size except a partial final unit (which lands last), then hand the kernel
  * one sendmsg per <=MSC_UDP_GSO_MAX_BYTES chunk with UDP_SEGMENT so it slices them
- * into MTU datagrams in one trip through the egress stack. Returns 0 on success,
- * -1 on any GSO error (errno logged once) so the caller disables GSO and falls
- * back to sendmmsg rather than limping on single-unit retransmits. */
-static int fire_send_gso(struct sender_flow *g, uint64_t start, unsigned k, uint64_t now)
+ * into MTU datagrams in one trip through the egress stack. Returns 0 once the
+ * batch is handed off: in full, or cut short by a known-transient error whose
+ * unsent tail is left to loss recovery, as in sender_send_batch. Returns -1 on
+ * any other error (errno logged once), with *sent set to the units already on
+ * the wire, so the caller disables GSO and resends only the rest via sendmmsg
+ * rather than limping on single-unit retransmits. */
+static int fire_send_gso(struct sender_flow *g, uint64_t start, unsigned k, uint64_t now,
+                         unsigned *sent)
 {
    struct msc_udp_xfer *x = g->x;
    size_t payload = x->payload_size;
@@ -4379,12 +4383,27 @@ static int fire_send_gso(struct sender_flow *g, uint64_t start, unsigned k, uint
          ssize_t s = sendmsg(g->udpfd, &msg, 0);
          if (s >= 0) break;
          if (errno == EINTR) continue;
+         /* Known-transient errors would hit sendmmsg too: handle them the
+          * same way and keep GSO. Anything else falls back for good. A
+          * needless fallback only costs batching, but keeping GSO after an
+          * unrecognised "unsupported" errno would fail every batch. */
+         if (errno == ENOBUFS || errno == EAGAIN || errno == ENOMEM ||
+#if EWOULDBLOCK != EAGAIN
+             errno == EWOULDBLOCK ||
+#endif
+             errno == ECONNREFUSED)
+         {
+            if (errno == ENOBUFS || errno == EAGAIN)
+               g->enobufs++;   /* send-buffer pressure: the autotune growth signal */
+            return 0;   /* leave the rest to loss recovery; keep GSO */
+         }
          if (!atomic_exchange(&g_gso_logged, 1))
          {
             fprintf(stderr, "MSC UDP sender: UDP GSO sendmsg failed (%s); "
                     "falling back to sendmmsg\n", strerror(errno));
          }
-         return -1;   /* caller disables GSO and resends via sendmmsg */
+         *sent = done;
+         return -1;   /* caller disables GSO and resends the rest via sendmmsg */
       }
       done += seg;
    }
@@ -4407,7 +4426,7 @@ static void fire_batch(struct sender_flow *g, uint64_t start, unsigned k)
    uint64_t base_off = unit_off(x, &g->part, fl, base_global); /* within file */
    uint64_t end_off = base_off + (uint64_t)k * payload;
    uint64_t now = msc_udp_now_ns();
-   unsigned i, ndg = 0;
+   unsigned i, ndg = 0, first = 0;
    size_t read_len;
 
    if (end_off > fl->size) end_off = fl->size;   /* partial final unit of fl */
@@ -4437,12 +4456,12 @@ static void fire_batch(struct sender_flow *g, uint64_t start, unsigned k)
 
    if (g->gso_enabled)
    {
-      if (fire_send_gso(g, start, k, now) == 0)
+      if (fire_send_gso(g, start, k, now, &first) == 0)
          return;
-      g->gso_enabled = 0;
+      g->gso_enabled = 0;   /* units [0, first) already went out via GSO */
    }
 
-   for (i = 0; i < k; i++)
+   for (i = first; i < k; i++)
    {
       uint64_t seq = start + i;
       uint64_t off = base_off + (uint64_t)i * payload;
