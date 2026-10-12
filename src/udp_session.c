@@ -2173,6 +2173,21 @@ static void pmtud_probe_sender(int udpfd, int controlfd,
       confirmed = 0;
    }
    if (do_pmtud && confirmed > hdr)
+   {
+      /* Adopt only a size that was actually probed. A receiver can report
+       * more than any single probe carried (older receivers summed
+       * GRO-coalesced probes), and a payload above the path ceiling
+       * fragments or stalls the whole transfer. */
+      uint32_t reported = confirmed;
+      confirmed = 0;
+      for (i = 0; i < n; i++)
+         if ((uint32_t)cand[i] <= reported && (uint32_t)cand[i] > confirmed)
+            confirmed = (uint32_t)cand[i];
+      if (confirmed != reported && g_stats)
+         fprintf(stderr, "MSC UDP sender: PMTUD receiver reported %u, which is not "
+                 "a probed size; using %u\n", reported, confirmed);
+   }
+   if (do_pmtud && confirmed > hdr)
       g_payload_probe = (size_t)confirmed - hdr;
    disc = IP_PMTUDISC_WANT;   /* back to the default for the data phase */
    if (do_pmtud)

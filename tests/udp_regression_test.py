@@ -62,6 +62,15 @@ def main():
                    "MSC_UDP_STATS": "1"})
         assert dest.read_bytes() == source.read_bytes()
         assert "PMTUD saw payload 2016 " in out, out
+        # A receiver that still reports the summed size (an older release)
+        # must not push the sender above the largest size it actually probed.
+        dest = work / "gro-probes-as-one"
+        out = run([ROOT / "build/udp_test", source, dest, "2"],
+                  {"LD_PRELOAD": f"{wan} {gro}", "MSC_UDP_WANSHIM_MTU": "2016",
+                   "MSC_TEST_COALESCE_AS_ONE": "1", "MSC_UDP_STATS": "1"})
+        assert dest.read_bytes() == source.read_bytes()
+        assert "PMTUD saw payload 2564 " in out, out
+        assert re.search(r"confirmed_payload 2016 -> payload ceiling 1968\b", out), out
         print("ok: reduced MTU with/without offloads; unconfirmed path fails; "
               "coalesced probes", flush=True)
 

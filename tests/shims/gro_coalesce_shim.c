@@ -10,12 +10,17 @@
  * returning a probe it waits briefly for the next queued datagram and, if that
  * is also a probe no larger than the first, appends it to the same buffer.
  * Every other datagram, socket type and call passes straight through.
+ *
+ * MSC_TEST_COALESCE_AS_ONE=1 also rewrites the first probe's length field to
+ * cover the whole buffer, so the receiver reports the summed size as an older
+ * receiver did. That exercises the sender's own guard.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 
@@ -24,10 +29,12 @@
 #define COALESCE_WAIT_MS 50   /* longer than the sender's 10 ms inter-round pause */
 
 static ssize_t (*real_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
+static int as_one;
 
 __attribute__((constructor)) static void init(void)
 {
    real_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
+   as_one = getenv("MSC_TEST_COALESCE_AS_ONE") != NULL;
 }
 
 static int is_probe(const void *buf, ssize_t n)
@@ -63,5 +70,14 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
    if (m <= 0 || m > n || (size_t)(n + m) > len || !is_probe(next, m))
       return n;
    m = real_recvfrom(fd, (char *)buf + n, (size_t)m, MSG_DONTWAIT, NULL, NULL);
-   return m > 0 ? n + m : n;
+   if (m <= 0)
+      return n;
+   if (as_one)
+   {
+      struct msc_udp_packet_header h;
+      memcpy(&h, buf, sizeof(h));
+      h.length = htonl((uint32_t)(n + m) - (uint32_t)sizeof(h));
+      memcpy(buf, &h, sizeof(h));
+   }
+   return n + m;
 }
