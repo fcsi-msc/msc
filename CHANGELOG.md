@@ -32,7 +32,8 @@ Notable user-facing changes are recorded here.
   destination on slow storage no longer trips the stall timeout as long as the
   preparation keeps advancing, and no data is sent and dropped while the
   receiver cannot take it. Preparation that stops advancing for a stall timeout
-  still fails the transfer.
+  still fails the transfer, and the receiver then abandons the destination
+  instead of finishing its preparation.
 
 ## 1.0.0 - 2026-09-26
 

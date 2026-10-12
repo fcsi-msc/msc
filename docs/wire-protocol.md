@@ -42,7 +42,10 @@ padding to the wire format.
    both ends advertise READY, the session's first single-file transfer then
    waits: the receiver creates and reserves the destination, sending
    `PREPARING` periodically, and releases the sender with `READY` (or reports
-   `ERROR`). Later transfers in the session start their flows directly.
+   `ERROR`). A sender that gives up sends `ABORT` and closes the channel; the
+   receiver treats any input during preparation as that and abandons the
+   destination at its next step. Later transfers in the session start their
+   flows directly.
 6. Transfer DATA and ACK packets; finish each flow with final ACK/FIN behavior.
 7. Report transfer byte count using `DONE`, and perform the optional checksum
    approval. Checkpointed modes have additional durable-range acknowledgements.

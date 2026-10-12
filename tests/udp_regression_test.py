@@ -131,6 +131,16 @@ def main():
                   {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "4000",
                    "MSC_TEST_STALL_TIMEOUT_MS": "1000"}, expected=6)
         assert "no progress preparing the destination for 1.0 seconds" in out, out
+        # Once the sender has given up, the receiver abandons the preparation at
+        # its next step instead of finishing it: four 1.5 s steps (6 s in all)
+        # under a 1 s timeout end after the first.
+        started = time.monotonic()
+        out = run([ROOT / "build/udp_test", source4, work / "abandoned-prepare", "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "1500",
+                   "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000"},
+                  expected=6)
+        assert time.monotonic() - started < 4, out
+        assert "abandoning the destination" in out, out
         print("ok: the sender waits for a slow destination, not a stuck one", flush=True)
 
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and

@@ -968,6 +968,7 @@ struct ready_signal
    int running;            /* the helper thread was started */
    atomic_int stop;
    atomic_ullong progress; /* bumped by the receiver at each preparation step */
+   atomic_int peer_gone;   /* the sender stopped waiting: abandon preparation */
    pthread_t thread;
 };
 
@@ -1388,6 +1389,21 @@ static uint64_t ready_heartbeat_ns(void)
    return ns;
 }
 
+/* While the sender waits for READY it sends nothing, except ABORT just before
+ * it gives up and closes the channel. Any input or end of file therefore
+ * means it has stopped waiting. Only the helper, the channel's sole user
+ * during preparation, may call this. */
+static int ready_sender_gone(int fd)
+{
+   struct msc_udp_control_channel *channel = msc_udp_control_channel_lookup(fd);
+   struct pollfd p;
+   if (channel != NULL)
+      return msc_udp_control_channel_wait_readable(channel, 1) != 0;
+   p.fd = fd;
+   p.events = POLLIN;
+   return poll(&p, 1, 0) > 0;   /* includes POLLHUP and POLLERR */
+}
+
 static void *ready_heartbeat_main(void *arg)
 {
    struct ready_signal *r = arg;
@@ -1400,13 +1416,23 @@ static void *ready_heartbeat_main(void *arg)
    {
       unsigned long long now_progress;
       nanosleep(&slice, NULL);
-      if (atomic_load(&r->stop) || msc_udp_now_ns() < next)
+      if (atomic_load(&r->stop))
+         break;
+      if (ready_sender_gone(r->fd))
+      {
+         atomic_store(&r->peer_gone, 1);
+         break;
+      }
+      if (msc_udp_now_ns() < next)
          continue;
       now_progress = atomic_load(&r->progress);
       if (now_progress == announced)
          continue;   /* nothing new: let the sender's stall timer run */
       if (send_u32(r->fd, MSC_UDP_CTL_PREPARING) != 0)
+      {
+         atomic_store(&r->peer_gone, 1);
          break;
+      }
       announced = now_progress;
       next = msc_udp_now_ns() + period;
    }
@@ -1420,12 +1446,18 @@ static void ready_begin(struct ready_signal *r, int fd)
    r->fd = fd;
    atomic_init(&r->stop, 0);
    atomic_init(&r->progress, 0);
+   atomic_init(&r->peer_gone, 0);
    r->running = pthread_create(&r->thread, NULL, ready_heartbeat_main, r) == 0;
 }
 
 static void ready_progress(struct ready_signal *r)
 {
    if (r != NULL) atomic_fetch_add(&r->progress, 1);
+}
+
+static int ready_abandoned(struct ready_signal *r)
+{
+   return r != NULL && atomic_load(&r->peer_gone);
 }
 
 /* Stop the helper; afterwards the caller owns the control channel again. */
@@ -5920,6 +5952,11 @@ static int reserve_destination(int fd, uint64_t size, struct ready_signal *ready
    while (off < size)
    {
       uint64_t len = size - off < chunk ? size - off : chunk;
+      if (ready_abandoned(ready))
+      {
+         errno = ECANCELED;   /* the sender stopped waiting */
+         return -1;
+      }
       if (fallocate(fd, 0, (off_t)off, (off_t)len) != 0)
          return -1;
       off += len;
@@ -5960,18 +5997,24 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
             if (reserve_destination(x->files[i].fd, x->files[i].size, x->ready) == 0)
                m = mmap(NULL, (size_t)x->files[i].size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, x->files[i].fd, 0);
-            else if (errno == ENOSPC || errno == EDQUOT || errno == EIO)
+            else if (errno == ENOSPC || errno == EDQUOT || errno == EIO ||
+                     errno == ECANCELED)
             {
                uint64_t j;
-               fprintf(stderr, "MSC UDP receiver: cannot reserve destination storage: %s\n",
-                       strerror(errno));
+               int abandoned = errno == ECANCELED;
+               if (abandoned)
+                  fprintf(stderr, "MSC UDP receiver: the sender stopped waiting; "
+                          "abandoning the destination\n");
+               else
+                  fprintf(stderr, "MSC UDP receiver: cannot reserve destination storage: %s\n",
+                          strerror(errno));
                for (j = 0; j < i; j++)
                   if (x->files[j].map != NULL)
                   {
                      munmap(x->files[j].map, (size_t)x->files[j].size);
                      x->files[j].map = NULL;
                   }
-               return MSC_EXIT_DESTINATION;
+               return abandoned ? -1 : MSC_EXIT_DESTINATION;
             }
          }
          if (m != MAP_FAILED) x->files[i].map = m;   /* else fall back to pwritev */
@@ -6019,12 +6062,22 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
          samp_on = 1;
    }
 
-   /* The destination is prepared: release a sender waiting on this transfer.
-    * If that fails the control channel is gone, so start no flows. */
-   if (x->ready != NULL && ready_send(x->ready) != 0)
-      fprintf(stderr, "MSC UDP receiver: failed sending ready\n");
-   else
+   /* The destination is prepared: release a sender waiting on this transfer,
+    * unless it has stopped waiting. Either way without a sender, start no
+    * flows. */
+   if (x->ready == NULL)
       ready = 1;
+   else
+   {
+      ready_quiesce(x->ready);
+      if (ready_abandoned(x->ready))
+         fprintf(stderr, "MSC UDP receiver: the sender stopped waiting; "
+                 "abandoning the destination\n");
+      else if (ready_send(x->ready) != 0)
+         fprintf(stderr, "MSC UDP receiver: failed sending ready\n");
+      else
+         ready = 1;
+   }
    phase_mark(x->phases, PH_PREPARE);
    for (f = 0; ready && f < x->flow_count; f++)
    {
