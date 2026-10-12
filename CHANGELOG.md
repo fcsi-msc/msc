@@ -19,14 +19,6 @@ Notable user-facing changes are recorded here.
 - UDP path-MTU discovery no longer overestimates the path when the kernel's
   UDP GRO delivers two probes in one receive buffer. The overestimate could
   make transfers fragment heavily or fail.
-- `contrib/slurm/msc-slurm-smoke.sh` keeps a job step running on the receiving
-  node. Where systemd-logind removes a user's `/dev/shm` files between job
-  steps, transfers and checksums no longer fail.
-- `contrib/slurm/msc-slurm-smoke.sh` keeps a separate log for each throughput
-  run instead of overwriting one shared log.
-
-### Fixed
-
 - A UDP sender now waits until the receiver has created and reserved the
   destination before sending data, when both ends support it. Preparing a large
   destination on slow storage no longer trips the stall timeout as long as the
@@ -34,6 +26,11 @@ Notable user-facing changes are recorded here.
   receiver cannot take it. Preparation that stops advancing for a stall timeout
   still fails the transfer, and the receiver then abandons the destination
   instead of finishing its preparation.
+- `contrib/slurm/msc-slurm-smoke.sh` keeps a job step running on the receiving
+  node. Where systemd-logind removes a user's `/dev/shm` files between job
+  steps, transfers and checksums no longer fail.
+- `contrib/slurm/msc-slurm-smoke.sh` keeps a separate log for each throughput
+  run instead of overwriting one shared log.
 
 ## 1.0.0 - 2026-09-26
 
