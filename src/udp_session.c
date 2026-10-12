@@ -932,6 +932,30 @@ struct msc_udp_file
                         * file at ~1 writer's rate. Only when base == 0. */
 };
 
+/* Where a session's wall time went, reported under MSC_UDP_STATS. Each
+ * phase_mark() charges the time since the previous mark to one phase, so the
+ * phases always sum to the session's lifetime; a session's transfers add up.
+ *   start    process start until the session opens (the sender's includes
+ *            launching the remote side)
+ *   open     control connection, data ports and the protocol handshake
+ *   probe    path-MTU discovery and the pre-data RTT probe
+ *   setup    between transfers and before close (manifests, checkpoints)
+ *   prepare  a transfer's preamble up to starting its data flows; on the
+ *            receiver this includes creating and reserving the destination
+ *   data     data flows running
+ *   finish   after the data until the transfer completes (sync, final
+ *            acknowledgement, checksum, publication)
+ *   close    session teardown */
+enum msc_udp_phase { PH_START, PH_OPEN, PH_PROBE, PH_SETUP, PH_PREPARE, PH_DATA,
+                     PH_FINISH, PH_CLOSE, PH_COUNT };
+
+struct msc_udp_phases
+{
+   uint64_t ns[PH_COUNT];
+   uint64_t mark;          /* time of the previous phase_mark() */
+   uint64_t transfers;
+};
+
 struct msc_udp_xfer
 {
    int flow_count;
@@ -961,6 +985,7 @@ struct msc_udp_xfer
     * Atomic because flow workers are threads. */
    _Atomic uint32_t flows_retired;
    volatile sig_atomic_t *cancel_flag;
+   struct msc_udp_phases *phases;   /* the owning session's phase clock */
 };
 
 /* Data-socket topology, shared by both sides. `nports` (K) sockets carry
@@ -995,6 +1020,7 @@ struct msc_udp_sender
    int flow_count;
    uint64_t next_transfer_id;
    int one_mode;          /* data rides the control socket (MSC_UDP_CTLMODE_ONE) */
+   struct msc_udp_phases phases;
 };
 
 struct msc_udp_receiver
@@ -1004,7 +1030,50 @@ struct msc_udp_receiver
    int flow_count;
    uint64_t next_transfer_id;
    int one_mode;          /* data rides the control socket (MSC_UDP_CTLMODE_ONE) */
+   struct msc_udp_phases phases;
 };
+
+static uint64_t g_process_start_ns;   /* origin of each session's start phase */
+
+__attribute__((constructor)) static void phase_origin(void)
+{
+   g_process_start_ns = msc_udp_now_ns();
+}
+
+static void phase_begin(struct msc_udp_phases *p)
+{
+   memset(p, 0, sizeof(*p));
+   p->mark = g_process_start_ns;
+}
+
+static void phase_mark(struct msc_udp_phases *p, enum msc_udp_phase phase)
+{
+   uint64_t now;
+   if (p == NULL) return;
+   now = msc_udp_now_ns();
+   if (now > p->mark) p->ns[phase] += now - p->mark;
+   p->mark = now;
+}
+
+static void phase_report(const struct msc_udp_phases *p, const char *side)
+{
+   static const char *const names[PH_COUNT] = {
+      "start", "open", "probe", "setup", "prepare", "data", "finish", "close" };
+   char line[512];
+   size_t used;
+   uint64_t total = 0;
+   int i;
+   if (!g_stats) return;
+   used = (size_t)snprintf(line, sizeof(line), "MSC UDP %s phases:", side);
+   for (i = 0; i < PH_COUNT; i++)
+   {
+      total += p->ns[i];
+      used += (size_t)snprintf(line + used, sizeof(line) - used, " %s %.3fs",
+                               names[i], (double)p->ns[i] / 1e9);
+   }
+   fprintf(stderr, "%s total %.3fs transfers %llu\n", line, (double)total / 1e9,
+           (unsigned long long)p->transfers);
+}
 
 /* flows on socket k under f -> f % K: k, k+K, k+2K, ... */
 static int sock_share(int flow_count, int nports, int k)
@@ -5590,12 +5659,14 @@ static int sender_run_flows(struct msc_udp_xfer *x, const struct msc_udp_sockset
    if (g_stats && g_pace_rate_mbit > 0.0)
       fprintf(stderr, "MSC UDP sender: aggregate fresh-payload cap %.1f Mbit/s\n",
               g_pace_rate_mbit);
+   phase_mark(x->phases, PH_PREPARE);
    for (f = 0; f < x->flow_count; f++)
    {
       if (pthread_create(&threads[f], NULL, sender_flow_worker, &flows[f]) != 0) break;
       created++;
    }
    for (f = 0; f < created; f++) pthread_join(threads[f], NULL);
+   phase_mark(x->phases, PH_DATA);
    if (created < x->flow_count) rc = -1;
    for (f = 0; f < x->flow_count; f++) if (flows[f].error) rc = -1;
    free(threads);
@@ -5789,12 +5860,14 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
          samp_on = 1;
    }
 
+   phase_mark(x->phases, PH_PREPARE);
    for (f = 0; f < x->flow_count; f++)
    {
       if (pthread_create(&threads[f], NULL, receiver_flow_worker, &flows[f]) != 0) break;
       created++;
    }
    for (f = 0; f < created; f++) pthread_join(threads[f], NULL);
+   phase_mark(x->phases, PH_DATA);
    if (created < x->flow_count) rc = -1;
    for (f = 0; f < x->flow_count; f++)
       if (flows[f].error)
@@ -5906,6 +5979,8 @@ void *msc_udp_sender_open(struct msc_udp_config *cfg)
 
    s = msc_udp_alloc(sizeof(*s), "sender session");
    memset(s, 0, sizeof(*s));
+   phase_begin(&s->phases);
+   phase_mark(&s->phases, PH_START);
    s->controlfd = -1;
    s->flow_count = cfg->flow_count;
    s->next_transfer_id = random_transfer_id();
@@ -6025,6 +6100,7 @@ void *msc_udp_sender_open(struct msc_udp_config *cfg)
       msc_udp_sender_close(s);
       return NULL;
    }
+   phase_mark(&s->phases, PH_OPEN);
    /* PMTUD probe on flow 0 -- before any transfer, so a discovered payload sizes
     * every buffer. Only when both ends agreed in the HELLO. */
    if ((g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD)) ||
@@ -6032,6 +6108,7 @@ void *msc_udp_sender_open(struct msc_udp_config *cfg)
       pmtud_probe_sender(s->ss.udp_fds[0], s->controlfd,
                          s->ss.receive_demux_of[0],
                          g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD));
+   phase_mark(&s->phases, PH_PROBE);
    if (g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD) && g_payload_probe == 0)
    {
       fprintf(stderr, "MSC UDP sender: no usable payload confirmed by PMTUD\n");
@@ -6047,7 +6124,7 @@ int msc_udp_sender_fd(void *session)
    return s == NULL ? -1 : s->controlfd;
 }
 
-int msc_udp_sender_send(void *session, struct msc_udp_config *cfg)
+static int sender_send_file(void *session, struct msc_udp_config *cfg)
 {
    struct msc_udp_sender *s = session;
    struct msc_udp_xfer x;
@@ -6127,6 +6204,7 @@ int msc_udp_sender_send(void *session, struct msc_udp_config *cfg)
    x.my_ost_start = cfg->my_ost_count > 0 ? cfg->my_ost_start : -1;
    x.my_ost_count = cfg->my_ost_count;
    x.cancel_flag = cfg->cancel_flag;
+   x.phases = &s->phases;
    atomic_init(&x.flows_retired, 0);   /* stack xfer: field-initialized, not zeroed */
    xfer_index(&x);   /* unit_base/nunits + total_units/total_bytes (stripe-aware) */
 
@@ -6314,7 +6392,7 @@ static int table_specs_to_files(const struct msc_udp_tree_xfer *t,
 /* multi-file (recursive) send: the file table + manifest are already agreed by
  * both ends over the control_channel, so there is no per-file greeting. The whole tree
  * is one global unit stream; the only control_channel traffic is the single tail ack. */
-int msc_udp_sender_send_table(void *session, struct msc_udp_tree_xfer *t)
+static int sender_send_table(void *session, struct msc_udp_tree_xfer *t)
 {
    struct msc_udp_sender *s = session;
    struct msc_udp_xfer x;
@@ -6346,6 +6424,7 @@ int msc_udp_sender_send_table(void *session, struct msc_udp_tree_xfer *t)
    x.stripe_size = 0;     /* a tree spans many files: no single layout to affine by */
    x.stripe_count = 0;    /* -> contiguous unit count + partition */
    x.cancel_flag = t->cancel_flag;
+   x.phases = &s->phases;
    atomic_init(&x.flows_retired, 0);   /* stack xfer: field-initialized, not zeroed */
    xfer_index(&x);
    t->total_bytes = x.total_bytes;
@@ -6434,11 +6513,35 @@ int msc_udp_sender_send_table(void *session, struct msc_udp_tree_xfer *t)
    return 0;
 }
 
+/* The public transfer entry points bracket each transfer for the phase clock:
+ * time since the previous mark is setup, and everything after the data flows
+ * until the transfer returns is finish. */
+int msc_udp_sender_send(void *session, struct msc_udp_config *cfg)
+{
+   struct msc_udp_sender *s = session;
+   int rc;
+   if (s != NULL) phase_mark(&s->phases, PH_SETUP);
+   rc = sender_send_file(session, cfg);
+   if (s != NULL) { phase_mark(&s->phases, PH_FINISH); s->phases.transfers++; }
+   return rc;
+}
+
+int msc_udp_sender_send_table(void *session, struct msc_udp_tree_xfer *t)
+{
+   struct msc_udp_sender *s = session;
+   int rc;
+   if (s != NULL) phase_mark(&s->phases, PH_SETUP);
+   rc = sender_send_table(session, t);
+   if (s != NULL) { phase_mark(&s->phases, PH_FINISH); s->phases.transfers++; }
+   return rc;
+}
+
 void msc_udp_sender_close(void *session)
 {
    struct msc_udp_sender *s = session;
    int f;
    if (s == NULL) return;
+   phase_mark(&s->phases, PH_SETUP);
    /* two-phase shutdown. Phase 1: the control channel FIN/ACK exchange runs while the
     * demux (one mode) is still alive feeding it -- joining the demux first
     * would strand the peer's ACKs and defeat FIN reliability. Phase 2: join
@@ -6456,6 +6559,8 @@ void msc_udp_sender_close(void *session)
       free(s->ss.sock_fds);
    }
    if (s->controlfd >= 0) close(s->controlfd);
+   phase_mark(&s->phases, PH_CLOSE);
+   phase_report(&s->phases, "sender");
    free(s);
 }
 
@@ -6470,6 +6575,8 @@ void *msc_udp_receiver_open(struct msc_udp_config *cfg, int controlfd)
 
    s = msc_udp_alloc(sizeof(*s), "receiver session");
    memset(s, 0, sizeof(*s));
+   phase_begin(&s->phases);
+   phase_mark(&s->phases, PH_START);
    s->controlfd = controlfd;
    s->flow_count = cfg->flow_count;
    s->next_transfer_id = 0;   /* announced by the sender in HELLO */
@@ -6545,12 +6652,14 @@ void *msc_udp_receiver_open(struct msc_udp_config *cfg, int controlfd)
       msc_udp_receiver_close(s);
       return NULL;
    }
+   phase_mark(&s->phases, PH_OPEN);
    /* PMTUD probe exchange, mirroring the sender (only when both ends agreed) */
    if ((g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD)) ||
        (g_feat_agreed & MSC_UDP_FEAT_DATA_RTT))
       pmtud_probe_receiver(s->ss.udp_fds[0], controlfd,
                            s->ss.receive_demux_of[0],
                            g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD));
+   phase_mark(&s->phases, PH_PROBE);
    if (g_pmtud && (g_feat_agreed & MSC_UDP_FEAT_PMTUD) && g_payload_probe == 0)
    {
       fprintf(stderr, "MSC UDP receiver: no usable payload confirmed by PMTUD\n");
@@ -6578,7 +6687,7 @@ uint64_t msc_udp_receiver_next_transfer_id(void *session)
    return s == NULL ? 0 : s->next_transfer_id;
 }
 
-int msc_udp_receiver_recv(void *session, struct msc_udp_config *cfg)
+static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
 {
    struct msc_udp_receiver *s = session;
    struct msc_udp_xfer x;
@@ -6665,6 +6774,7 @@ int msc_udp_receiver_recv(void *session, struct msc_udp_config *cfg)
    x.my_ost_start = cfg->my_ost_count > 0 ? cfg->my_ost_start : -1;
    x.my_ost_count = cfg->my_ost_count;
    x.cancel_flag = cfg->cancel_flag;
+   x.phases = &s->phases;
    atomic_init(&x.flows_retired, 0);   /* stack xfer: field-initialized, not zeroed */
    xfer_index(&x);
 
@@ -6779,7 +6889,7 @@ out:
  * manifest the caller read off the control_channel (every fd open, every dir created).
  * Run the whole tree as one global unit stream, flush every file, then send the
  * single tail ack -- byte-count accounting, no per-file checksum. */
-int msc_udp_receiver_recv_table(void *session, struct msc_udp_tree_xfer *t)
+static int receiver_recv_table(void *session, struct msc_udp_tree_xfer *t)
 {
    struct msc_udp_receiver *s = session;
    struct msc_udp_xfer x;
@@ -6811,6 +6921,7 @@ int msc_udp_receiver_recv_table(void *session, struct msc_udp_tree_xfer *t)
    x.stripe_size = 0;     /* tree: contiguous count + partition (matches the sender) */
    x.stripe_count = 0;
    x.cancel_flag = t->cancel_flag;
+   x.phases = &s->phases;
    atomic_init(&x.flows_retired, 0);   /* stack xfer: field-initialized, not zeroed */
    xfer_index(&x);
    t->total_bytes = x.total_bytes;
@@ -6867,11 +6978,32 @@ out:
    return -1;
 }
 
+int msc_udp_receiver_recv(void *session, struct msc_udp_config *cfg)
+{
+   struct msc_udp_receiver *s = session;
+   int rc;
+   if (s != NULL) phase_mark(&s->phases, PH_SETUP);
+   rc = receiver_recv_file(session, cfg);
+   if (s != NULL) { phase_mark(&s->phases, PH_FINISH); s->phases.transfers++; }
+   return rc;
+}
+
+int msc_udp_receiver_recv_table(void *session, struct msc_udp_tree_xfer *t)
+{
+   struct msc_udp_receiver *s = session;
+   int rc;
+   if (s != NULL) phase_mark(&s->phases, PH_SETUP);
+   rc = receiver_recv_table(session, t);
+   if (s != NULL) { phase_mark(&s->phases, PH_FINISH); s->phases.transfers++; }
+   return rc;
+}
+
 void msc_udp_receiver_close(void *session)
 {
    struct msc_udp_receiver *s = session;
    int f;
    if (s == NULL) return;
+   phase_mark(&s->phases, PH_SETUP);
    /* two-phase shutdown, mirroring the sender: FIN/ACK over the still-live
     * demux, then join it. The control fd itself belongs to the CALLER (msc.c
     * accepted it) and is closed there exactly once -- in one mode it is also
@@ -6885,6 +7017,8 @@ void msc_udp_receiver_close(void *session)
             close(s->ss.sock_fds[f]);
       free(s->ss.sock_fds);
    }
+   phase_mark(&s->phases, PH_CLOSE);
+   phase_report(&s->phases, "receiver");
    free(s);
 }
 

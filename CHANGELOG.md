@@ -6,6 +6,9 @@ Notable user-facing changes are recorded here.
 
 ### Added
 
+- With `MSC_UDP_STATS=1`, each side prints a phase-timing line when its UDP
+  session closes, showing how its wall time divided between launch, handshake,
+  path probing, destination preparation, data, completion and teardown.
 - `contrib/slurm`: `B_NODE` and `MSC_SRUN_EXTRA` let the smoke test and
   `msc-srun` run in heterogeneous jobs, for partitions that allow only one
   node per job.

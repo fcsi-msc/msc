@@ -14,6 +14,8 @@
  *                                   (unset or 0 = never fail; the shim is then
  *                                   a pure pass-through)
  *   MSC_TEST_ENOSPC_ERRNO=E         errno to report (default ENOSPC)
+ *   MSC_TEST_FALLOCATE_DELAY_MS=N   sleep N ms in every fallocate before it
+ *                                   runs, as slow destination storage does
  *
  * Only the destination write path is intercepted -- pwrite/pwritev/write/writev
  * (udp_io.c uses pwrite and pwritev for the non-mmap path, which is why the
@@ -34,11 +36,13 @@
 #include <stdlib.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 static atomic_ullong g_written;      /* bytes let through so far */
 static unsigned long long g_limit;   /* 0 = never fail */
 static int g_errno = ENOSPC;
+static unsigned long g_falloc_delay_ms;
 static int g_ready;
 
 static ssize_t (*real_write)(int, const void *, size_t);
@@ -62,6 +66,8 @@ static void shim_init(void)
    v = getenv("MSC_TEST_ENOSPC_ERRNO");
    if (v != NULL && *v != '\0')
       g_errno = atoi(v);
+   v = getenv("MSC_TEST_FALLOCATE_DELAY_MS");
+   g_falloc_delay_ms = v != NULL ? strtoul(v, NULL, 10) : 0;
    g_ready = 1;
 }
 
@@ -152,4 +158,36 @@ ssize_t pwritev64(int fd, const struct iovec *iov, int iovcnt, off64_t off)
    if (real_pwritev64 == NULL)
       real_pwritev64 = dlsym(RTLD_NEXT, "pwritev64");
    return real_pwritev64(fd, iov, iovcnt, off);
+}
+
+static void falloc_delay(void)
+{
+   struct timespec ts;
+   if (g_falloc_delay_ms == 0)
+      return;
+   ts.tv_sec = (time_t)(g_falloc_delay_ms / 1000);
+   ts.tv_nsec = (long)(g_falloc_delay_ms % 1000) * 1000000L;
+   while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+      ;
+}
+
+/* msc imports fallocate64, for the same reason as pwrite64 above. */
+int fallocate(int fd, int mode, off_t off, off_t len)
+{
+   static int (*real_fallocate)(int, int, off_t, off_t);
+   shim_init();
+   falloc_delay();
+   if (real_fallocate == NULL)
+      real_fallocate = dlsym(RTLD_NEXT, "fallocate");
+   return real_fallocate(fd, mode, off, len);
+}
+
+int fallocate64(int fd, int mode, off64_t off, off64_t len)
+{
+   static int (*real_fallocate64)(int, int, off64_t, off64_t);
+   shim_init();
+   falloc_delay();
+   if (real_fallocate64 == NULL)
+      real_fallocate64 = dlsym(RTLD_NEXT, "fallocate64");
+   return real_fallocate64(fd, mode, off, len);
 }

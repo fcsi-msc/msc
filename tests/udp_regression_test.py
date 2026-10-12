@@ -74,6 +74,28 @@ def main():
         print("ok: reduced MTU with/without offloads; unconfirmed path fails; "
               "coalesced probes", flush=True)
 
+        # MSC_UDP_STATS reports where each side's wall time went, and a slow
+        # destination reservation is charged to the receiver's prepare phase.
+        storage = str(ROOT / "build/storage_fault_shim.so")
+        dest = work / "phases"
+        out = run([ROOT / "build/udp_test", source, dest, "2"],
+                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "1000",
+                   "MSC_UDP_STATS": "1"})
+        assert dest.read_bytes() == source.read_bytes()
+        names = ("start", "open", "probe", "setup", "prepare", "data", "finish", "close")
+        pattern = (r"MSC UDP (sender|receiver) phases: "
+                   + " ".join(rf"{n} (?P<{n}>\d+\.\d{{3}})s" for n in names)
+                   + r" total (?P<total>\d+\.\d{3})s transfers 1\n")
+        sides = {m.group(1): m for m in re.finditer(pattern, out)}
+        assert set(sides) == {"sender", "receiver"}, out
+        for m in sides.values():
+            parts = sum(float(m.group(n)) for n in names)
+            assert abs(parts - float(m.group("total"))) < 0.01, m.group(0)
+        assert float(sides["receiver"].group("prepare")) >= 0.9, out
+        assert float(sides["receiver"].group("data")) < 0.9, out
+        print("ok: phase timings charge a slow reservation to the receiver's prepare",
+              flush=True)
+
         # A 1 MiB budget forces repeated wraparound, including SACK, DSACK and
         # retransmission-cache reuse. Compare bytes independently of MSC.
         large = work / "large"
