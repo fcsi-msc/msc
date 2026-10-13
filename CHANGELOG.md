@@ -29,6 +29,10 @@ Notable user-facing changes are recorded here.
 - The `MSC_UDP_STATS` receiver summary now reports the bytes actually received
   and an average computed from them. A failed transfer no longer reports its
   full planned size.
+- When a UDP segmentation offload (GSO) send fails partway through a batch,
+  MSC no longer resends the packets that were already sent. Temporary
+  conditions such as send-buffer pressure no longer turn GSO off for the rest
+  of the flow.
 - `contrib/slurm/msc-slurm-smoke.sh` keeps a job step running on the receiving
   node. Where systemd-logind removes a user's `/dev/shm` files between job
   steps, transfers and checksums no longer fail.

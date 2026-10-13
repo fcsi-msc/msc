@@ -131,6 +131,54 @@ cmp "$ROOT/input.bin" "$ROOT/noffload.bin"
 grep -q "falling back to sendmmsg" "$ROOT/noffload.stats"
 test "$(grep -c "falling back to sendmmsg" "$ROOT/noffload.stats")" -eq 1
 
+# One GSO send failing after earlier chunks of the same batch already went
+# out. A single flow keeps the shim's call count in step with one sender, and
+# its first batch spans several UDP_SEGMENT chunks, so call 2 fails mid-batch.
+# Whatever the errno, units already on the wire must not be sent again: the
+# DATA datagrams the shim saw leave may not exceed the sender's fresh sends
+# plus retransmits. (The receiver's dup count cannot show this: a duplicate
+# that lands in the same receive batch as its original is merged silently.)
+gso_fault()   # gso_fault <name> <errno>; sets $segs to the UDP_SEGMENT sends
+{
+   LD_PRELOAD="$PWD/build/udp_offload_shim.so" MSC_TEST_GSO_FAIL_AT=2 \
+   MSC_TEST_GSO_FAIL_ERRNO=$2 MSC_UDP_STATS=1 \
+      ./build/udp_test "$ROOT/input.bin" "$ROOT/$1.bin" 1 \
+      2> "$ROOT/$1.stats" > /dev/null
+   cmp "$ROOT/input.bin" "$ROOT/$1.bin"
+   grep -q "udp_offload_shim: injected $2 into UDP_SEGMENT sendmsg 2" "$ROOT/$1.stats"
+   segs=$(sed -n 's/^udp_offload_shim: \([0-9]*\) UDP_SEGMENT sends, .*/\1/p' \
+      "$ROOT/$1.stats")
+   wire=$(sed -n 's/^udp_offload_shim: .* sends, \([0-9]*\) data datagrams sent$/\1/p' \
+      "$ROOT/$1.stats")
+   tx=$(sed -n 's/.*sender flow 0: units [0-9]* tx \([0-9]*\) retransmitted .*/\1/p' \
+      "$ROOT/$1.stats" | head -1)
+   rtx=$(sed -n 's/.*sender flow 0: units [0-9]* tx [0-9]* retransmitted \([0-9]*\) .*/\1/p' \
+      "$ROOT/$1.stats" | head -1)
+   test -n "$segs"
+   test -n "$wire"
+   test -n "$tx"
+   test -n "$rtx"
+   if [ "$wire" -gt $((tx + rtx)) ]; then
+      echo "GSO $2: $wire data datagrams sent for $tx units and $rtx retransmits" >&2
+      exit 1
+   fi
+}
+# Any error not known to be transient -- those that mean the kernel cannot do
+# UDP_SEGMENT, and an unrecognised one such as EPERM: one logged fallback, and
+# the flow never tries GSO again.
+for e in EINVAL EIO EMSGSIZE EOPNOTSUPP EPERM; do
+   gso_fault "gso-$e" "$e"
+   test "$(grep -c "falling back to sendmmsg" "$ROOT/gso-$e.stats")" -eq 1
+   test "$segs" -eq 2
+done
+# Send-buffer pressure is transient: like sendmmsg, leave the rest of the
+# batch to loss recovery and keep using GSO.
+for e in ENOBUFS EAGAIN; do
+   gso_fault "gso-$e" "$e"
+   test "$(grep -c "falling back to sendmmsg" "$ROOT/gso-$e.stats")" -eq 0
+   test "$segs" -gt 2
+done
+
 # --- data-port selection ---------------------------------------------------
 # Every transfer names the ports it is actually using, on stderr from both ends
 # (stdout may be the transferred file itself). The receiver picks; the sender
