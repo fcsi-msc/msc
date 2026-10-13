@@ -9,6 +9,33 @@
 
 #include "msc.h"
 
+#define MSC_FINISHED_GRACE_MS 5000
+
+/* Once the receiver has sent its final record, nothing its process does can
+ * change the outcome. Wait a few seconds for it to exit, then stop waiting, so
+ * a receiver stuck afterwards (closing a file on slow storage, say) cannot hold
+ * msc. Returns 1 once the child has been reaped into *status, 0 if it was
+ * abandoned. */
+static int reap_finished_child(pid_t child, int *status)
+{
+   int waited;
+   for (waited = 0; waited < MSC_FINISHED_GRACE_MS; waited += 50)
+   {
+      pid_t r = waitpid(child, status, WNOHANG);
+      if (r == child)
+         return 1;
+      if (r < 0 && errno != EINTR)
+         return 0;
+      usleep(50000);
+   }
+   fprintf(stderr, "MSC receiver had not exited %d s after confirming the transfer; "
+                   "not waiting for it\n", MSC_FINISHED_GRACE_MS / 1000);
+   kill(child, SIGTERM);
+   while (waitpid(child, status, 0) < 0 && errno == EINTR)
+      ;
+   return 0;
+}
+
 /* create child process and run a routine in the parent.  When
  * parent routine is done, wait for child.
  */
@@ -36,7 +63,12 @@ void makechild(msc_child_fn pprocess, msc_child_fn cprocess,
          pprocess(arg);
          if (msc_cancelled())
             kill(childpid, SIGTERM);
-         while (waitpid(childpid, &status, 0) < 0)
+         if (arg->finished && !msc_cancelled())
+         {
+            if (!reap_finished_child(childpid, &status))
+               return;   /* the transfer is confirmed; its receiver is not needed */
+         }
+         else while (waitpid(childpid, &status, 0) < 0)
          {
             if (errno == EINTR)
                continue;

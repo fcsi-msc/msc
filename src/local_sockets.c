@@ -332,12 +332,12 @@ static int send_iov_all(int fd, struct iovec *iov, int iovcnt)
    return 0;
 }
 
-/* The header flag that lets the receiver send FLUSHING records.
- * MSC_TEST_LEGACY_SENDER=1 omits it and refuses those records, as a sender
- * from before them would. */
-static uint32_t sender_flush_flag(void)
+/* A receiver's FLUSHING record: alive, still finishing the transfer. */
+static int segment_is_beat(const void *record)
 {
-   return getenv("MSC_TEST_LEGACY_SENDER") != NULL ? 0U : MSC_SEGMENT_FLUSH_AWARE;
+   const struct segment_header *h = record;
+   return ntohl(h->magic) == MSC_SEGMENT_MAGIC &&
+          (ntohl(h->reserved) & 0xffU) == MSC_SEGMENT_FLUSHING;
 }
 
 static void *segment_sender_thread(void *arg)
@@ -381,7 +381,7 @@ static void *segment_sender_thread(void *arg)
       }
 
       header.magic = htonl(MSC_SEGMENT_MAGIC);
-      header.reserved = htonl(sender_flush_flag());
+      header.reserved = htonl(MSC_SEGMENT_FLUSH_AWARE);   /* we accept FLUSHING */
       header.offset = host_to_network_64(offset);
       header.length = host_to_network_64(length);
       iov[0].iov_base = &header;
@@ -409,7 +409,7 @@ static void *segment_sender_thread(void *arg)
       struct segment_header done;
       bzero(&done, sizeof(done));
       done.magic = htonl(MSC_SEGMENT_MAGIC);
-      done.reserved = htonl(sender_flush_flag());
+      done.reserved = htonl(MSC_SEGMENT_FLUSH_AWARE);
       sendall(worker->socketfd, &done, sizeof(done));
    }
    free(buffer);
@@ -427,6 +427,7 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
    unsigned int created = 0;
    struct msc_checkpoint resumed;
    int have_checkpoint = 0;
+   int finish_code = 0;   /* how the wait for the receiver to finish failed */
    struct msc_progress progress;
 
    bzero(&state, sizeof(state));
@@ -571,18 +572,14 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
    if (!state.error)
    {
       struct segment_header ack;
-      int got;
-      /* The receiver flushes the destination before it acknowledges. While
-       * that flush advances it sends FLUSHING records, each within the stall
-       * timeout that bounds every receive here, so a slow destination is told
-       * apart from a stuck one. */
-      while ((got = recvall_exact(sockfd[0], &ack, sizeof(ack))) == 0 &&
-             sender_flush_flag() != 0 &&
-             ntohl(ack.magic) == MSC_SEGMENT_MAGIC &&
-             (ntohl(ack.reserved) & 0xffU) == MSC_SEGMENT_FLUSHING)
-         ;
-      if (got != 0 ||
-          ntohl(ack.magic) != MSC_SEGMENT_MAGIC ||
+      /* The receiver flushes the destination before it acknowledges, and says
+       * it is alive meanwhile. */
+      finish_code = msc_await_final_record(sockfd[0], &ack, sizeof(ack), segment_is_beat,
+                                           AD->stall_timeout_ms, AD->flush_timeout_ms,
+                                           (uint64_t)state.transfer_length);
+      if (finish_code != 0)
+         state.error = 1;
+      else if (ntohl(ack.magic) != MSC_SEGMENT_MAGIC ||
           (ntohl(ack.reserved) & 0xffU) != MSC_SEGMENT_ACK ||
           network_to_host_64(ack.length) != (uint64_t)state.transfer_length)
       {
@@ -593,6 +590,7 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
       {
          state.destination_write_ns = network_to_host_64(ack.offset);
          state.destination_flush_ns = (uint64_t)(ntohl(ack.reserved) >> 8) * 1000000U;
+         AD->finished = 1;
       }
    }
 
@@ -620,6 +618,8 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
    {
       fprintf(stderr, "MSC segmented sender failed\n");
       if (msc_cancelled()) return;
-      exit(MSC_EXIT_NETWORK);
+      /* A destination that never confirmed the data it received will not do
+       * better on a retry, unlike a network failure. */
+      exit(finish_code == MSC_EXIT_DESTINATION ? MSC_EXIT_DESTINATION : MSC_EXIT_NETWORK);
    }
 }

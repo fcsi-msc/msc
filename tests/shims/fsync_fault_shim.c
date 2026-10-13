@@ -15,14 +15,14 @@
 
 static int (*next_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 static int (*next_fsync)(int);
-static int (*next_sync_file_range)(int, off64_t, off64_t, unsigned int);
 static int (*next_fallocate)(int, int, off_t, off_t);
 static int (*next_fallocate64)(int, int, off64_t, off64_t);
 static atomic_int calls;
 static int fail_at, record_fd = -1;
 static const char *fail_kind;
 static const char *allocation_error;
-static int fsync_delay_ms, range_delay_ms;
+static int fsync_delay_ms;
+static long long fsync_delay_min_bytes;
 
 __attribute__((constructor)) static void init(void)
 {
@@ -30,10 +30,10 @@ __attribute__((constructor)) static void init(void)
    const char *path = getenv("MSC_TEST_FSYNC_LOG");
    next_create = dlsym(RTLD_NEXT, "pthread_create");
    next_fsync = dlsym(RTLD_NEXT, "fsync");
-   next_sync_file_range = dlsym(RTLD_NEXT, "sync_file_range");
    fsync_delay_ms = getenv("MSC_TEST_FSYNC_DELAY_MS") ? atoi(getenv("MSC_TEST_FSYNC_DELAY_MS")) : 0;
-   range_delay_ms = getenv("MSC_TEST_SYNC_RANGE_DELAY_MS")
-                       ? atoi(getenv("MSC_TEST_SYNC_RANGE_DELAY_MS")) : 0;
+   fsync_delay_min_bytes = getenv("MSC_TEST_FSYNC_DELAY_MIN_BYTES")
+                              ? atoll(getenv("MSC_TEST_FSYNC_DELAY_MIN_BYTES")) : 0;
+
    next_fallocate = dlsym(RTLD_NEXT, "fallocate");
    next_fallocate64 = dlsym(RTLD_NEXT, "fallocate64");
    allocation_error = getenv("MSC_TEST_FALLOCATE_ERROR");
@@ -73,18 +73,15 @@ int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), v
    return next_create(t, a, fn, arg);
 }
 
-/* Slow destination storage: each regular-file writeback step takes this long. */
+/* Slow destination storage: each fsync of a regular file of at least
+ * MSC_TEST_FSYNC_DELAY_MIN_BYTES takes this long, so a test can slow a data
+ * file without slowing the small checkpoint files beside it. */
 static void storage_delay(int fd, int ms)
 {
    struct stat st;
-   if (ms > 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
+   if (ms > 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+       (long long)st.st_size >= fsync_delay_min_bytes)
       usleep((useconds_t)ms * 1000U);
-}
-
-int sync_file_range(int fd, off64_t offset, off64_t nbytes, unsigned int flags)
-{
-   storage_delay(fd, range_delay_ms);
-   return next_sync_file_range(fd, offset, nbytes, flags);
 }
 
 int fsync(int fd)

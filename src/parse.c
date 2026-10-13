@@ -57,7 +57,8 @@ void usage(struct argdata *AD)
  "[--resume] [--checkpoint PATH] "
  "[--keep-checkpoint] [--retries N] [--retry-delay DURATION] "
  "[--progress=auto|always|never] [--progress-interval DURATION] "
- "[--stall-timeout DURATION] [--reconnect-interval DURATION]\n");
+ "[--stall-timeout DURATION] [--flush-timeout DURATION] "
+ "[--reconnect-interval DURATION]\n");
 }
 
 /* printed when -h specified */
@@ -106,6 +107,7 @@ void help(struct argdata *AD)
    fprintf(stderr," --progress=auto|always|never: rate-limited progress on stderr\n");
    fprintf(stderr," --progress-interval DURATION: progress refresh interval (default 1s)\n");
    fprintf(stderr," --stall-timeout DURATION: stop after no network progress (default 30s; 0 disables)\n");
+   fprintf(stderr," --flush-timeout DURATION: after all data arrives, wait at least this long (longer for big transfers, 1 s per MiB) for the destination to confirm it is durable (default 30m; 0 waits indefinitely)\n");
    fprintf(stderr," --reconnect-interval DURATION: SSH probe interval after a resumable stall (default 10s; 0 disables)\n");
    fprintf(stderr," -x: don't transfer, just print out msc commands that would be run for a multimachine transfer.  Useful for restarting sections that may have failed.\n");
    fprintf(stderr,"\n");
@@ -468,6 +470,7 @@ void parseargs(int argc, char *argv[], struct argdata *AD)
       { "udp-ports", required_argument, NULL, 1021 },
       { "env", required_argument, NULL, 1022 },
       { "dest-stripe-count", required_argument, NULL, 1023 },
+      { "flush-timeout", required_argument, NULL, 1024 },
       { NULL, 0, NULL, 0 }
    };
    int needhelp=0;
@@ -563,6 +566,7 @@ void parseargs(int argc, char *argv[], struct argdata *AD)
    AD->retry_delay_ms = 1000;
    AD->progress_interval_ms = 1000;
    AD->stall_timeout_ms = DEFAULT_STALL_TIMEOUT_MS;
+   AD->flush_timeout_ms = DEFAULT_FLUSH_TIMEOUT_MS;
    AD->reconnect_interval_ms = DEFAULT_RECONNECT_INTERVAL_MS;
 
        /* already parsed last 2 arguments */
@@ -633,19 +637,21 @@ void parseargs(int argc, char *argv[], struct argdata *AD)
          case 1014:
          case 1015:
          case 1016:
+         case 1024:
          {
             char *end;
             unsigned long long value, multiplier;
             uint64_t *target = opt == 1012 ? &AD->retry_delay_ms :
                                opt == 1014 ? &AD->progress_interval_ms :
                                opt == 1015 ? &AD->stall_timeout_ms :
+                               opt == 1024 ? &AD->flush_timeout_ms :
                                              &AD->reconnect_interval_ms;
             errno = 0; value = strtoull(optarg, &end, 10);
             if (strcmp(end, "ms") == 0 || *end == '\0') multiplier = 1;
             else if (strcmp(end, "s") == 0) multiplier = 1000;
             else if (strcmp(end, "m") == 0) multiplier = 60000;
             else { fprintf(stderr, "duration must use ms, s, or m\n"); exit(MSC_EXIT_CLI); }
-            if (errno || (value == 0 && opt != 1015 && opt != 1016) ||
+            if (errno || (value == 0 && opt != 1015 && opt != 1016 && opt != 1024) ||
                 value > UINT64_MAX / multiplier)
             { fprintf(stderr, "duration is out of range\n"); exit(MSC_EXIT_CLI); }
             *target = (uint64_t)value * multiplier;

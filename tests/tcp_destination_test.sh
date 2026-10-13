@@ -137,42 +137,70 @@ else
    echo "skip: unprivileged user namespaces are unavailable; full-filesystem case not run"
 fi
 
-# The receiver flushes the destination before acknowledging it, and the
-# sender waits for that acknowledgement under the stall timeout. A flush that
-# keeps advancing must not fail a finished transfer however long it takes; one
-# that stops must still fail it. The fsync shim slows writeback steps.
+# The receiver flushes the destination before acknowledging it. Meanwhile it
+# says it is alive, so a flush longer than the stall timeout -- one that shows
+# no progress at all, as on a network filesystem -- does not fail a transfer
+# whose data has arrived. The sender bounds the finish at the larger of
+# --flush-timeout and 1 s per MiB transferred, and reports a destination that
+# never confirms its data with exit 4. The fsync shim makes every fsync of a
+# regular file take MSC_TEST_FSYNC_DELAY_MS.
 shim="$(dirname "$MSC")/build/fsync_fault_shim.so"
-flush()   # label, expected exit, then environment assignments
-{
-   label="$1"; want="$2"; shift 2
+head -c 1048576 /dev/urandom > "$work/mib"
+flush()   # label, expected exit, source, sender binary, receiver binary, msc
+{         # options..., then -- and environment assignments
+   label="$1"; want="$2"; src="$3"; sender="$4"; receiver="$5"; shift 5
+   options=""
+   while [ "$1" != "--" ]; do options="$options $1"; shift; done
+   shift
    rm -f "$work/out"
-   timeout 60 env LD_PRELOAD="$shim" "$@" "$MSC" -T -n 4 --stall-timeout 1s \
-      -l localhost -r localhost -B "$MSC" -i "$work/src" -o "$work/out" \
+   # shellcheck disable=SC2086 # options are single words
+   timeout 60 env LD_PRELOAD="$shim" "$@" "$sender" -T -n 4 --stall-timeout 1s $options \
+      -l localhost -r localhost -B "$receiver" -i "$src" -o "$work/out" \
       >/dev/null 2>"$work/log" && rc=0 || rc=$?
    if [ "$rc" -ne "$want" ]; then
       echo "FAIL: $label exited $rc, want $want"
       sed -n '1,5p' "$work/log"
       exit 1
    fi
-   cmp -s "$work/src" "$work/out" || { echo "FAIL: $label left a different file"; exit 1; }
+   cmp -s "$src" "$work/out" || { echo "FAIL: $label left a different file"; exit 1; }
 }
-flush "writeback advancing for 3.5 s" 0 MSC_TEST_FLUSH_CHUNK_MB=1 MSC_TEST_SYNC_RANGE_DELAY_MS=600
-flush "final fsync of 1.2 s" 0 MSC_TEST_FSYNC_DELAY_MS=1200
-flush "writeback stuck for 4 s" 6 MSC_TEST_FLUSH_CHUNK_MB=8 MSC_TEST_SYNC_RANGE_DELAY_MS=4000
-grep -q "did not acknowledge" "$work/log" \
-   || { echo "FAIL: a stuck flush did not report the missing acknowledgement"; exit 1; }
-# A sender from before FLUSHING records never receives one: a short flush
-# still succeeds, and a long one fails as it always did.
-flush "pre-heartbeat sender, short flush" 0 MSC_TEST_LEGACY_SENDER=1 MSC_TEST_FSYNC_DELAY_MS=600
-flush "pre-heartbeat sender, long flush" 6 MSC_TEST_LEGACY_SENDER=1 MSC_TEST_FSYNC_DELAY_MS=2500
-echo "ok: a slow but advancing flush completes; a stuck one fails; older senders see no new records"
+flush "a 3 s final fsync" 0 "$work/src" "$MSC" "$MSC" -- MSC_TEST_FSYNC_DELAY_MS=3000
+# 1 MiB: the ceiling is max(1 s, 1 MiB at 1 MiB/s) = 1 s; the fsync takes 4 s.
+flush "a stuck fsync past the ceiling" 4 "$work/mib" "$MSC" "$MSC" --flush-timeout 1s -- \
+   MSC_TEST_FSYNC_DELAY_MS=4000
+grep -q "did not confirm it was durable within" "$work/log" \
+   || { echo "FAIL: a stuck fsync did not report the ceiling"; sed -n '1,5p' "$work/log"; exit 1; }
+# 5 MiB and a byte: the size term (about 5 s) outlasts --flush-timeout 1s.
+flush "a 3 s fsync inside the size term" 0 "$work/src" "$MSC" "$MSC" --flush-timeout 1s -- \
+   MSC_TEST_FSYNC_DELAY_MS=3000
+echo "ok: a slow flush completes; one past --flush-timeout and the size term fails with exit 4"
 
-# A checkpointed transfer flushes before its final checkpoint update.
+# A checkpointed transfer flushes and publishes before its ACK.
 rm -f "$work/out" "$work/out.ckpt"
-timeout 60 env LD_PRELOAD="$shim" MSC_TEST_FLUSH_CHUNK_MB=1 MSC_TEST_SYNC_RANGE_DELAY_MS=600 \
+timeout 60 env LD_PRELOAD="$shim" MSC_TEST_FSYNC_DELAY_MS=2500 \
+   MSC_TEST_FSYNC_DELAY_MIN_BYTES=1048576 \
    "$MSC" -T -n 4 --stall-timeout 1s --checkpoint "$work/out.ckpt" \
    -l localhost -r localhost -B "$MSC" -i "$work/src" -o "$work/out" \
    >/dev/null 2>"$work/log" || { echo "FAIL: a checkpointed slow flush failed"; sed -n '1,5p' "$work/log"; exit 1; }
 cmp -s "$work/src" "$work/out" || { echo "FAIL: a checkpointed slow flush corrupted the file"; exit 1; }
 test ! -e "$work/out.ckpt" || { echo "FAIL: a completed checkpointed transfer kept its checkpoint"; exit 1; }
 echo "ok: a checkpointed transfer survives a slow flush and removes its checkpoint"
+
+# Mixed versions, against MSC 1.1.0 built from its release tag: neither side
+# sees records it does not know, so a flush inside the stall timeout succeeds
+# either way, and an older receiver's long flush fails as it always did.
+root="$(dirname "$MSC")"
+old="$work/v1.1.0"
+if git -C "$root" rev-parse -q --verify 'v1.1.0^{commit}' >/dev/null 2>&1 &&
+   mkdir "$old" && git -C "$root" archive v1.1.0 | tar -x -C "$old" &&
+   make -C "$old" msc >"$work/old-build.log" 2>&1; then
+   flush "1.1.0 sender, new receiver" 0 "$work/src" "$old/msc" "$MSC" -- \
+      MSC_TEST_FSYNC_DELAY_MS=500
+   flush "new sender, 1.1.0 receiver" 0 "$work/src" "$MSC" "$old/msc" -- \
+      MSC_TEST_FSYNC_DELAY_MS=500
+   flush "new sender, 1.1.0 receiver, long flush" 6 "$work/src" "$MSC" "$old/msc" -- \
+      MSC_TEST_FSYNC_DELAY_MS=2500
+   echo "ok: 1.1.0 peers interoperate; an older receiver's long flush fails as before"
+else
+   echo "skip: cannot build v1.1.0 from a release tag here; mixed-version cases not run"
+fi
