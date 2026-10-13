@@ -200,7 +200,7 @@ progress_suite: msc
 
 # How the TCP single-file receiver writes: mapped for a destination it
 # creates, pwrite for offsets and MSC_TCP_NO_MMAP=1, and named write failures.
-tcp_destination_suite: msc
+tcp_destination_suite: msc $(B)/fsync_fault_shim.so
 	sh tests/tcp_destination_test.sh
 
 # The sub-suites run one after another rather than as prerequisites: they

@@ -29,6 +29,11 @@
 
 #define MSC_SEGMENT_MAGIC 0x4d534331U
 #define MSC_SEGMENT_ACK 1U
+/* Receiver -> sender on stream 0 before the ACK: the destination is being
+ * flushed and the flush is still advancing. Sent only to a sender whose
+ * segment headers carry MSC_SEGMENT_FLUSH_AWARE. */
+#define MSC_SEGMENT_FLUSHING 2U
+#define MSC_SEGMENT_FLUSH_AWARE 0x100U   /* sender -> receiver header flag */
 #define MSC_RESUME_MAGIC 0x4d535252U
 #define MSC_RESUME_REPLY_MAGIC 0x4d535250U
 #define MSC_UDP_DURABLE_MAGIC 0x4d535544U
@@ -144,7 +149,9 @@ struct segment_header
 {
    /* A zero length is the per-stream end marker.  For data records, offset is
     * relative to this transfer (destination offsets are applied separately).
-    * Every field is sent in network byte order, including the 64-bit fields. */
+    * Every field is sent in network byte order, including the 64-bit fields.
+    * On sender records, reserved carries flags; on the receiver's records its
+    * low byte is the type (MSC_SEGMENT_ACK or MSC_SEGMENT_FLUSHING). */
    uint32_t magic;
    uint32_t reserved;
    uint64_t offset;
