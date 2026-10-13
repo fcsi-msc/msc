@@ -505,8 +505,7 @@ static int receiver_flush(struct receiver_state *state, off_t base, uint64_t len
    pthread_t thread;
    int started, rc, saved;
 
-   if (!__atomic_load_n(&state->peer_flush_aware, __ATOMIC_RELAXED) ||
-       state->stall_timeout_ms == 0)
+   if (!state->peer_flush_aware || state->stall_timeout_ms == 0)   /* workers joined */
       return fsync(state->outputfd);
    if (test != NULL && atoll(test) > 0)
       chunk = (uint64_t)atoll(test) << 20;
@@ -565,6 +564,7 @@ static void *segment_receiver_thread(void *arg)
    struct receiver_worker *worker = arg;
    struct receiver_state *state = worker->state;
    char *buffer = checkmalloc(state->segment_size, "receiver worker buffer");
+   int flush_aware = 0;   /* this stream's sender accepts FLUSHING records */
 
    while (!receiver_has_error(state) && !msc_cancelled())
    {
@@ -584,7 +584,7 @@ static void *segment_receiver_thread(void *arg)
          break;
       }
       if (ntohl(header.reserved) & MSC_SEGMENT_FLUSH_AWARE)
-         __atomic_store_n(&state->peer_flush_aware, 1, __ATOMIC_RELAXED);
+         flush_aware = 1;
       offset = network_to_host_64(header.offset);
       length = network_to_host_64(header.length);
       if (length == 0)
@@ -667,6 +667,12 @@ static void *segment_receiver_thread(void *arg)
          set_receiver_error(state);
          break;
       }
+   }
+   if (flush_aware)
+   {
+      pthread_mutex_lock(&state->error_lock);
+      state->peer_flush_aware = 1;
+      pthread_mutex_unlock(&state->error_lock);
    }
    free(buffer);
    return NULL;
