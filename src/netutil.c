@@ -111,10 +111,10 @@ void msc_beat_stop(struct msc_beat *b)
    pthread_mutex_destroy(&b->lock);
 }
 
-/* The slowest destination flush rate a sender waits for: 4 MiB/s, half the
- * slowest measured for a network filesystem committing a whole file in one
- * fsync (8-17 MiB/s). */
-#define MSC_FLUSH_FLOOR_BYTES_PER_S (UINT64_C(4) << 20)
+/* The slowest destination flush rate a sender waits for: 2 MiB/s, well below
+ * a loaded network filesystem committing a whole file in one fsync, which can
+ * fall to a few MiB/s and vary twofold from one run to the next. */
+#define MSC_FLUSH_FLOOR_BYTES_PER_S (UINT64_C(2) << 20)
 
 uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes)
 {
@@ -216,7 +216,7 @@ int msc_await_final_record(int socketfd, void *record, size_t size,
          {
             describe_ms(text, sizeof(text), ceiling);
             fprintf(stderr, "MSC delivered all data, but the destination did not confirm "
-                            "it was durable within %s (--flush-timeout, or 1 s per 4 MiB "
+                            "it was durable within %s (--flush-timeout, or 1 s per 2 MiB "
                             "transferred if longer)\n", text);
             return MSC_EXIT_DESTINATION;
          }
