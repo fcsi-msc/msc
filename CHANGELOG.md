@@ -10,7 +10,8 @@ Notable user-facing changes are recorded here.
   data has arrived, for the receiver to confirm the destination is durable: D
   or 1 s per MiB transferred, whichever is longer. The default is 30 minutes,
   and 0 waits indefinitely. A destination that does not confirm in time fails
-  the transfer with exit 4 rather than leaving msc waiting forever.
+  the transfer with exit 4 rather than leaving msc waiting forever; a
+  checkpointed transfer then keeps its checkpoint, and `--resume` finishes it.
 
 ### Changed
 

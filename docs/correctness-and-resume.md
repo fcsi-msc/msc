@@ -128,7 +128,10 @@ alive, so a flush longer than the stall timeout does not fail a transfer whose
 data has arrived. `--flush-timeout` (default 30 minutes; 0 waits indefinitely)
 bounds that wait instead, extended to 1 s per MiB transferred for large
 transfers. A destination that never confirms its data within it fails the
-transfer with exit 4: all data was delivered, and retrying cannot help.
+transfer with exit 4: all data was delivered, and retrying cannot help. A
+checkpointed receiver that finds its sender gone does not publish: it keeps the
+partial file and the checkpoint, and rerunning with `--resume` once the
+destination responds finishes the transfer.
 
 Only network/transport exit 6 is retried. `--retries` controls bounded retries
 with backoff. Checkpointed transfers also enable reconnect probing by default
