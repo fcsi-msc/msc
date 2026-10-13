@@ -578,7 +578,12 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
                                            AD->stall_timeout_ms, AD->flush_timeout_ms,
                                            (uint64_t)state.transfer_length);
       if (finish_code != 0)
+      {
          state.error = 1;
+         if (finish_code == MSC_EXIT_DESTINATION && have_checkpoint)
+            fprintf(stderr, "MSC kept the checkpoint; rerun with --resume to finish "
+                            "once the destination responds\n");
+      }
       else if (ntohl(ack.magic) != MSC_SEGMENT_MAGIC ||
           (ntohl(ack.reserved) & 0xffU) != MSC_SEGMENT_ACK ||
           network_to_host_64(ack.length) != (uint64_t)state.transfer_length)
@@ -590,7 +595,6 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
       {
          state.destination_write_ns = network_to_host_64(ack.offset);
          state.destination_flush_ns = (uint64_t)(ntohl(ack.reserved) >> 8) * 1000000U;
-         AD->finished = 1;
       }
    }
 

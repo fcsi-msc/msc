@@ -329,7 +329,6 @@ struct argdata
    uint64_t progress_interval_ms;
    uint64_t stall_timeout_ms;  /* maximum interval without network progress */
    uint64_t flush_timeout_ms;  /* sender: bound on the receiver's finish; 0 = none */
-   int finished;               /* sender: the receiver's final record arrived */
    uint64_t reconnect_interval_ms; /* SSH probe cadence after a resumable stall */
    int my_ost_start;           /* multi-machine Lustre slice metadata */
    int my_ost_count;
@@ -404,8 +403,7 @@ extern int msc_configure_tcp_socket(int fd, uint64_t timeout_ms);
 
 /* Receiver liveness while it finishes a transfer (flush, publish): a timer
  * thread calls send(arg) every interval until stopped. It touches nothing but
- * its timer and that send, so storage stuck in the kernel cannot stall it.
- * msc_beat_lock serializes other writes to the same channel with the beats. */
+ * its timer and that send, so storage stuck in the kernel cannot stall it. */
 struct msc_beat
 {
    pthread_t thread;
@@ -419,8 +417,6 @@ struct msc_beat
 extern uint64_t msc_beat_interval_ns(uint64_t stall_timeout_ms);
 extern void msc_beat_start(struct msc_beat *b, uint64_t interval_ns,
                            int (*send)(void *), void *arg);
-extern void msc_beat_lock(struct msc_beat *b);
-extern void msc_beat_unlock(struct msc_beat *b);
 extern void msc_beat_stop(struct msc_beat *b);
 /* How long a sender waits for the receiver to finish after the data:
  * max(flush_timeout_ms, bytes at the floor rate); 0 when unbounded. */

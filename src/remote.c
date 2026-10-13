@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -416,6 +417,23 @@ static int send_flushing(void *arg)
    beat.magic = htonl(MSC_SEGMENT_MAGIC);
    beat.reserved = htonl(MSC_SEGMENT_FLUSHING);
    return sendall(*(int *)arg, &beat, sizeof(beat));
+}
+
+/* Whether the sender has closed stream 0. After the data it sends nothing
+ * while it waits for the ACK, so anything readable there is its end of file
+ * or a reset. A failed send is no test: the first write after the peer has
+ * closed can still succeed. */
+static int sender_gone(int socketfd)
+{
+   struct pollfd p;
+   char byte;
+   p.fd = socketfd;
+   p.events = POLLIN | POLLRDHUP;
+   if (poll(&p, 1, 0) <= 0)
+      return 0;
+   if (p.revents & (POLLRDHUP | POLLHUP | POLLERR))
+      return 1;
+   return recv(socketfd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) <= 0;
 }
 
 /* From the end of the data until the ACK -- unmapping, flushing and, for a
@@ -869,6 +887,17 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
    {
       fprintf(stderr, "MSC transfer interrupted; durable partial data and checkpoint retained at %s\n",
               AD->checkpoint_path);
+      pthread_mutex_destroy(&state.error_lock);
+      goto cleanup;
+   }
+   /* A sender that has given up waiting (the destination outlasted its
+    * --flush-timeout) has reported a failure. Publishing now would leave a
+    * complete file and no checkpoint behind that report, and break the
+    * --resume it suggests, so keep both as they are instead. */
+   if (sender_gone(newsockfds[0]))
+   {
+      fprintf(stderr, "MSC sender stopped waiting; keeping %s and its checkpoint "
+                      "for --resume\n", temp_path);
       pthread_mutex_destroy(&state.error_lock);
       goto cleanup;
    }

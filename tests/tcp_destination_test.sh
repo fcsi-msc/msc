@@ -184,7 +184,39 @@ timeout 60 env LD_PRELOAD="$shim" MSC_TEST_FSYNC_DELAY_MS=2500 \
    >/dev/null 2>"$work/log" || { echo "FAIL: a checkpointed slow flush failed"; sed -n '1,5p' "$work/log"; exit 1; }
 cmp -s "$work/src" "$work/out" || { echo "FAIL: a checkpointed slow flush corrupted the file"; exit 1; }
 test ! -e "$work/out.ckpt" || { echo "FAIL: a completed checkpointed transfer kept its checkpoint"; exit 1; }
+if grep -q "msc reconnect" "$work/log"; then
+   echo "FAIL: the checkpointed slow flush only succeeded by reconnecting"
+   sed -n '1,8p' "$work/log"
+   exit 1
+fi
 echo "ok: a checkpointed transfer survives a slow flush and removes its checkpoint"
+
+# When the ceiling trips on a checkpointed transfer, the receiver must not
+# publish behind the sender's failure: it keeps the partial file and the
+# checkpoint, and --resume then finishes the transfer.
+rm -f "$work/out" "$work/out.ckpt"
+timeout 60 env LD_PRELOAD="$shim" MSC_TEST_FSYNC_DELAY_MS=3000 \
+   MSC_TEST_FSYNC_DELAY_MIN_BYTES=1048576 \
+   "$MSC" -T -n 4 --stall-timeout 1s --flush-timeout 1s --checkpoint "$work/out.ckpt" \
+   -l localhost -r localhost -B "$MSC" -i "$work/mib" -o "$work/out" \
+   >/dev/null 2>"$work/log" && rc=0 || rc=$?
+[ "$rc" -eq 4 ] || { echo "FAIL: a checkpointed transfer past the ceiling exited $rc, want 4"; sed -n '1,8p' "$work/log"; exit 1; }
+grep -q "rerun with --resume" "$work/log" \
+   || { echo "FAIL: a checkpointed transfer past the ceiling did not suggest --resume"; exit 1; }
+waited=0
+until grep -q "keeping .* for --resume" "$work/log" || [ "$waited" -ge 20 ]; do
+   sleep 1
+   waited=$((waited + 1))
+done
+grep -q "keeping .* for --resume" "$work/log" \
+   || { echo "FAIL: the receiver did not keep its checkpoint after the sender gave up"; sed -n '1,8p' "$work/log"; exit 1; }
+test ! -e "$work/out" || { echo "FAIL: the receiver published after the sender gave up"; exit 1; }
+test -e "$work/out.ckpt" || { echo "FAIL: the receiver dropped the checkpoint after the sender gave up"; exit 1; }
+timeout 60 "$MSC" -T -n 4 --stall-timeout 1s --resume --checkpoint "$work/out.ckpt" \
+   -l localhost -r localhost -B "$MSC" -i "$work/mib" -o "$work/out" >/dev/null 2>"$work/log" \
+   || { echo "FAIL: --resume after the ceiling failed"; sed -n '1,8p' "$work/log"; exit 1; }
+cmp -s "$work/mib" "$work/out" || { echo "FAIL: --resume after the ceiling left a different file"; exit 1; }
+echo "ok: past the ceiling a checkpointed receiver keeps its checkpoint, and --resume finishes"
 
 # Mixed versions, against MSC 1.1.0 built from its release tag: neither side
 # sees records it does not know, so a flush inside the stall timeout succeeds

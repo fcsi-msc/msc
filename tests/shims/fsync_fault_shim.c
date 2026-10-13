@@ -73,14 +73,15 @@ int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), v
    return next_create(t, a, fn, arg);
 }
 
-/* Slow destination storage: each fsync of a regular file of at least
- * MSC_TEST_FSYNC_DELAY_MIN_BYTES takes this long, so a test can slow a data
- * file without slowing the small checkpoint files beside it. */
+/* Slow destination storage: each fsync of a regular file with at least
+ * MSC_TEST_FSYNC_DELAY_MIN_BYTES allocated takes this long, so a test can slow
+ * the flush of received data without slowing small checkpoint files or a
+ * sparse, pre-sized destination synced before any data arrives. */
 static void storage_delay(int fd, int ms)
 {
    struct stat st;
    if (ms > 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-       (long long)st.st_size >= fsync_delay_min_bytes)
+       (long long)st.st_blocks * 512 >= fsync_delay_min_bytes)
       usleep((useconds_t)ms * 1000U);
 }
 

@@ -98,16 +98,6 @@ void msc_beat_start(struct msc_beat *b, uint64_t interval_ns,
    b->running = pthread_create(&b->thread, NULL, beat_main, b) == 0;
 }
 
-void msc_beat_lock(struct msc_beat *b)
-{
-   pthread_mutex_lock(&b->lock);
-}
-
-void msc_beat_unlock(struct msc_beat *b)
-{
-   pthread_mutex_unlock(&b->lock);
-}
-
 void msc_beat_stop(struct msc_beat *b)
 {
    pthread_mutex_lock(&b->lock);
