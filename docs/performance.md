@@ -92,9 +92,12 @@ storage backpressure need not first become packet loss. See
 
 ## Destination write path
 
-For eligible whole-file writes, MSC normally uses a shared mapping on non-Lustre
-filesystems and coalesced `pwritev` on Lustre. Consecutive units for the same file
-can share a vectored write; reordering and file boundaries break runs.
+For eligible whole-file writes, a UDP receiver uses a shared mapping on local
+filesystems (tmpfs, ext2/3/4, XFS or Btrfs) and coalesced `pwritev` elsewhere,
+including NFS, CephFS and Lustre. Mapped writeback on a network filesystem goes
+page by page over the network and can be many times slower: several times on
+Lustre and over 50 times on NFS. Consecutive units for the same file can share
+a vectored write; reordering and file boundaries break runs.
 MSC reserves destination storage with `fallocate` before mapping, so an initial
 ENOSPC is reported as a destination error rather than a write-time SIGBUS.
 Filesystems that do not support allocation use the vectored path. Late device
@@ -102,7 +105,7 @@ errors, external truncation, and thin-provisioned storage still need filesystem
 and operational safeguards.
 Offsets, supplied file descriptors, and mapping eligibility can select the
 vectored path. `MSC_UDP_NO_MMAP=1` forces it; `MSC_UDP_FORCE_MMAP=1` requests
-mapping on eligible paths even on Lustre.
+mapping on eligible paths on any filesystem.
 
 On tmpfs, `fallocate` allocates and zeroes every page of the file in one serial
 pass, which can take as long as the data phase itself. A mapped single-file
@@ -124,9 +127,8 @@ common Linux filesystems, and each segment is copied once instead of twice. The
 file grows to cover each segment as it arrives, so no space is reserved up
 front. A page the kernel cannot allocate fails that receive with an error that
 names the filesystem's reason, such as ENOSPC, and does not crash the receiver.
-Network filesystems keep `pwrite`: mapped writeback on Lustre cannot issue
-large RPCs and is several times slower, and NFS and CephFS have not been
-measured. Other filesystems, destination offsets, checkpointed transfers and
+Network filesystems keep `pwrite`, for the reason given above for UDP. Other
+filesystems, destination offsets, checkpointed transfers and
 multiple-machine slices also keep `pwrite`; `MSC_TCP_NO_MMAP=1` keeps it
 everywhere. With `--stats`, the receiver prints
 `MSC TCP receiver write-path: mmap` or `pwrite`. The `--progress` summary's

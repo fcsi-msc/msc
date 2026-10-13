@@ -152,7 +152,7 @@ Defaults below are the base values before profile adjustments.
 | `MSC_UDP_SOCK_AUTOTUNE` | 0 disables buffer autotuning; default on. |
 | `MSC_UDP_AUTOTUNE_MAX` | Positive autotune ceiling in bytes; 256 MiB, capped at `INT_MAX`; kernel limits still apply. |
 | `MSC_UDP_NO_MMAP` | 1 forces vectored writes; default 0. |
-| `MSC_UDP_FORCE_MMAP` | 1 requests mapping for eligible paths including Lustre; default 0. Avoid combining the two overrides. |
+| `MSC_UDP_FORCE_MMAP` | 1 requests mapping for eligible paths on any filesystem, including network filesystems; default 0 (map only on tmpfs, ext2/3/4, XFS and Btrfs). Avoid combining the two overrides. |
 | `MSC_TCP_NO_MMAP` | 1 makes TCP single-file receivers write with `pwrite` instead of receiving into a mapping of a local-filesystem destination; default 0. Forwarded to the receiver. |
 | `MSC_UDP_RESERVE_UPFRONT` | 1 reserves a mapped tmpfs destination in full before data starts, instead of alongside the data; default 0. |
 | `MSC_UDP_FSYNC_THREADS` | Positive recursive tail-sync worker count; 64. |
