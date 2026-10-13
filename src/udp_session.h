@@ -671,6 +671,7 @@ extern int msc_udp_checksum_fd(int fd, off_t off, uint64_t len, uint64_t *sum);
  * the query returns -1, and msc_udp_open_dest falls back to a plain open(). */
 extern int msc_udp_is_lustre(const char *path);
 extern int msc_udp_fd_is_lustre(int fd);
+extern int msc_fd_maps_well(int fd);
 extern int msc_udp_query_stripe(const char *path, uint64_t *stripe_size,
                             uint32_t *stripe_count);
 /* Create `path` with an explicitly requested Lustre layout, keeping the caller's

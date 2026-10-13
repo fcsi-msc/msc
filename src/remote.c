@@ -8,7 +8,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
-#include <sys/vfs.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -250,27 +249,6 @@ static void report_destination_failure(struct receiver_state *state,
    set_receiver_error(state);
 }
 
-/* Local filesystems where receiving into a mapping has been measured faster
- * than pwrite. Network filesystems keep pwrite: their mapped writeback can
- * be far slower (on Lustre it cannot issue large RPCs; see receiver_run_flows
- * in udp_session.c), and NFS and CephFS have not been measured. */
-static int destination_maps_well(int fd)
-{
-   struct statfs fs;
-   if (fstatfs(fd, &fs) != 0)
-      return 0;
-   switch ((unsigned long)fs.f_type)
-   {
-   case 0x01021994UL:   /* tmpfs */
-   case 0x0000EF53UL:   /* ext2, ext3, ext4 */
-   case 0x58465342UL:   /* XFS */
-   case 0x9123683EUL:   /* Btrfs */
-      return 1;
-   default:
-      return 0;
-   }
-}
-
 /* Use mappings only for a destination this transfer created empty and writes
  * from its first byte, on a filesystem where they help. MSC_TCP_NO_MMAP=1
  * keeps pwrite everywhere. */
@@ -284,7 +262,7 @@ static void destination_map_setup(struct receiver_state *state, int fresh)
 
    if (!fresh || state->destination_base != 0 || (off != NULL && atoi(off) != 0) ||
        fstat(state->outputfd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != 0 ||
-       !destination_maps_well(state->outputfd))
+       !msc_fd_maps_well(state->outputfd))
       return;
    if (page <= 0)
       page = 4096;
