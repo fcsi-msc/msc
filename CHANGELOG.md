@@ -36,6 +36,12 @@ Notable user-facing changes are recorded here.
   give up. The receiver now tells the sender while the flush is advancing; a
   flush that stops advancing still fails the transfer. Both ends need this
   version; with an older peer the earlier behavior remains.
+- Recursive TCP transfers sync every received file, every directory and the
+  destination root before reporting success, as recursive UDP transfers do.
+  Without a checkpoint, only the last file each stream wrote was synced, so a
+  crash soon after a successful transfer could lose data. The sync runs in
+  parallel (`MSC_UDP_FSYNC_THREADS`), and while it advances the receiver tells
+  the sender, so a slow destination no longer fails a finished tree.
 
 ## 1.1.0 - 2026-10-12
 

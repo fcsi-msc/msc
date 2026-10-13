@@ -176,3 +176,43 @@ timeout 60 env LD_PRELOAD="$shim" MSC_TEST_FLUSH_CHUNK_MB=1 MSC_TEST_SYNC_RANGE_
 cmp -s "$work/src" "$work/out" || { echo "FAIL: a checkpointed slow flush corrupted the file"; exit 1; }
 test ! -e "$work/out.ckpt" || { echo "FAIL: a completed checkpointed transfer kept its checkpoint"; exit 1; }
 echo "ok: a checkpointed transfer survives a slow flush and removes its checkpoint"
+
+# Recursive TCP: the receiver syncs every file, every directory and the root
+# before acknowledging the tree, telling the sender while that advances.
+mkdir -p "$work/tree/a/b"
+head -c 1048576 /dev/urandom > "$work/tree/a/x"
+head -c 2097152 /dev/urandom > "$work/tree/a/b/y"
+cp "$work/src" "$work/tree/z"
+tree()   # label, expected exit, then environment assignments
+{
+   label="$1"; want="$2"; shift 2
+   rm -rf "$work/copy"
+   timeout 60 env LD_PRELOAD="$shim" "$@" "$MSC" -T -R -n 4 --stall-timeout 1s \
+      -l localhost -r localhost -B "$MSC" -i "$work/tree" -o "$work/copy" \
+      >/dev/null 2>"$work/log" && rc=0 || rc=$?
+   if { [ "$want" -eq 0 ] && [ "$rc" -ne 0 ]; } || { [ "$want" -ne 0 ] && [ "$rc" -eq 0 ]; }; then
+      echo "FAIL: recursive $label exited $rc"
+      sed -n '1,5p' "$work/log"
+      exit 1
+   fi
+   diff -r "$work/tree" "$work/copy" >/dev/null \
+      || { echo "FAIL: recursive $label left a different tree"; exit 1; }
+}
+rm -f "$work/fsync.log"
+tree "durability" 0 MSC_TEST_FSYNC_LOG="$work/fsync.log"
+for path in a/x a/b/y z; do
+   grep -qx "F $work/copy/$path" "$work/fsync.log" \
+      || { echo "FAIL: recursive TCP acknowledged before syncing $path"; exit 1; }
+done
+for path in a a/b; do
+   grep -qx "D $work/copy/$path" "$work/fsync.log" \
+      || { echo "FAIL: recursive TCP acknowledged before syncing directory $path"; exit 1; }
+done
+grep -qx "D $work/copy" "$work/fsync.log" \
+   || { echo "FAIL: recursive TCP acknowledged before syncing the tree root"; exit 1; }
+echo "ok: recursive TCP syncs every file, directory and the root before acknowledging"
+tree "sync advancing for about 1.6 s" 0 MSC_TEST_FSYNC_DELAY_MS=400
+tree "sync stuck for 4 s" 1 MSC_TEST_FLUSH_CHUNK_MB=8 MSC_TEST_SYNC_RANGE_DELAY_MS=4000
+tree "pre-heartbeat sender, short sync" 0 MSC_TEST_LEGACY_SENDER=1 MSC_TEST_FSYNC_DELAY_MS=150
+tree "pre-heartbeat sender, long sync" 1 MSC_TEST_LEGACY_SENDER=1 MSC_TEST_FSYNC_DELAY_MS=1500
+echo "ok: a slow but advancing recursive sync completes; a stuck one fails; older senders see no new records"

@@ -49,6 +49,11 @@
 #define MSC_RECORD_SYMLINK 7
 #define MSC_RECORD_HARDLINK 8
 #define MSC_RECORD_HOLE 9
+/* Receiver -> sender on stream 0 before ACK: the tree is being synced and the
+ * sync is still advancing. Sent only to a sender whose WORKER_DONE records
+ * carry MSC_RECORD_FLAG_FLUSH_AWARE in their mode field. */
+#define MSC_RECORD_FLUSHING 10
+#define MSC_RECORD_FLAG_FLUSH_AWARE 1U
 
 /* Public process exit status contract.  Keep these values stable: scripts and
  * the SSH parent use them to distinguish permanent from retryable failures. */

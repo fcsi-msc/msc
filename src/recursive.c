@@ -105,6 +105,7 @@ struct directory_receiver_state
    uint64_t bytes_since_checkpoint;
    uint64_t segments_received;
    uint64_t interrupt_after;
+   int peer_flush_aware;   /* the sender accepts FLUSHING records */
 };
 
 struct directory_receiver_worker
@@ -698,11 +699,19 @@ static int buffer_is_zero(const unsigned char *buffer, size_t length)
    return 1;
 }
 
+/* The WORKER_DONE flag that lets the receiver send FLUSHING records.
+ * MSC_TEST_LEGACY_SENDER=1 omits it and refuses those records, as a sender
+ * from before them would. */
+static uint32_t sender_flush_flag(void)
+{
+   return getenv("MSC_TEST_LEGACY_SENDER") != NULL ? 0U : MSC_RECORD_FLAG_FLUSH_AWARE;
+}
+
 static int send_done_record(int socketfd)
 {
    struct directory_record_header done;
 
-   encode_header(&done, MSC_RECORD_WORKER_DONE, 0, 0, 0, 0);
+   encode_header(&done, MSC_RECORD_WORKER_DONE, sender_flush_flag(), 0, 0, 0);
    return sendall(socketfd, &done, sizeof(done));
 }
 
@@ -1340,7 +1349,15 @@ static void *directory_receiver_thread(void *arg)
          break;
       }
       if (header.type == MSC_RECORD_WORKER_DONE)
+      {
+         if (header.mode & MSC_RECORD_FLAG_FLUSH_AWARE)
+         {
+            pthread_mutex_lock(&state->error_lock);
+            state->peer_flush_aware = 1;
+            pthread_mutex_unlock(&state->error_lock);
+         }
          break;
+      }
       if ((header.type != MSC_RECORD_DATA && header.type != MSC_RECORD_HOLE) ||
           header.length > state->segment_size)
       {
@@ -1392,10 +1409,7 @@ static void *directory_receiver_thread(void *arg)
       if (state->error) { set_receiver_error(state); break; }
    }
    if (outputfd >= 0)
-   {
-      fsync(outputfd);
-      close(outputfd);
-   }
+      close(outputfd);   /* receivedirectory syncs every file before the ACK */
    free(buffer);
    return NULL;
 }
@@ -1500,10 +1514,20 @@ void xferdirectory(int sockets[], struct argdata *AD)
    AD->childinfo->xfercount = 0;
    for (i = 0; i < created; i++)
       AD->childinfo->xfercount += workers[i].bytes_sent;
-   if (!state.error &&
-       (recvall_exact(sockets[0], &ack, sizeof(ack)) != 0 ||
-        decode_header(&ack) != 0 || ack.type != MSC_RECORD_ACK))
-      state.error = 1;
+   /* The receiver syncs the tree before it acknowledges. While that sync
+    * advances it sends FLUSHING records, each within the stall timeout that
+    * bounds every receive here, so a slow destination is told apart from a
+    * stuck one. */
+   if (!state.error)
+   {
+      int got, decoded = -1;
+      while ((got = recvall_exact(sockets[0], &ack, sizeof(ack))) == 0 &&
+             (decoded = decode_header(&ack)) == 0 &&
+             ack.type == MSC_RECORD_FLUSHING && sender_flush_flag() != 0)
+         ;
+      if (got != 0 || decoded != 0 || ack.type != MSC_RECORD_ACK)
+         state.error = 1;
+   }
    pthread_mutex_destroy(&state.cursor_lock);
    pthread_mutex_destroy(&state.error_lock);
    free(workers);
@@ -1520,6 +1544,242 @@ void xferdirectory(int sockets[], struct argdata *AD)
       if (msc_cancelled()) return;
       exit(AD->checkpoint_path != NULL ? MSC_EXIT_NETWORK : MSC_EXIT_INTERNAL);
    }
+}
+
+#define MSC_TREE_SYNC_CHUNK_MB 256   /* writeback step; MSC_TEST_FLUSH_CHUNK_MB shrinks it */
+
+static uint64_t tree_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+/* Syncing a received tree: workers claim regular files from one cursor, write
+ * each back in chunks and fsync it. progress counts completed chunks, files
+ * and directories; a heartbeat tells the sender while it keeps advancing. */
+struct tree_sync
+{
+   struct directory_manifest *manifest;
+   uint64_t chunk;
+   pthread_mutex_t lock;
+   size_t next;                 /* next manifest entry to claim */
+   uint64_t progress;
+   int error;                   /* first failure (errno) */
+   const char *failed;          /* the path that failed */
+   int stop;                    /* the heartbeat should end */
+   pthread_cond_t wake;
+};
+
+static void tree_sync_advance(struct tree_sync *t)
+{
+   pthread_mutex_lock(&t->lock);
+   t->progress++;
+   pthread_mutex_unlock(&t->lock);
+}
+
+static void tree_sync_fail(struct tree_sync *t, const char *path, int error)
+{
+   pthread_mutex_lock(&t->lock);
+   if (t->error == 0)
+   {
+      t->error = error;
+      t->failed = path;
+   }
+   pthread_mutex_unlock(&t->lock);
+}
+
+static void *tree_sync_worker(void *arg)
+{
+   struct tree_sync *t = arg;
+   for (;;)
+   {
+      struct directory_entry *entry;
+      uint64_t off = 0;
+      int fd;
+      pthread_mutex_lock(&t->lock);
+      while (t->next < t->manifest->count &&
+             (t->manifest->entries[t->next].type != MSC_RECORD_FILE || t->error != 0))
+         t->next++;
+      entry = t->next < t->manifest->count ? &t->manifest->entries[t->next++] : NULL;
+      pthread_mutex_unlock(&t->lock);
+      if (entry == NULL)
+         break;
+      fd = open(entry->full_path, O_RDONLY | O_NOFOLLOW);
+      if (fd < 0)
+      {
+         tree_sync_fail(t, entry->full_path, errno);
+         break;
+      }
+      while (off < entry->size)
+      {
+         uint64_t len = entry->size - off < t->chunk ? entry->size - off : t->chunk;
+         if (sync_file_range(fd, (off_t)off, (off_t)len,
+                             SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+                             SYNC_FILE_RANGE_WAIT_AFTER) != 0)
+            break;   /* unsupported or failed: the fsync below reports it */
+         off += len;
+         tree_sync_advance(t);
+      }
+      if (fsync(fd) != 0)
+      {
+         tree_sync_fail(t, entry->full_path, errno);
+         close(fd);
+         break;
+      }
+      close(fd);
+      tree_sync_advance(t);
+   }
+   return NULL;
+}
+
+struct tree_beat
+{
+   struct tree_sync *sync;
+   int socketfd;
+   uint64_t interval_ns, stall_ns;
+};
+
+/* Send FLUSHING every interval while the sync has advanced within the last
+ * stall timeout. A sync that stops advancing goes quiet, and the sender gives
+ * up after its stall timeout as before. */
+static void *tree_beat_main(void *arg)
+{
+   struct tree_beat *b = arg;
+   struct tree_sync *t = b->sync;
+   uint64_t seen = 0, advanced = tree_now_ns();
+   pthread_mutex_lock(&t->lock);
+   while (!t->stop)
+   {
+      uint64_t next = tree_now_ns() + b->interval_ns, now, progress;
+      struct timespec at;
+      int rc = 0;
+      at.tv_sec = (time_t)(next / UINT64_C(1000000000));
+      at.tv_nsec = (long)(next % UINT64_C(1000000000));
+      while (!t->stop && rc != ETIMEDOUT)
+         rc = pthread_cond_timedwait(&t->wake, &t->lock, &at);
+      if (t->stop)
+         break;
+      progress = t->progress;
+      pthread_mutex_unlock(&t->lock);
+      now = tree_now_ns();
+      if (progress != seen)
+      {
+         seen = progress;
+         advanced = now;
+      }
+      if (now - advanced < b->stall_ns)
+      {
+         struct directory_record_header beat;
+         encode_header(&beat, MSC_RECORD_FLUSHING, 0, 0, progress, 0);
+         if (sendall(b->socketfd, &beat, sizeof(beat)) != 0)
+         {
+            pthread_mutex_lock(&t->lock);
+            break;
+         }
+      }
+      pthread_mutex_lock(&t->lock);
+   }
+   pthread_mutex_unlock(&t->lock);
+   return NULL;
+}
+
+/* Make the received tree durable before acknowledging it: every regular
+ * file's data, then every manifest directory and the root, so the new entries
+ * survive too. Files are synced in parallel (MSC_UDP_FSYNC_THREADS workers,
+ * default 64), since a serial fsync per file dominates trees of many small
+ * files. When the sender accepts them, FLUSHING records on stream 0 keep it
+ * waiting while the sync advances, however long the sync takes. */
+static int receiver_sync_tree(struct directory_receiver_state *state, const char *root,
+                              uint64_t stall_ms)
+{
+   struct directory_manifest *manifest = state->manifest;
+   const char *threads_env = getenv("MSC_UDP_FSYNC_THREADS");
+   const char *chunk_env = getenv("MSC_TEST_FLUSH_CHUNK_MB");
+   size_t nthreads = threads_env != NULL && atoi(threads_env) > 0
+                        ? (size_t)atoi(threads_env) : 64;
+   struct tree_sync t;
+   struct tree_beat b;
+   pthread_condattr_t attr;
+   pthread_t *threads, beat_thread;
+   size_t i, created = 0;
+   int beating = 0, rc = 0;
+
+   if (nthreads > manifest->file_count)
+      nthreads = manifest->file_count > 0 ? manifest->file_count : 1;
+   memset(&t, 0, sizeof(t));
+   t.manifest = manifest;
+   t.chunk = (uint64_t)MSC_TREE_SYNC_CHUNK_MB << 20;
+   if (chunk_env != NULL && atoll(chunk_env) > 0)
+      t.chunk = (uint64_t)atoll(chunk_env) << 20;
+   pthread_mutex_init(&t.lock, NULL);
+   pthread_condattr_init(&attr);
+   pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+   pthread_cond_init(&t.wake, &attr);
+   pthread_condattr_destroy(&attr);
+
+   if (stall_ms != 0 && state->peer_flush_aware)   /* workers joined */
+   {
+      uint64_t interval = stall_ms * UINT64_C(1000000) / 4;
+      if (interval < UINT64_C(100000000)) interval = UINT64_C(100000000);
+      if (interval > UINT64_C(5000000000)) interval = UINT64_C(5000000000);
+      b.sync = &t;
+      b.socketfd = state->sockets[0];
+      b.interval_ns = interval;
+      b.stall_ns = stall_ms * UINT64_C(1000000);
+      beating = pthread_create(&beat_thread, NULL, tree_beat_main, &b) == 0;
+   }
+
+   threads = checkmalloc(sizeof(*threads) * nthreads, "tree sync threads");
+   for (i = 0; i < nthreads; i++)
+   {
+      if (pthread_create(&threads[i], NULL, tree_sync_worker, &t) != 0)
+         break;
+      created++;
+   }
+   if (created == 0)
+      tree_sync_worker(&t);   /* no thread could start: sync inline */
+   for (i = 0; i < created; i++)
+      pthread_join(threads[i], NULL);
+   free(threads);
+
+   /* File fsync does not make its directory entry durable. */
+   for (i = 0; t.error == 0 && i < manifest->count; i++)
+   {
+      struct directory_entry *entry = &manifest->entries[i];
+      int fd;
+      if (entry->type != MSC_RECORD_DIRECTORY) continue;
+      fd = open(entry->full_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      if (fd < 0 || fsync(fd) != 0)
+         tree_sync_fail(&t, entry->full_path, errno);
+      if (fd >= 0) close(fd);
+      tree_sync_advance(&t);
+   }
+   if (t.error == 0)
+   {
+      int fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      if (fd < 0 || fsync(fd) != 0)
+         tree_sync_fail(&t, root, errno);
+      if (fd >= 0) close(fd);
+   }
+
+   if (beating)
+   {
+      pthread_mutex_lock(&t.lock);
+      t.stop = 1;
+      pthread_cond_signal(&t.wake);
+      pthread_mutex_unlock(&t.lock);
+      pthread_join(beat_thread, NULL);
+   }
+   if (t.error != 0)
+   {
+      fprintf(stderr, "MSC recursive receiver could not sync %s: %s\n",
+              t.failed, strerror(t.error));
+      rc = -1;
+   }
+   pthread_cond_destroy(&t.wake);
+   pthread_mutex_destroy(&t.lock);
+   return rc;
 }
 
 void receivedirectory(int numstreams, int sockets[], struct argdata *AD)
@@ -1634,6 +1894,10 @@ void receivedirectory(int numstreams, int sockets[], struct argdata *AD)
          }
       }
    }
+   /* Durable before the ACK, and before the final checkpoint update, whose
+    * own sync then has little left to do. */
+   if (!state.error && receiver_sync_tree(&state, AD->destfile, AD->stall_timeout_ms) != 0)
+      state.error = 1;
    if (AD->checkpoint_path != NULL)
    {
       pthread_mutex_lock(&state.completion_lock);
