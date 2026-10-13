@@ -39,7 +39,7 @@ make check
 | `dest_stripe_suite` | Destination-stripe option parsing, restrictions, and forwarding. |
 | `wanshim` | Synthetic WAN smoke, a WAN profile with throughput/retransmission gates, and MTU black-hole behavior. |
 | `shim_check` | Emulator passthrough, delay, loss, and seeded behavior; GSO/sendmmsg datagram equivalence, MTU, scatter/gather and TOS preservation. |
-| `udp_regressions` | Small MTUs, exhausted PMTUD, GRO-coalesced PMTUD probes, PMTUD probe-loss statistics, phase timings, the sender's wait for destination preparation (slow, hung and abandoned), receiver byte summaries, bounded ring wraparound under loss, fsync worker failures and syscall coverage, publication errors, and growing hardlink indexes. |
+| `udp_regressions` | Small MTUs, exhausted PMTUD, GRO-coalesced PMTUD probes, PMTUD probe-loss statistics, phase timings, the sender's wait for destination preparation (slow, hung and abandoned), tmpfs reservation alongside the data (helpers, catch-up prefaults, and a full tmpfs where unprivileged user and mount namespaces are available), receiver byte summaries, bounded ring wraparound under loss, fsync worker failures and syscall coverage, publication errors, and growing hardlink indexes. |
 | `valgrind`, `helgrind`, `helgrind_udp` | Memory checks, TCP worker races, and UDP telemetry/shared-socket/offload-fallback races; see [Valgrind](valgrind.md). |
 
 Avoid `make clean` in a checkout where another process is building or testing.
@@ -106,6 +106,11 @@ Storage fault controls include `MSC_TEST_ENOSPC_AFTER_BYTES` and
 write syscalls do not see mapped-memory stores. `MSC_TEST_FALLOCATE_DELAY_MS`
 delays each destination reservation step, and `MSC_TEST_RESERVE_CHUNK_MB`
 shrinks that step so tests can model preparation that is slow but advancing.
+Tests that rely on those steps set `MSC_UDP_RESERVE_UPFRONT=1`, so a tmpfs
+temporary directory still reserves up front. `MSC_TEST_NO_PREFAULT_HELPERS=1`
+leaves all prefaulting of a destination reserved alongside the data to the
+flows, and `MSC_TEST_IGNORE_ROOM=1` skips the free-space check before such a
+transfer so a full filesystem is found by prefaulting.
 The GRO coalescing shim's `MSC_TEST_COALESCE_AS_ONE=1` makes the receiver
 report the summed probe size, as receivers before the fix did.
 `MSC_TEST_TCP_MAP_REGION_MB` shrinks the TCP receiver's 1 GiB mapping region so

@@ -97,7 +97,19 @@ filesystems and coalesced `pwritev` on Lustre. Consecutive units for the same fi
 can share a vectored write; reordering and file boundaries break runs.
 MSC reserves destination storage with `fallocate` before mapping, so an initial
 ENOSPC is reported as a destination error rather than a write-time SIGBUS.
-Filesystems that do not support allocation use the vectored path. Late device
+Filesystems that do not support allocation use the vectored path.
+
+On tmpfs, `fallocate` allocates and zeroes every page of the file in one serial
+pass, which can take as long as the data phase itself. A mapped single-file
+destination there is instead reserved alongside the data: a helper thread per
+flow prefaults that flow's part of the mapping ahead of its data, and a flow
+prefaults any data its helper has not reached yet. Prefaulting reports a page
+that cannot be allocated as an error, so a full filesystem still fails the
+transfer with ENOSPC rather than SIGBUS, and a check of free space before the
+data starts catches the common case early. Lustre-affine partitions and kernels
+older than Linux 5.14 reserve up front; `MSC_UDP_RESERVE_UPFRONT=1` restores
+the up-front reservation everywhere. With `--stats`, the write-path line ends in
+`reserved alongside data` when it applies. Late device
 errors, external truncation, and thin-provisioned storage still need filesystem
 and operational safeguards.
 Offsets, supplied file descriptors, and mapping eligibility can select the

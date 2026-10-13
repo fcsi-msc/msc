@@ -40,7 +40,8 @@ padding to the wire format.
 5. Exchange single-file greeting, or the manifest/readiness/table records for
    a tree. Checkpointed transfers also perform their resume negotiation. When
    both ends advertise READY, the session's first single-file transfer then
-   waits: the receiver creates and reserves the destination, sending
+   waits: the receiver creates and reserves the destination (on tmpfs it
+   only creates and maps it, and reserves it alongside the data), sending
    `PREPARING` periodically, and releases the sender with `READY` (or reports
    `ERROR`). A sender that gives up sends `ABORT` and closes the channel; the
    receiver treats any input during preparation as that and abandons the

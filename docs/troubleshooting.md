@@ -51,7 +51,7 @@ MSC UDP receiver phases: start 0.010s open 0.011s probe 0.045s setup 0.000s prep
 | `open` | Control connection, data ports and the protocol handshake. |
 | `probe` | Path-MTU discovery and the pre-data RTT probe. |
 | `setup` | Between transfers and before close, such as manifest and checkpoint exchanges. |
-| `prepare` | Each transfer's preamble up to starting its data flows. On the receiver this includes creating and reserving the destination. A transfer that fails before its flows start is charged here in full. |
+| `prepare` | Each transfer's preamble up to starting its data flows. On the receiver this includes creating and reserving the destination, except on tmpfs, where reservation runs alongside the data and is charged to `data`. A transfer that fails before its flows start is charged here in full. |
 | `data` | Data flows running. |
 | `finish` | After the data until the transfer completes: sync, final acknowledgement, checksum and publication. |
 | `close` | Session teardown. |
