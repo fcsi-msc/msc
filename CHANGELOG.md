@@ -33,6 +33,9 @@ Notable user-facing changes are recorded here.
   MSC no longer resends the packets that were already sent. Temporary
   conditions such as send-buffer pressure no longer turn GSO off for the rest
   of the flow.
+- The `MSC_UDP_STATS` PMTUD line no longer counts probe sizes that the local
+  interface refused as `probe_losses`; they are reported separately as
+  `probe_unsendable`, so `probe_losses` reflects only probes lost on the path.
 - `contrib/slurm/msc-slurm-smoke.sh` keeps a job step running on the receiving
   node. Where systemd-logind removes a user's `/dev/shm` files between job
   steps, transfers and checksums no longer fail.
