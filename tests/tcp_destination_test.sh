@@ -6,7 +6,8 @@
 # Other filesystems, offsets and MSC_TCP_NO_MMAP=1 keep pwrite. Both
 # paths must deliver identical bytes for any segment size, including segments
 # that cross mapping regions (MSC_TEST_TCP_MAP_REGION_MB=1 shrinks a region to
-# 1 MiB), and a destination that cannot be written must name the reason.
+# 1 MiB), and a destination that cannot be written must name the reason. A
+# slow flush before the acknowledgement must not fail a finished transfer.
 # Nothing here needs an sshd. The full-filesystem case runs only where
 # unprivileged user and mount namespaces are available.
 set -e
@@ -135,3 +136,43 @@ if unshare -Urm true 2>/dev/null; then
 else
    echo "skip: unprivileged user namespaces are unavailable; full-filesystem case not run"
 fi
+
+# The receiver flushes the destination before acknowledging it, and the
+# sender waits for that acknowledgement under the stall timeout. A flush that
+# keeps advancing must not fail a finished transfer however long it takes; one
+# that stops must still fail it. The fsync shim slows writeback steps.
+shim="$(dirname "$MSC")/build/fsync_fault_shim.so"
+flush()   # label, expected exit, then environment assignments
+{
+   label="$1"; want="$2"; shift 2
+   rm -f "$work/out"
+   timeout 60 env LD_PRELOAD="$shim" "$@" "$MSC" -T -n 4 --stall-timeout 1s \
+      -l localhost -r localhost -B "$MSC" -i "$work/src" -o "$work/out" \
+      >/dev/null 2>"$work/log" && rc=0 || rc=$?
+   if [ "$rc" -ne "$want" ]; then
+      echo "FAIL: $label exited $rc, want $want"
+      sed -n '1,5p' "$work/log"
+      exit 1
+   fi
+   cmp -s "$work/src" "$work/out" || { echo "FAIL: $label left a different file"; exit 1; }
+}
+flush "writeback advancing for 3.5 s" 0 MSC_TEST_FLUSH_CHUNK_MB=1 MSC_TEST_SYNC_RANGE_DELAY_MS=600
+flush "final fsync of 1.2 s" 0 MSC_TEST_FSYNC_DELAY_MS=1200
+flush "writeback stuck for 4 s" 6 MSC_TEST_FLUSH_CHUNK_MB=8 MSC_TEST_SYNC_RANGE_DELAY_MS=4000
+grep -q "did not acknowledge" "$work/log" \
+   || { echo "FAIL: a stuck flush did not report the missing acknowledgement"; exit 1; }
+# A sender from before FLUSHING records never receives one: a short flush
+# still succeeds, and a long one fails as it always did.
+flush "pre-heartbeat sender, short flush" 0 MSC_TEST_LEGACY_SENDER=1 MSC_TEST_FSYNC_DELAY_MS=600
+flush "pre-heartbeat sender, long flush" 6 MSC_TEST_LEGACY_SENDER=1 MSC_TEST_FSYNC_DELAY_MS=2500
+echo "ok: a slow but advancing flush completes; a stuck one fails; older senders see no new records"
+
+# A checkpointed transfer flushes before its final checkpoint update.
+rm -f "$work/out" "$work/out.ckpt"
+timeout 60 env LD_PRELOAD="$shim" MSC_TEST_FLUSH_CHUNK_MB=1 MSC_TEST_SYNC_RANGE_DELAY_MS=600 \
+   "$MSC" -T -n 4 --stall-timeout 1s --checkpoint "$work/out.ckpt" \
+   -l localhost -r localhost -B "$MSC" -i "$work/src" -o "$work/out" \
+   >/dev/null 2>"$work/log" || { echo "FAIL: a checkpointed slow flush failed"; sed -n '1,5p' "$work/log"; exit 1; }
+cmp -s "$work/src" "$work/out" || { echo "FAIL: a checkpointed slow flush corrupted the file"; exit 1; }
+test ! -e "$work/out.ckpt" || { echo "FAIL: a completed checkpointed transfer kept its checkpoint"; exit 1; }
+echo "ok: a checkpointed transfer survives a slow flush and removes its checkpoint"

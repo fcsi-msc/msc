@@ -81,6 +81,8 @@ struct receiver_state
    int signal_number;
    volatile uint64_t write_ns;
    uint64_t flush_ns;
+   uint64_t stall_timeout_ms;  /* the sender's no-progress limit; 0 = none */
+   int peer_flush_aware;       /* the sender accepts FLUSHING records */
    /* A fresh regular single-file destination is received straight into
     * shared mappings of the file, so the workers do not take turns on the
     * inode's write lock as they do with pwrite. Region i maps the file from
@@ -427,6 +429,137 @@ static int receive_into_destination(struct receiver_state *state, int socketfd,
    return rc;
 }
 
+#define MSC_FLUSH_CHUNK_MB 256   /* writeback step; MSC_TEST_FLUSH_CHUNK_MB shrinks it */
+
+/* How often to tell the sender the flush is advancing: well inside its stall
+ * timeout, as for the UDP receiver's PREPARING records. */
+static uint64_t flush_heartbeat_ns(uint64_t stall_timeout_ms)
+{
+   uint64_t ns = stall_timeout_ms * UINT64_C(1000000) / 4;
+   if (ns < UINT64_C(100000000)) ns = UINT64_C(100000000);
+   if (ns > UINT64_C(5000000000)) ns = UINT64_C(5000000000);
+   return ns;
+}
+
+static int send_flushing(int socketfd, uint64_t flushed)
+{
+   struct segment_header beat;
+   memset(&beat, 0, sizeof(beat));
+   beat.magic = htonl(MSC_SEGMENT_MAGIC);
+   beat.reserved = htonl(MSC_SEGMENT_FLUSHING);
+   beat.offset = host_to_network_64(flushed);
+   return sendall(socketfd, &beat, sizeof(beat));
+}
+
+/* Keeps sending FLUSHING during the final fsync, until it returns or one
+ * stall timeout has passed since the writeback last advanced. */
+struct flush_beat
+{
+   int socketfd;
+   uint64_t flushed, interval_ns, deadline_ns;
+   pthread_mutex_t lock;
+   pthread_cond_t wake;
+   int stop;
+};
+
+static void *flush_beat_main(void *arg)
+{
+   struct flush_beat *b = arg;
+   pthread_mutex_lock(&b->lock);
+   while (!b->stop)
+   {
+      uint64_t next = receiver_now_ns() + b->interval_ns;
+      struct timespec at;
+      int rc = 0;
+      at.tv_sec = (time_t)(next / UINT64_C(1000000000));
+      at.tv_nsec = (long)(next % UINT64_C(1000000000));
+      while (!b->stop && rc != ETIMEDOUT)
+         rc = pthread_cond_timedwait(&b->wake, &b->lock, &at);
+      if (b->stop || receiver_now_ns() >= b->deadline_ns)
+         break;
+      pthread_mutex_unlock(&b->lock);
+      rc = send_flushing(b->socketfd, b->flushed);
+      pthread_mutex_lock(&b->lock);
+      if (rc != 0)
+         break;
+   }
+   pthread_mutex_unlock(&b->lock);
+   return NULL;
+}
+
+/* Flush [base, base + length) of the destination before acknowledging it.
+ * A flush to slow storage can outlast the stall timeout that bounds the
+ * sender's wait for the acknowledgement, and the sender would report a
+ * finished transfer as failed. So when the sender accepts it, write back in
+ * chunks and send FLUSHING after each completed chunk (at most once per
+ * heartbeat interval), then keep sending it through the final fsync for up to
+ * one stall timeout after the last chunk completed. Writeback that stops
+ * advancing sends nothing, and the sender still gives up. */
+static int receiver_flush(struct receiver_state *state, off_t base, uint64_t length)
+{
+   const char *test = getenv("MSC_TEST_FLUSH_CHUNK_MB");
+   uint64_t chunk = (uint64_t)MSC_FLUSH_CHUNK_MB << 20, interval, now, beat, progress;
+   uint64_t off = 0;
+   struct flush_beat b;
+   pthread_condattr_t attr;
+   pthread_t thread;
+   int started, rc, saved;
+
+   if (!__atomic_load_n(&state->peer_flush_aware, __ATOMIC_RELAXED) ||
+       state->stall_timeout_ms == 0)
+      return fsync(state->outputfd);
+   if (test != NULL && atoll(test) > 0)
+      chunk = (uint64_t)atoll(test) << 20;
+   interval = flush_heartbeat_ns(state->stall_timeout_ms);
+   beat = progress = receiver_now_ns();
+   while (off < length)
+   {
+      uint64_t len = length - off < chunk ? length - off : chunk;
+      if (sync_file_range(state->outputfd, base + (off_t)off, (off_t)len,
+                          SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+                          SYNC_FILE_RANGE_WAIT_AFTER) != 0)
+      {
+         if (errno == EINVAL || errno == ESPIPE || errno == ENOSYS)
+            break;   /* not supported here: the fsync below does it all */
+         return -1;
+      }
+      off += len;
+      now = progress = receiver_now_ns();
+      if (now - beat >= interval)
+      {
+         if (send_flushing(state->sockets[0], off) != 0)
+            return -1;
+         beat = now;
+      }
+   }
+
+   b.socketfd = state->sockets[0];
+   b.flushed = off;
+   b.interval_ns = interval;
+   b.deadline_ns = progress + state->stall_timeout_ms * UINT64_C(1000000);
+   b.stop = 0;
+   pthread_mutex_init(&b.lock, NULL);
+   pthread_condattr_init(&attr);
+   pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+   pthread_cond_init(&b.wake, &attr);
+   pthread_condattr_destroy(&attr);
+   started = pthread_create(&thread, NULL, flush_beat_main, &b) == 0;
+   rc = fsync(state->outputfd);
+   saved = errno;
+   if (started)
+   {
+      pthread_mutex_lock(&b.lock);
+      b.stop = 1;
+      pthread_cond_signal(&b.wake);
+      pthread_mutex_unlock(&b.lock);
+      pthread_join(thread, NULL);
+   }
+   pthread_cond_destroy(&b.wake);
+   pthread_mutex_destroy(&b.lock);
+   errno = saved;
+   return rc;
+}
+
 static void *segment_receiver_thread(void *arg)
 {
    struct receiver_worker *worker = arg;
@@ -450,6 +583,8 @@ static void *segment_receiver_thread(void *arg)
          set_receiver_error(state);
          break;
       }
+      if (ntohl(header.reserved) & MSC_SEGMENT_FLUSH_AWARE)
+         __atomic_store_n(&state->peer_flush_aware, 1, __ATOMIC_RELAXED);
       offset = network_to_host_64(header.offset);
       length = network_to_host_64(header.length);
       if (length == 0)
@@ -541,7 +676,7 @@ static void *segment_receiver_thread(void *arg)
  * it, so the file may be mapped and extended segment by segment. */
 void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
                           int segment_size, off_t destination_base, int fresh,
-                          int stats)
+                          int stats, uint64_t stall_timeout_ms)
 {
    struct receiver_state state;
    struct receiver_worker *workers;
@@ -555,6 +690,7 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    state.segment_size = segment_size;
    state.sockets = newsockfds;
    state.numstreams = numstreams;
+   state.stall_timeout_ms = stall_timeout_ms;
    pthread_mutex_init(&state.error_lock, NULL);
    destination_map_setup(&state, fresh);
    if (stats)
@@ -583,7 +719,7 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    if (!state.error)
    {
       uint64_t started = receiver_now_ns();
-      if (fsync(state.outputfd) != 0)
+      if (receiver_flush(&state, state.destination_base, state.bytes_received) != 0)
       { perror("MSC segmented receiver fsync"); state.error = 1; }
       state.flush_ns = receiver_now_ns() - started;
    }
@@ -816,6 +952,7 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
    state.sockets = newsockfds; state.numstreams = numstreams;
    state.checkpoint = &checkpoint; state.checkpoint_path = AD->checkpoint_path;
    state.checkpoint_data_path = temp_path;
+   state.stall_timeout_ms = AD->stall_timeout_ms;
    fault = getenv("MSC_TEST_INTERRUPT_AFTER_SEGMENTS");
    if (fault != NULL) state.interrupt_after = strtoull(fault, NULL, 10);
    fault = getenv("MSC_TEST_SIGNAL_AFTER_SEGMENTS");
@@ -835,6 +972,15 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
       created++;
    }
    for (i = 0; i < (uint32_t)created; i++) pthread_join(threads[i], NULL);
+   /* Write the data back (telling the sender while it advances) before the
+    * checkpoint update, whose own fsync then has little left to do. */
+   if (!state.error && transfer_size != 0 &&
+       msc_checkpoint_contains(&checkpoint, 0, transfer_size) &&
+       receiver_flush(&state, state.destination_base, transfer_size) != 0)
+   {
+      perror("MSC resumable receiver fsync");
+      state.error = 1;
+   }
    pthread_mutex_lock(&state.error_lock);
    if (persist_receiver_checkpoint(&state) != 0) state.error = 1;
    pthread_mutex_unlock(&state.error_lock);
@@ -1224,7 +1370,8 @@ void connect_and_process(struct argdata *AD)
       off_t destination_base = AD->dst_offset != 0 ? AD->dst_offset : AD->lastgood;
       readsocket_segmented(AD->numstreams, newsockfds, AD->outfileid,
                            AD->packetsize, destination_base,
-                           destination_truncated(AD), AD->stats);
+                           destination_truncated(AD), AD->stats,
+                           AD->stall_timeout_ms);
    }
    else
       readsocket(AD->numstreams, newsockfds, AD->outfileid, AD->packetsize);

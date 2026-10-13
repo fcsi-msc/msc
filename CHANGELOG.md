@@ -30,6 +30,12 @@ Notable user-facing changes are recorded here.
   after it finishes before exiting.
 - A TCP receiver that cannot write its destination reports the byte offset and
   the reason, such as ENOSPC, instead of only that the receiver failed.
+- A TCP single-file transfer to slow storage no longer fails with exit 6 after
+  all of its data has arrived. The receiver flushes the destination before
+  acknowledging it, and a flush longer than the stall timeout made the sender
+  give up. The receiver now tells the sender while the flush is advancing; a
+  flush that stops advancing still fails the transfer. Both ends need this
+  version; with an older peer the earlier behavior remains.
 
 ## 1.1.0 - 2026-10-12
 
