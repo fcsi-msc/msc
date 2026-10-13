@@ -193,7 +193,9 @@ echo "ok: a checkpointed transfer survives a slow flush and removes its checkpoi
 
 # When the ceiling trips on a checkpointed transfer, the receiver must not
 # publish behind the sender's failure: it keeps the partial file and the
-# checkpoint, and --resume then finishes the transfer.
+# checkpoint, and --resume then finishes the transfer. (The shim's delay can
+# end early when the exiting sender's SSH stand-in is signalled, unlike an
+# uninterruptible fsync on a stuck network filesystem; the outcome is the same.)
 rm -f "$work/out" "$work/out.ckpt"
 timeout 60 env LD_PRELOAD="$shim" MSC_TEST_FSYNC_DELAY_MS=3000 \
    MSC_TEST_FSYNC_DELAY_MIN_BYTES=1048576 \
