@@ -107,7 +107,7 @@ void help(struct argdata *AD)
    fprintf(stderr," --progress=auto|always|never: rate-limited progress on stderr\n");
    fprintf(stderr," --progress-interval DURATION: progress refresh interval (default 1s)\n");
    fprintf(stderr," --stall-timeout DURATION: stop after no network progress (default 30s; 0 disables)\n");
-   fprintf(stderr," --flush-timeout DURATION: after all data arrives, wait at least this long (longer for big transfers, 1 s per MiB) for the destination to confirm it is durable (default 30m; 0 waits indefinitely)\n");
+   fprintf(stderr," --flush-timeout DURATION: after all data arrives, wait at least this long (longer for big transfers: 1 s per 4 MiB) for the destination to confirm it is durable (default 30m; 0 waits indefinitely)\n");
    fprintf(stderr," --reconnect-interval DURATION: SSH probe interval after a resumable stall (default 10s; 0 disables)\n");
    fprintf(stderr," -x: don't transfer, just print out msc commands that would be run for a multimachine transfer.  Useful for restarting sections that may have failed.\n");
    fprintf(stderr,"\n");

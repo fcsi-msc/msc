@@ -576,7 +576,7 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
        * it is alive meanwhile. */
       finish_code = msc_await_final_record(sockfd[0], &ack, sizeof(ack), segment_is_beat,
                                            AD->stall_timeout_ms, AD->flush_timeout_ms,
-                                           (uint64_t)state.transfer_length);
+                                           (uint64_t)state.transfer_length, have_checkpoint);
       if (finish_code != 0)
       {
          state.error = 1;

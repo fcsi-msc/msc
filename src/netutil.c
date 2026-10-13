@@ -111,10 +111,10 @@ void msc_beat_stop(struct msc_beat *b)
    pthread_mutex_destroy(&b->lock);
 }
 
-/* The slowest destination flush rate a sender waits for: 1 MiB/s, well below
- * the 8-17 MiB/s measured for a network filesystem committing a whole file in
- * one fsync. */
-#define MSC_FLUSH_FLOOR_BYTES_PER_S (UINT64_C(1) << 20)
+/* The slowest destination flush rate a sender waits for: 4 MiB/s, half the
+ * slowest measured for a network filesystem committing a whole file in one
+ * fsync (8-17 MiB/s). */
+#define MSC_FLUSH_FLOOR_BYTES_PER_S (UINT64_C(4) << 20)
 
 uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes)
 {
@@ -134,8 +134,11 @@ static uint64_t netutil_now_ms(void)
 
 static void describe_ms(char *text, size_t size, uint64_t ms)
 {
-   if (ms % 60000U == 0)
-      snprintf(text, size, "%llum", (unsigned long long)(ms / 60000U));
+   unsigned long long s = (unsigned long long)(ms / 1000U);
+   if (ms >= 3600000U)
+      snprintf(text, size, "%lluh%02llum", s / 3600U, s % 3600U / 60U);
+   else if (ms >= 60000U)
+      snprintf(text, size, "%llum%02llus", s / 60U, s % 60U);
    else
       snprintf(text, size, "%.1fs", (double)ms / 1000.0);
 }
@@ -145,16 +148,21 @@ static void describe_ms(char *text, size_t size, uint64_t ms)
  * that is_beat() does not call a beat. Each record must arrive within the
  * stall timeout, which a receiver that is alive but still flushing meets with
  * beats, and the whole wait ends at msc_finish_ceiling_ms(flush_timeout_ms,
- * bytes). Returns 0 with the final record in record, MSC_EXIT_NETWORK when
- * the receiver went quiet or the stream failed, and MSC_EXIT_DESTINATION when
- * the receiver stayed alive but the destination never confirmed the data. */
+ * bytes). A wait longer than one stall timeout (or 30 s) says so once, so a
+ * long flush does not look like a hang. Returns 0 with the final record in
+ * record, MSC_EXIT_NETWORK when the receiver went quiet or the stream failed,
+ * and MSC_EXIT_DESTINATION when the receiver stayed alive but the destination
+ * never confirmed the data. checkpointed adds that interrupting keeps the
+ * checkpoint. */
 int msc_await_final_record(int socketfd, void *record, size_t size,
                            int (*is_beat)(const void *record),
                            uint64_t stall_timeout_ms, uint64_t flush_timeout_ms,
-                           uint64_t bytes)
+                           uint64_t bytes, int checkpointed)
 {
    uint64_t ceiling = msc_finish_ceiling_ms(flush_timeout_ms, bytes);
    uint64_t start = netutil_now_ms(), heard = start;
+   uint64_t notice = stall_timeout_ms != 0 ? stall_timeout_ms : 30000U;
+   int noticed = 0;
    char text[32];
 
    for (;;)
@@ -163,8 +171,24 @@ int msc_await_final_record(int socketfd, void *record, size_t size,
       int64_t wait = -1;
       struct pollfd p;
       int r;
+      if (!noticed && now >= start + notice)
+      {
+         if (ceiling != 0)
+            describe_ms(text, sizeof(text), ceiling);
+         fprintf(stderr, "MSC all data delivered; waiting for the destination to confirm "
+                         "it is durable (limit %s; --flush-timeout changes it%s)\n",
+                 ceiling != 0 ? text : "none",
+                 checkpointed ? "; Ctrl-C keeps the checkpoint for --resume" : "");
+         noticed = 1;
+      }
+      if (!noticed)
+         wait = (int64_t)(start + notice > now ? start + notice - now : 0);
       if (stall_timeout_ms != 0)
-         wait = (int64_t)(heard + stall_timeout_ms > now ? heard + stall_timeout_ms - now : 0);
+      {
+         int64_t quiet = (int64_t)(heard + stall_timeout_ms > now ? heard + stall_timeout_ms - now : 0);
+         if (wait < 0 || quiet < wait)
+            wait = quiet;
+      }
       if (ceiling != 0)
       {
          int64_t left = (int64_t)(start + ceiling > now ? start + ceiling - now : 0);
@@ -192,7 +216,7 @@ int msc_await_final_record(int socketfd, void *record, size_t size,
          {
             describe_ms(text, sizeof(text), ceiling);
             fprintf(stderr, "MSC delivered all data, but the destination did not confirm "
-                            "it was durable within %s (--flush-timeout, or 1 s per MiB "
+                            "it was durable within %s (--flush-timeout, or 1 s per 4 MiB "
                             "transferred if longer)\n", text);
             return MSC_EXIT_DESTINATION;
          }

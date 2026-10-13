@@ -425,7 +425,7 @@ extern uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes)
 extern int msc_await_final_record(int socketfd, void *record, size_t size,
                                   int (*is_beat)(const void *record),
                                   uint64_t stall_timeout_ms, uint64_t flush_timeout_ms,
-                                  uint64_t bytes);
+                                  uint64_t bytes, int checkpointed);
 extern const char *msc_ssh_program(void);
 
 /* SSH connect/keepalive budgets, scaled by the declared path class (see
