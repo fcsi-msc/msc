@@ -2,6 +2,14 @@
 
 Notable user-facing changes are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- A transfer with progress reporting enabled (`--progress=always`, or
+  `--progress=auto` on a terminal) no longer waits up to one progress interval
+  after it finishes before exiting.
+
 ## 1.1.0 - 2026-10-12
 
 ### Added
