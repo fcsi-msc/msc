@@ -7,6 +7,8 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/vfs.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -79,12 +81,34 @@ struct receiver_state
    int signal_number;
    volatile uint64_t write_ns;
    uint64_t flush_ns;
+   /* A fresh regular single-file destination is received straight into
+    * shared mappings of the file, so the workers do not take turns on the
+    * inode's write lock as they do with pwrite. Region i maps the file from
+    * i * region_bytes for region_span bytes; the span runs one segment past
+    * the region, so a segment always lies inside the region holding its first
+    * byte. map_lock guards the regions and mapped_length. */
+   int mapped;
+   pthread_mutex_t map_lock;
+   char **regions;
+   size_t region_count;
+   uint64_t region_bytes;
+   size_t region_span;
+   uint64_t mapped_length;     /* file length set so far */
 };
+
+#define MSC_DEST_REGION_MB 1024   /* mapping region; MSC_TEST_TCP_MAP_REGION_MB shrinks it */
 
 static uint64_t receiver_now_ns(void)
 {
    struct timespec ts;
    clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t receiver_thread_cpu_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
 
@@ -214,6 +238,195 @@ static int persist_receiver_checkpoint(struct receiver_state *state)
    return 0;
 }
 
+static void report_destination_failure(struct receiver_state *state,
+                                       uint64_t offset, int error)
+{
+   fprintf(stderr, "MSC could not write the destination at byte %llu: %s\n",
+           (unsigned long long)offset,
+           error == EFAULT ? "the kernel could not allocate its pages"
+                           : strerror(error));
+   set_receiver_error(state);
+}
+
+/* Local filesystems where receiving into a mapping has been measured faster
+ * than pwrite. Network filesystems keep pwrite: their mapped writeback can
+ * be far slower (on Lustre it cannot issue large RPCs; see receiver_run_flows
+ * in udp_session.c), and NFS and CephFS have not been measured. */
+static int destination_maps_well(int fd)
+{
+   struct statfs fs;
+   if (fstatfs(fd, &fs) != 0)
+      return 0;
+   switch ((unsigned long)fs.f_type)
+   {
+   case 0x01021994UL:   /* tmpfs */
+   case 0x0000EF53UL:   /* ext2, ext3, ext4 */
+   case 0x58465342UL:   /* XFS */
+   case 0x9123683EUL:   /* Btrfs */
+      return 1;
+   default:
+      return 0;
+   }
+}
+
+/* Use mappings only for a destination this transfer created empty and writes
+ * from its first byte, on a filesystem where they help. MSC_TCP_NO_MMAP=1
+ * keeps pwrite everywhere. */
+static void destination_map_setup(struct receiver_state *state, int fresh)
+{
+   struct stat st;
+   const char *off = getenv("MSC_TCP_NO_MMAP");
+   const char *test = getenv("MSC_TEST_TCP_MAP_REGION_MB");
+   long page = sysconf(_SC_PAGESIZE);
+   void *first;
+
+   if (!fresh || state->destination_base != 0 || (off != NULL && atoi(off) != 0) ||
+       fstat(state->outputfd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != 0 ||
+       !destination_maps_well(state->outputfd))
+      return;
+   if (page <= 0)
+      page = 4096;
+   state->region_bytes = (uint64_t)MSC_DEST_REGION_MB << 20;
+   if (test != NULL && atoll(test) > 0)
+      state->region_bytes = (uint64_t)atoll(test) << 20;
+   state->region_span = (size_t)state->region_bytes +
+      (state->segment_size + (size_t)page - 1) / (size_t)page * (size_t)page;
+   /* Mapping beyond the end of the file is allowed; each segment extends the
+    * file before anything touches its pages. A filesystem that cannot map
+    * files at all keeps pwrite for the whole transfer. */
+   first = mmap(NULL, state->region_span, PROT_READ | PROT_WRITE, MAP_SHARED,
+                state->outputfd, 0);
+   if (first == MAP_FAILED)
+      return;
+   state->regions = checkmalloc(sizeof(*state->regions), "destination regions");
+   state->regions[0] = first;
+   state->region_count = 1;
+   state->mapped_length = 0;
+   pthread_mutex_init(&state->map_lock, NULL);
+   state->mapped = 1;
+}
+
+static void destination_map_teardown(struct receiver_state *state)
+{
+   size_t i;
+   if (!state->mapped)
+      return;
+   for (i = 0; i < state->region_count; i++)
+      if (state->regions[i] != NULL)
+         munmap(state->regions[i], state->region_span);
+   free(state->regions);
+   state->regions = NULL;
+   pthread_mutex_destroy(&state->map_lock);
+   state->mapped = 0;
+}
+
+/* Where the segment at offset lands in the mapped destination, after
+ * extending the file over it. The file is extended exactly to the segments
+ * being received, never ahead of them. NULL with errno 0 means that no mapping
+ * is available for this segment, and the caller writes it with pwrite; NULL
+ * with errno set is a destination failure. */
+static char *destination_map_segment(struct receiver_state *state,
+                                     uint64_t offset, uint64_t length)
+{
+   uint64_t end = offset + length;
+   uint64_t index = offset / state->region_bytes;
+   char *where = NULL;
+   int failure = 0;
+
+   pthread_mutex_lock(&state->map_lock);
+   if (end > state->mapped_length)
+   {
+      if (ftruncate(state->outputfd, (off_t)end) != 0)
+         failure = errno;
+      else
+         state->mapped_length = end;
+   }
+   if (failure == 0 && index >= state->region_count &&
+       index < SIZE_MAX / sizeof(*state->regions))
+   {
+      size_t count = (size_t)index + 1;
+      char **grown = realloc(state->regions, count * sizeof(*grown));
+      if (grown != NULL)
+      {
+         memset(grown + state->region_count, 0,
+                (count - state->region_count) * sizeof(*grown));
+         state->regions = grown;
+         state->region_count = count;
+      }
+   }
+   if (failure == 0 && index < state->region_count)
+   {
+      if (state->regions[index] == NULL)
+      {
+         void *m = mmap(NULL, state->region_span, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, state->outputfd,
+                        (off_t)(index * state->region_bytes));
+         if (m != MAP_FAILED)
+            state->regions[index] = m;
+      }
+      if (state->regions[index] != NULL)
+         where = state->regions[index] + (offset - index * state->region_bytes);
+   }
+   pthread_mutex_unlock(&state->map_lock);
+   errno = failure;
+   return where;
+}
+
+/* recv reports a destination page it could not allocate only as EFAULT.
+ * Reserving the same bytes recovers the filesystem's reason, such as ENOSPC
+ * or EDQUOT. */
+static int destination_fault_cause(int fd, uint64_t offset, uint64_t length)
+{
+   if (fallocate(fd, 0, (off_t)offset, (off_t)length) != 0 &&
+       errno != EOPNOTSUPP && errno != ENOSYS)
+      return errno;
+   return EFAULT;
+}
+
+/* Receive a segment straight into the mapped destination. Where a store into
+ * the mapping would raise SIGBUS on a full filesystem, the kernel's copy fails
+ * the receive with EFAULT instead, so no space needs reserving up front. The
+ * thread CPU time spent here, copying into and allocating destination pages
+ * but not waiting for the network, stands in for the pwrite time that the
+ * other path reports as destination write time. */
+static int receive_into_destination(struct receiver_state *state, int socketfd,
+                                    char *where, uint64_t offset, uint64_t length)
+{
+   uint64_t total = 0;
+   uint64_t started = receiver_thread_cpu_ns();
+   int rc = 0;
+
+   while (total < length)
+   {
+      ssize_t got = recv(socketfd, where + total, (size_t)(length - total), 0);
+      if (got < 0 && errno == EINTR)
+         continue;
+      if (got < 0 && errno == EFAULT)
+      {
+         report_destination_failure(state, offset + total,
+                                    destination_fault_cause(state->outputfd,
+                                                            offset + total,
+                                                            length - total));
+         rc = -1;
+         break;
+      }
+      if (got <= 0)
+      {
+         if (got < 0)
+            fprintf(stderr, "MSC socket receive failed: %s\n", strerror(errno));
+         else
+            fprintf(stderr, "MSC socket closed during record\n");
+         set_receiver_error(state);
+         rc = -1;
+         break;
+      }
+      total += (uint64_t)got;
+   }
+   __atomic_fetch_add(&state->write_ns, receiver_thread_cpu_ns() - started,
+                      __ATOMIC_RELAXED);
+   return rc;
+}
+
 static void *segment_receiver_thread(void *arg)
 {
    struct receiver_worker *worker = arg;
@@ -247,17 +460,48 @@ static void *segment_receiver_thread(void *arg)
          set_receiver_error(state);
          break;
       }
-      if (recvall_exact(worker->socketfd, buffer, length) != 0)
+      if (offset > (uint64_t)INT64_MAX - (uint64_t)state->destination_base - length)
       {
+         fprintf(stderr, "MSC received a segment beyond the largest file offset\n");
          set_receiver_error(state);
          break;
       }
       {
-         uint64_t started = receiver_now_ns();
-         if (pwriteall(state->outputfd, buffer, length,
-                       state->destination_base + offset) != 0)
-         { set_receiver_error(state); break; }
-         __atomic_fetch_add(&state->write_ns, receiver_now_ns() - started, __ATOMIC_RELAXED);
+         char *where = NULL;
+         if (state->mapped)
+         {
+            where = destination_map_segment(state, offset, length);
+            if (where == NULL && errno != 0)
+            {
+               report_destination_failure(state, offset, errno);
+               break;
+            }
+         }
+         if (where != NULL)
+         {
+            if (receive_into_destination(state, worker->socketfd, where,
+                                         offset, length) != 0)
+               break;
+         }
+         else
+         {
+            uint64_t started;
+            if (recvall_exact(worker->socketfd, buffer, length) != 0)
+            {
+               set_receiver_error(state);
+               break;
+            }
+            started = receiver_now_ns();
+            if (pwriteall(state->outputfd, buffer, length,
+                          state->destination_base + offset) != 0)
+            {
+               report_destination_failure(state, state->destination_base + offset,
+                                          errno);
+               break;
+            }
+            __atomic_fetch_add(&state->write_ns, receiver_now_ns() - started,
+                               __ATOMIC_RELAXED);
+         }
       }
       pthread_mutex_lock(&state->error_lock);
       state->bytes_received += length;
@@ -293,8 +537,11 @@ static void *segment_receiver_thread(void *arg)
    return NULL;
 }
 
+/* fresh: this transfer created or truncated the destination and owns all of
+ * it, so the file may be mapped and extended segment by segment. */
 void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
-                          int segment_size, off_t destination_base)
+                          int segment_size, off_t destination_base, int fresh,
+                          int stats)
 {
    struct receiver_state state;
    struct receiver_worker *workers;
@@ -309,6 +556,10 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    state.sockets = newsockfds;
    state.numstreams = numstreams;
    pthread_mutex_init(&state.error_lock, NULL);
+   destination_map_setup(&state, fresh);
+   if (stats)
+      fprintf(stderr, "MSC TCP receiver write-path: %s\n",
+              state.mapped ? "mmap" : "pwrite");
    workers = checkmalloc(sizeof(*workers) * numstreams, "receiver workers");
    threads = checkmalloc(sizeof(*threads) * numstreams, "receiver threads");
 
@@ -326,6 +577,7 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    }
    for (lc = 0; lc < created; lc++)
       pthread_join(threads[lc], NULL);
+   destination_map_teardown(&state);
    /* A success ACK means every worker finished and the bytes reached the
     * backing file, not merely the stdio/kernel page cache. */
    if (!state.error)
@@ -860,6 +1112,13 @@ void findlastgood(struct argdata *AD)
    }
 }
 
+/* A normal single-set file transfer truncates its destination when it opens
+ * it, and then owns all of it. */
+static int destination_truncated(const struct argdata *AD)
+{
+   return AD->parentsets <= 1 && AD->dst_offset == 0 && !AD->obeylastgood;
+}
+
 /* prepare connection.  See if file exists, and size.  get port number
  * send to caller, and open sockets.
  */
@@ -964,7 +1223,8 @@ void connect_and_process(struct argdata *AD)
    {
       off_t destination_base = AD->dst_offset != 0 ? AD->dst_offset : AD->lastgood;
       readsocket_segmented(AD->numstreams, newsockfds, AD->outfileid,
-                           AD->packetsize, destination_base);
+                           AD->packetsize, destination_base,
+                           destination_truncated(AD), AD->stats);
    }
    else
       readsocket(AD->numstreams, newsockfds, AD->outfileid, AD->packetsize);
@@ -1061,8 +1321,12 @@ void remote_process(struct argdata *AD)
        * Only a normal single-set transfer should truncate here; multi-set
        * workers must preserve sections written by their peers.
        */
-      if (AD->parentsets <= 1 && AD->dst_offset == 0 && !AD->obeylastgood)
-         openflags |= O_TRUNC;
+      if (destination_truncated(AD))
+      {
+         /* Read access as well lets the TCP receiver map the destination
+          * (readsocket_segmented); a shared writable mapping needs both. */
+         openflags = (openflags & ~O_ACCMODE) | O_RDWR | O_TRUNC;
+      }
       /* --dest-stripe-count on the TCP path. A Lustre layout is fixed at
        * creation, so it can only be honored where this open would create the
        * file from scratch: a fresh single-set transfer. Multi-set workers share
@@ -1101,7 +1365,13 @@ void remote_process(struct argdata *AD)
          }
       }
       else
+      {
          fd = open(AD->destfile, openflags, 0666);
+         /* A destination the user may write but not read keeps pwrite. */
+         if (fd < 0 && errno == EACCES && !AD->udp &&
+             (openflags & O_ACCMODE) == O_RDWR)
+            fd = open(AD->destfile, (openflags & ~O_ACCMODE) | O_WRONLY, 0666);
+      }
       AD->outfileid = fdopen(fd, "w");
       DEBUG0("remote_process: after open\n");
       if (AD->outfileid == NULL)

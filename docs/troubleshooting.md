@@ -99,6 +99,7 @@ Keep log consumers draining: a blocked sink can slow transfer workers.
 | Offload-dependent behavior | Try `--no-gso --no-gro`. |
 | High socket or demux drops | Compare lower `-n`, and separately change `--udp-data-ports`; inspect granted buffers. |
 | Small receive window or high write stalls | Compare destination storage and write path; inspect flush time. |
+| TCP single-file transfer slower than expected | Check the receiver's `--stats` line for `write-path: mmap`; compare against `MSC_TCP_NO_MMAP=1` and against `-R` on several files. |
 | High spurious/RTO counts | Confirm profile, RTO floor, reordering settings, and controller. |
 | Long final tail | Separate data completion, file syncing, checksum work, and metadata work. |
 | Retry loop appears unbounded | Checkpointed transfers reconnect by default; use `--reconnect-interval 0` for bounded retries only. |

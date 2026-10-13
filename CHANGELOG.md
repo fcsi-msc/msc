@@ -4,11 +4,24 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
+### Changed
+
+- TCP single-file transfers that create or truncate a regular destination on a
+  local filesystem (tmpfs, ext2/3/4, XFS or Btrfs) receive data straight into a
+  shared mapping of the file. Streams no longer take turns on the file's write
+  lock, which capped multi-stream TCP transfers into one file well below the
+  network rate, and each segment is copied once instead of twice. Network
+  filesystems such as NFS, CephFS and Lustre, other filesystems, destination
+  offsets, checkpointed transfers and multiple-machine slices keep `pwrite`,
+  and `MSC_TCP_NO_MMAP=1` keeps it everywhere.
+
 ### Fixed
 
 - A transfer with progress reporting enabled (`--progress=always`, or
   `--progress=auto` on a terminal) no longer waits up to one progress interval
   after it finishes before exiting.
+- A TCP receiver that cannot write its destination reports the byte offset and
+  the reason, such as ENOSPC, instead of only that the receiver failed.
 
 ## 1.1.0 - 2026-10-12
 
