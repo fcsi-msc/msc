@@ -80,7 +80,8 @@ def main():
         storage = str(ROOT / "build/storage_fault_shim.so")
         dest = work / "phases"
         out = run([ROOT / "build/udp_test", source, dest, "2"],
-                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "1000",
+                  {"LD_PRELOAD": storage, "MSC_UDP_RESERVE_UPFRONT": "1",
+                   "MSC_TEST_FALLOCATE_DELAY_MS": "1000",
                    "MSC_UDP_STATS": "1"})
         assert dest.read_bytes() == source.read_bytes()
         names = ("start", "open", "probe", "setup", "prepare", "data", "finish", "close")
@@ -111,7 +112,8 @@ def main():
         source4 = work / "source4"
         source4.write_bytes(os.urandom(4 * 1024 * 1024))
         out = run([ROOT / "build/udp_test", source4, dest, "2"],
-                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "600",
+                  {"LD_PRELOAD": storage, "MSC_UDP_RESERVE_UPFRONT": "1",
+                   "MSC_TEST_FALLOCATE_DELAY_MS": "600",
                    "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000",
                    "MSC_UDP_STATS": "1"})
         assert dest.read_bytes() == source4.read_bytes()
@@ -128,7 +130,8 @@ def main():
         # harness runs the receiver in-process, so the run itself lasts until
         # the hung step returns; the CLI case below checks how fast msc exits.)
         out = run([ROOT / "build/udp_test", source, work / "stuck-prepare", "2"],
-                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "4000",
+                  {"LD_PRELOAD": storage, "MSC_UDP_RESERVE_UPFRONT": "1",
+                   "MSC_TEST_FALLOCATE_DELAY_MS": "4000",
                    "MSC_TEST_STALL_TIMEOUT_MS": "1000"}, expected=6)
         assert "no progress preparing the destination for 1.0 seconds" in out, out
         # Once the sender has given up, the receiver abandons the preparation at
@@ -136,7 +139,8 @@ def main():
         # under a 1 s timeout end after the first.
         started = time.monotonic()
         out = run([ROOT / "build/udp_test", source4, work / "abandoned-prepare", "2"],
-                  {"LD_PRELOAD": storage, "MSC_TEST_FALLOCATE_DELAY_MS": "1500",
+                  {"LD_PRELOAD": storage, "MSC_UDP_RESERVE_UPFRONT": "1",
+                   "MSC_TEST_FALLOCATE_DELAY_MS": "1500",
                    "MSC_TEST_RESERVE_CHUNK_MB": "1", "MSC_TEST_STALL_TIMEOUT_MS": "1000",
                    "MSC_UDP_STATS": "1"}, expected=6)
         assert time.monotonic() - started < 4, out
@@ -253,7 +257,8 @@ def main():
                        "-l", "localhost", "-r", "127.0.0.1",
                        "-B", ROOT / "msc", "-i", source, "-o", dest],
                       {"MSC_SSH": str(fake), "LD_PRELOAD": fault,
-                       "MSC_TEST_FALLOCATE_ERROR": failure},
+                       "MSC_TEST_FALLOCATE_ERROR": failure,
+                       "MSC_UDP_RESERVE_UPFRONT": "1"},
                       expected=4 if failure == "nospc" else 0)
             assert f"injected allocation {failure}" in out
             if failure == "nospc":
@@ -262,6 +267,70 @@ def main():
                 assert "write-path: mmap 0 pwritev 1" in out
                 assert dest.read_bytes() == source.read_bytes()
         print("ok: mmap reserves space; ENOSPC fails cleanly; unsupported allocation uses pwritev", flush=True)
+
+        # On tmpfs a mapped single file is reserved alongside the data: a helper
+        # per flow prefaults that flow's part of the mapping, and flush_run
+        # prefaults any run a helper has not reached, instead of one serial
+        # fallocate before any data moves.
+        shm = Path("/dev/shm")
+        shm_type = subprocess.run(["stat", "-f", "-c", "%t", str(shm)],
+                                  capture_output=True, text=True).stdout.strip()
+        if shm_type == "1021994" and os.access(shm, os.W_OK):
+            source8 = work / "source8"
+            source8.write_bytes(os.urandom(8 * 1024 * 1024 + 123))
+            with tempfile.TemporaryDirectory(prefix="msc-regression-", dir=shm) as d:
+                for label, extra, want in (
+                        ("helpers", {}, r"reserve: 8 flows prefaulting, \d+ catch-up"),
+                        ("catch-up", {"MSC_TEST_NO_PREFAULT_HELPERS": "1"},
+                         r"reserve: 8 flows prefaulting, [1-9]\d* catch-up"),
+                        ("upfront", {"MSC_UDP_RESERVE_UPFRONT": "1"}, None)):
+                    dest = Path(d) / label
+                    out = run([ROOT / "build/udp_test", source8, dest, "8"],
+                              dict(extra, MSC_UDP_STATS="1"))
+                    assert dest.read_bytes() == source8.read_bytes(), (label, out)
+                    assert ("reserved alongside data" in out) == (want is not None), (label, out)
+                    assert want is None or re.search(want, out), (label, out)
+            print("ok: a tmpfs destination is reserved alongside the data, by helpers "
+                  "or by catch-up prefaults; MSC_UDP_RESERVE_UPFRONT reserves first", flush=True)
+        else:
+            print("skip: /dev/shm is not a writable tmpfs; reservation alongside data not run",
+                  flush=True)
+
+        # A full tmpfs: the up-front room check fails before any data moves, and
+        # with that check skipped, prefaulting fails partway. Either way the
+        # transfer exits 4 naming ENOSPC, nothing is published, and the receiver
+        # does not die of SIGBUS.
+        if subprocess.run(["unshare", "-Urm", "true"], capture_output=True).returncode == 0:
+            full = work / "full"
+            full.mkdir()
+            source2 = work / "source2"
+            source2.write_bytes(os.urandom(2 * 1024 * 1024))
+            script = ('mount -t tmpfs -o size=1m msc-full "$1" || exit 99; dir=$1; shift; '
+                      '"$@"; rc=$?; [ -e "$dir/out" ] && echo PUBLISHED; exit $rc')
+            for label, extra, who in (("room check", {}, "receiver"),
+                                      ("prefault", {"MSC_TEST_IGNORE_ROOM": "1"},
+                                       r"receiver flow \d+")):
+                result = subprocess.run(
+                    ["unshare", "-Urm", "sh", "-c", script, "sh", str(full),
+                     str(ROOT / "msc"), "-n2", "--stats", "--stall-timeout", "2s",
+                     "-l", "localhost", "-r", "127.0.0.1", "-B", str(ROOT / "msc"),
+                     "-i", str(source2), "-o", str(full / "out")],
+                    cwd=ROOT, env=dict(BASE, MSC_SSH=str(fake), **extra),
+                    capture_output=True, text=True, timeout=60)
+                out = result.stdout + result.stderr
+                if result.returncode == 99:
+                    print("skip: tmpfs cannot be mounted in a user namespace here", flush=True)
+                    break
+                assert result.returncode == 4, (label, result.returncode, out)
+                assert "PUBLISHED" not in out, (label, out)
+                assert re.search("MSC UDP " + who + ": cannot reserve destination storage: "
+                                 "No space left on device", out), (label, out)
+            else:
+                print("ok: a full tmpfs fails with ENOSPC before data (room check) "
+                      "and partway (prefault), publishing nothing", flush=True)
+        else:
+            print("skip: unprivileged user namespaces are unavailable; full tmpfs not run",
+                  flush=True)
 
         # A receiver stuck preparing the destination must not hang msc: it
         # gives up after the stall timeout instead of waiting out the 10 s hang.
@@ -277,6 +346,7 @@ def main():
                  "-i", str(source), "-o", str(work / "stuck-cli")],
                 cwd=ROOT, stdout=sink, stderr=subprocess.STDOUT, start_new_session=True,
                 env=dict(BASE, MSC_SSH=str(fake), LD_PRELOAD=storage,
+                         MSC_UDP_RESERVE_UPFRONT="1",
                          MSC_TEST_FALLOCATE_DELAY_MS="10000"))
             try:
                 code = process.wait(timeout=30)

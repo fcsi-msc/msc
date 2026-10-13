@@ -14,6 +14,14 @@ Notable user-facing changes are recorded here.
   filesystems such as NFS, CephFS and Lustre, other filesystems, destination
   offsets, checkpointed transfers and multiple-machine slices keep `pwrite`,
   and `MSC_TCP_NO_MMAP=1` keeps it everywhere.
+- A UDP single-file transfer into tmpfs reserves the destination alongside the
+  data instead of before it. Reserving tmpfs space allocates and zeroes every
+  page, and doing it in one pass first could take as long as the data phase
+  itself, roughly halving end-to-end throughput for large files. Each flow now
+  prefaults its own part of the destination as the data arrives. A full
+  filesystem still fails the transfer with ENOSPC, before any data moves when
+  free space is already short. `MSC_UDP_RESERVE_UPFRONT=1` keeps the up-front
+  reservation.
 
 ### Fixed
 

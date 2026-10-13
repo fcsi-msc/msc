@@ -104,18 +104,31 @@ Offsets, supplied file descriptors, and mapping eligibility can select the
 vectored path. `MSC_UDP_NO_MMAP=1` forces it; `MSC_UDP_FORCE_MMAP=1` requests
 mapping on eligible paths even on Lustre.
 
+On tmpfs, `fallocate` allocates and zeroes every page of the file in one serial
+pass, which can take as long as the data phase itself. A mapped single-file
+UDP destination there is instead reserved alongside the data: a helper thread
+per flow prefaults that flow's part of the mapping ahead of its data, and a
+flow prefaults any data its helper has not reached yet. Prefaulting reports a
+page that cannot be allocated as an error, so a full filesystem still fails the
+transfer with ENOSPC rather than SIGBUS, and a check of free space before the
+data starts catches the common case early. Lustre-affine partitions and kernels
+older than Linux 5.14 reserve up front; `MSC_UDP_RESERVE_UPFRONT=1` restores
+the up-front reservation everywhere. With `--stats`, the write-path line ends in
+`reserved alongside data` when it applies.
+
 A TCP single-file transfer that creates or truncates a regular destination on a
 local filesystem (tmpfs, ext2/3/4, XFS or Btrfs) receives each segment straight
-into a shared mapping of the file. Streams then copy into the destination in parallel, instead of taking
-turns on the file's write lock as `pwrite` does on common Linux filesystems,
-and each segment is copied once instead of twice. The file grows to cover each
-segment as it arrives, so no space is reserved up front. A page the kernel
-cannot allocate fails that receive with an error that names the filesystem's
-reason, such as ENOSPC, and does not crash the receiver. Network filesystems keep
-`pwrite`: mapped writeback on Lustre cannot issue large RPCs and is several
-times slower, and NFS and CephFS have not been measured. Other filesystems,
-destination offsets, checkpointed transfers and multiple-machine slices also
-keep `pwrite`; `MSC_TCP_NO_MMAP=1` keeps it everywhere. With `--stats`, the receiver prints
+into a shared mapping of the file. Streams then copy into the destination in
+parallel, instead of taking turns on the file's write lock as `pwrite` does on
+common Linux filesystems, and each segment is copied once instead of twice. The
+file grows to cover each segment as it arrives, so no space is reserved up
+front. A page the kernel cannot allocate fails that receive with an error that
+names the filesystem's reason, such as ENOSPC, and does not crash the receiver.
+Network filesystems keep `pwrite`: mapped writeback on Lustre cannot issue
+large RPCs and is several times slower, and NFS and CephFS have not been
+measured. Other filesystems, destination offsets, checkpointed transfers and
+multiple-machine slices also keep `pwrite`; `MSC_TCP_NO_MMAP=1` keeps it
+everywhere. With `--stats`, the receiver prints
 `MSC TCP receiver write-path: mmap` or `pwrite`. The `--progress` summary's
 destination write time on the mapped path is the CPU time spent receiving into
 the destination, excluding time spent waiting for the network.
