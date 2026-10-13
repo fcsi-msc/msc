@@ -39,6 +39,11 @@ these records while it waits for the acknowledgement. A sender marks its
 segment headers to say it accepts them; a receiver sends none to a sender that
 does not, so mixed versions keep the earlier behavior.
 
+A recursive TCP receiver likewise syncs every received file (in parallel,
+writing large files back in chunks), every directory and the root before its
+`ACK` record, and sends `FLUSHING` records while that sync advances to a sender
+whose `WORKER_DONE` records carry the flag that accepts them.
+
 The stdin/remote-command path uses streaming behavior suited to pipes. It does
 not have the same random-access and checkpoint guarantees as a regular file.
 

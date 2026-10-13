@@ -134,8 +134,9 @@ destination write time on the mapped path is the CPU time spent receiving into
 the destination, excluding time spent waiting for the network.
 
 Recursive completion can sync multiple files concurrently with
-`MSC_UDP_FSYNC_THREADS` (default 64). This setting is independent of data-flow
-count. A shorter data phase can still have a long filesystem flush tail.
+`MSC_UDP_FSYNC_THREADS` (default 64), for UDP and TCP receivers alike. This
+setting is independent of data-flow count. A shorter data phase can still have
+a long filesystem flush tail.
 
 ## Lustre layout
 

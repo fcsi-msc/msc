@@ -13,7 +13,7 @@ the receiver's durability barrier.
 | UDP single file with checkpoint | Retain `.msc-part` partial data and durable checkpoint; publish the completed file. | SHA-256 verification of reused ranges on resume; optional checksums of newly transferred chunks. |
 | TCP segmented single file without checkpoint | Write the destination directly. | Kernel stream reliability and application segment/byte accounting; interruption can leave a partial destination. |
 | TCP single file with checkpoint | Retain partial file and checkpoint; publish on completion. | Validate checkpoint identity and SHA-256 of ranges before reuse. |
-| Recursive TCP or UDP without checkpoint | Materialize and update the tree in place. | Manifest/data accounting; no atomic tree replacement or automatic per-file end-to-end checksum pass. |
+| Recursive TCP or UDP without checkpoint | Materialize and update the tree in place; sync every file, directory and the root before reporting success. | Manifest/data accounting; no atomic tree replacement or automatic per-file end-to-end checksum pass. |
 | Recursive TCP or UDP with checkpoint | Update the tree in place and record durable logical ranges. | Verify reused ranges with SHA-256; retry missing data and final metadata. |
 | Multiple machine pairs writing one file | Workers update assigned portions of a shared destination. | Do not apply the one-pair temporary-file publication guarantee. CLI checkpoint/resume requires one pair. |
 
@@ -122,10 +122,11 @@ session to choose a different payload size or path MTU.
 
 SIGINT and SIGTERM retain exit statuses 130 and 143. The default no-progress
 timeout is 30 s; `--stall-timeout 0` disables it. It is a liveness bound, not a
-limit on total transfer duration. A TCP single-file receiver flushes the
-destination before acknowledging it; while that flush keeps advancing, it tells
-the sender so, and a slow destination does not fail a finished transfer. A
-flush that stops advancing for the stall timeout still does.
+limit on total transfer duration. A TCP receiver flushes the destination file,
+or the whole received tree, before acknowledging it; while that flush keeps
+advancing, it tells the sender so, and a slow destination does not fail a
+finished transfer. A flush that stops advancing for the stall timeout still
+does.
 
 Only network/transport exit 6 is retried. `--retries` controls bounded retries
 with backoff. Checkpointed transfers also enable reconnect probing by default
