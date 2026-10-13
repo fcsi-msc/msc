@@ -109,12 +109,13 @@ static uint64_t g_stall_timeout_ns =
  *                   a many-file tree is I/O-wait bound and journal commits
  *                   coalesce across concurrent fsyncs; the serial per-file fsync
  *                   barrier otherwise dominates many-small-files transfers.
- *   Dest write path (receiver, base==0 whole-file writers): the default now auto-
- *   picks by filesystem -- mmap on non-Lustre (shm/local: lock-free memcpy wins),
- *   pwritev on Lustre (mmap writeback there is ~7x slower: measured 1.6 vs 11
- *   Gbit/s single-node). Overrides:
+ *   Dest write path (receiver, base==0 whole-file writers): the default picks by
+ *   filesystem -- mmap on local filesystems (tmpfs, ext2/3/4, XFS, Btrfs: lock-
+ *   free memcpy wins), the pwritev coalescer elsewhere. Mapped writeback on a
+ *   network filesystem goes page by page over the network: ~7x slower on Lustre
+ *   (1.6 vs 11 Gbit/s single-node) and over 50x slower on NFS. Overrides:
  *   MSC_UDP_NO_MMAP=1    force the pwritev coalescer everywhere (never mmap).
- *   MSC_UDP_FORCE_MMAP=1 force mmap even on Lustre (reproduces the old default; for A/B).
+ *   MSC_UDP_FORCE_MMAP=1 force mmap on any filesystem, including Lustre and NFS (for A/B).
  *   A mapped single file on tmpfs is not reserved up front: there fallocate
  *   allocates and zeroes every page in one serial pass before any data moves.
  *   Instead a helper thread per flow prefaults that flow's part of the mapping
@@ -173,10 +174,9 @@ static uint64_t g_retransmit_budget = 512ULL * 1024 * 1024;
 static int g_fsync_threads = 64; /* parallel fsync workers for the tree tail flush */
 static int g_no_mmap = 0;      /* MSC_UDP_NO_MMAP=1: never mmap the dest; use the pwritev
                                 * coalescer even for base==0 (whole-file) writers. */
-static int g_force_mmap = 0;   /* MSC_UDP_FORCE_MMAP=1: mmap even on Lustre (to reproduce
-                                * the old default for the A/B). Default now auto-picks:
-                                * mmap on non-Lustre, pwritev on Lustre (measured 7x
-                                * faster there: 1.6 -> 11 Gbit/s single-node). */
+static int g_force_mmap = 0;   /* MSC_UDP_FORCE_MMAP=1: mmap on any filesystem (for the
+                                * A/B). Default auto-picks: mmap on local filesystems,
+                                * pwritev elsewhere (msc_fd_maps_well). */
 static int g_reserve_upfront = 0; /* MSC_UDP_RESERVE_UPFRONT=1: reserve a tmpfs destination
                                    * before data too, instead of alongside it */
 static int g_recv_batch = MSC_UDP_RECV_BATCH; /* MSC_UDP_RECV_BATCH=N: recvmmsg slots per call.
@@ -6261,16 +6261,17 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
    /* mmap each destination so flows memcpy in parallel instead of serializing on
     * the per-inode pwritev lock (measured ~2.25x on a single big file). Only when
     * base == 0 (a byte-range write into a shared file keeps the pwrite path) AND
-    * the dest is NOT Lustre: mmap writeback on Lustre can't issue large RPCs and is
-    * ~7x slower than the coalesced pwritev path (1.6 vs 11 Gbit/s single-node),
-    * so Lustre dests take pwritev. MSC_UDP_FORCE_MMAP overrides for the A/B.
+    * the dest is on a local filesystem: mapped writeback on a network filesystem
+    * goes page by page over the network (on Lustre it can't issue large RPCs and is
+    * ~7x slower than the coalesced pwritev path, 1.6 vs 11 Gbit/s single-node), so
+    * those dests take pwritev. MSC_UDP_FORCE_MMAP overrides for the A/B.
     * The file is already sized (ftruncate) by the caller, so the mapping spans it. */
    for (i = 0; i < x->nfiles; i++)
    {
       x->files[i].map = NULL;
       if (x->allow_mmap && x->files[i].size > 0 &&
           x->files[i].base == 0 && !g_no_mmap &&
-          (g_force_mmap || !msc_udp_fd_is_lustre(x->files[i].fd)))
+          (g_force_mmap || msc_fd_maps_well(x->files[i].fd)))
       {
          /* Reserve storage before mmap: ftruncate alone can leave sparse pages
           * whose first write kills the process with SIGBUS on a full device.

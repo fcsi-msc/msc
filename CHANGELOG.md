@@ -22,6 +22,12 @@ Notable user-facing changes are recorded here.
   filesystem still fails the transfer with ENOSPC, before any data moves when
   free space is already short. `MSC_UDP_RESERVE_UPFRONT=1` keeps the up-front
   reservation.
+- UDP single-file transfers map the destination only on local filesystems
+  (tmpfs, ext2/3/4, XFS or Btrfs), as TCP now does, and write with coalesced
+  `pwritev` elsewhere. Network filesystems other than Lustre were mapped
+  before, and mapped writeback goes page by page over the network: on NFS it
+  was over 50 times slower than the filesystem's single-writer rate.
+  `MSC_UDP_FORCE_MMAP=1` maps on any filesystem.
 
 ### Fixed
 

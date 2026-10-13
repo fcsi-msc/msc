@@ -224,6 +224,27 @@ int msc_udp_fd_is_lustre(int fd)
    return sfs.f_type == (__typeof__(sfs.f_type))LL_SUPER_MAGIC;
 }
 
+/* Local filesystems where writing a destination through a shared mapping has
+ * been measured faster than pwrite. Network filesystems are excluded: their
+ * mapped writeback goes page by page over the network and was measured several
+ * times slower on Lustre and over 50 times slower on NFS. */
+int msc_fd_maps_well(int fd)
+{
+   struct statfs sfs;
+   if (fd < 0 || fstatfs(fd, &sfs) != 0)
+      return 0;
+   switch ((unsigned long)sfs.f_type)
+   {
+   case 0x01021994UL:   /* tmpfs */
+   case 0x0000EF53UL:   /* ext2, ext3, ext4 */
+   case 0x58465342UL:   /* XFS */
+   case 0x9123683EUL:   /* Btrfs */
+      return 1;
+   default:
+      return 0;
+   }
+}
+
 int msc_udp_query_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_count)
 {
 #ifdef HAVE_LUSTRE
