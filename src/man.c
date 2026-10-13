@@ -123,7 +123,7 @@ static const char *MSC_MANUAL =
 "                         per 4 MiB transferred if longer;\n"
 "                         default 30m, 0 waits indefinitely. A live receiver\n"
 "                         that is still flushing keeps the transfer alive past\n"
-"                         the stall timeout."
+"                         the stall timeout.\n"
 "\n"
 "UDP PUBLICATION AND RESUME\n"
 "    A single-file UDP receive is written to .msc-udptmp.<pid> and published\n"
