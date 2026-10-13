@@ -37,7 +37,7 @@ make check
 | `dest_stripe_suite` | Destination-stripe option parsing, restrictions, and forwarding. |
 | `wanshim` | Synthetic WAN smoke, a WAN profile with throughput/retransmission gates, and MTU black-hole behavior. |
 | `shim_check` | Emulator passthrough, delay, loss, and seeded behavior; GSO/sendmmsg datagram equivalence, MTU, scatter/gather and TOS preservation. |
-| `udp_regressions` | Small MTUs, exhausted PMTUD, PMTUD probe-loss statistics, bounded ring wraparound under loss, fsync worker failures and syscall coverage, publication errors, and growing hardlink indexes. |
+| `udp_regressions` | Small MTUs, exhausted PMTUD, GRO-coalesced PMTUD probes, PMTUD probe-loss statistics, phase timings, the sender's wait for destination preparation (slow, hung and abandoned), receiver byte summaries, bounded ring wraparound under loss, fsync worker failures and syscall coverage, publication errors, and growing hardlink indexes. |
 | `valgrind`, `helgrind`, `helgrind_udp` | Memory checks, TCP worker races, and UDP telemetry/shared-socket/offload-fallback races; see [Valgrind](valgrind.md). |
 
 Avoid `make clean` in a checkout where another process is building or testing.
@@ -73,7 +73,8 @@ Always compare outputs even when an internal checksum is enabled.
 | `MSC_UDP_DROP` or `udp_test` drop argument | Integer-percent synthetic sender packet loss; disables GSO to preserve packet-level injection. |
 | `MSC_UDP_CONTROL_DROP` | Loss in the optional UDP control shim, including handshake/ACK/FIN frames. |
 | [wan_shim.c](../tests/shims/wan_shim.c) | Preload-based UDP delay, jitter, independent loss, duplication, initial ACK/FIN drops, MTU black holes, and local MTU limits. |
-| [storage_fault_shim.c](../tests/shims/storage_fault_shim.c) | Destination write failures after a byte threshold; used with the non-mapped write path. |
+| [storage_fault_shim.c](../tests/shims/storage_fault_shim.c) | Destination write failures after a byte threshold; used with the non-mapped write path. Can also delay every `fallocate` to emulate slow destination storage. |
+| [gro_coalesce_shim.c](../tests/shims/gro_coalesce_shim.c) | Delivers back-to-back PMTUD probes in one receive buffer, as UDP GRO can, to test probe-size accounting. |
 | [fsync_fault_shim.c](../tests/shims/fsync_fault_shim.c) | Worker creation failures, fsync recording, and forced file/directory sync errors. |
 | [udp_offload_shim.c](../tests/shims/udp_offload_shim.c) | Unsupported GSO/GRO fallback paths; a single GSO send failing with a chosen errno, with sent-datagram counts. |
 | [listen_count_shim.c](../tests/shims/listen_count_shim.c) | Records TCP `listen()` calls to verify the stdio port footprint. |
@@ -100,7 +101,11 @@ router queue model. Inspect trace counters to confirm impairment actually ran.
 
 Storage fault controls include `MSC_TEST_ENOSPC_AFTER_BYTES` and
 `MSC_TEST_ENOSPC_ERRNO`; tests force `MSC_UDP_NO_MMAP=1` because intercepted
-write syscalls do not see mapped-memory stores. Other `MSC_TEST_*` hooks are
+write syscalls do not see mapped-memory stores. `MSC_TEST_FALLOCATE_DELAY_MS`
+delays each destination reservation step, and `MSC_TEST_RESERVE_CHUNK_MB`
+shrinks that step so tests can model preparation that is slow but advancing.
+The GRO coalescing shim's `MSC_TEST_COALESCE_AS_ONE=1` makes the receiver
+report the summed probe size, as receivers before the fix did. Other `MSC_TEST_*` hooks are
 internal to their owning tests. They are not forwarded configuration for
 ordinary remote use.
 
