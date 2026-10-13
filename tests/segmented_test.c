@@ -11,7 +11,7 @@
 
 extern int *sockfd;
 extern void xferdata_segmented(FILE *, struct argdata *);
-extern void readsocket_segmented(int, int *, FILE *, int, off_t);
+extern void readsocket_segmented(int, int *, FILE *, int, off_t, int, int);
 
 int msc_debug = 0;
 FILE *msc_debugout;
@@ -72,10 +72,10 @@ int main(int argc, char **argv)
       FILE *output;
       for (i = 0; i < streams; i++)
          close(sender_sockets[i]);
-      output = fopen(argv[2], "w");
+      output = fopen(argv[2], "w+");   /* read access lets the receiver map it */
       if (output == NULL)
          return 1;
-      readsocket_segmented(streams, receiver_sockets, output, segment_size, 0);
+      readsocket_segmented(streams, receiver_sockets, output, segment_size, 0, 1, 0);
       fclose(output);
       return 0;
    }

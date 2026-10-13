@@ -230,7 +230,9 @@ int msc_udp_env_forwardable(const char *name, size_t length)
        * creation on the TCP path and the resume/findzero setup paths too, so it
        * deliberately carries a transport-neutral name. This list is what
        * msc_udp_remote_env() forwards on every ssh launch, TCP included. */
-      "MSC_DEST_STRIPE_COUNT"
+      "MSC_DEST_STRIPE_COUNT",
+      /* The TCP receiver's write-path override rides the same list. */
+      "MSC_TCP_NO_MMAP"
    };
    size_t i;
    for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
