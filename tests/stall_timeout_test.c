@@ -78,6 +78,31 @@ int main(void)
               (unsigned long long)elapsed);
       return 1;
    }
+   /* The finish ceiling: --flush-timeout, or 1 s per 2 MiB if longer; zero
+    * stays unbounded. */
+   {
+      static const struct { uint64_t timeout_ms, bytes, want_ms; } cases[] = {
+         { 1000, 1048576, 1000 },
+         { 1000, 20971520, 10000 },
+         { 1800000, UINT64_C(8) << 30, 4096000 },
+         { 1800000, (UINT64_C(2) << 20) * 3 + 1048576, 1800000 },
+         { 1, 3145728, 1500 },
+         { 0, UINT64_C(64) << 30, 0 },
+      };
+      size_t i;
+      for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+      {
+         uint64_t got = msc_finish_ceiling_ms(cases[i].timeout_ms, cases[i].bytes);
+         if (got != cases[i].want_ms)
+         {
+            fprintf(stderr, "finish ceiling for %llu ms, %llu bytes: %llu ms, want %llu\n",
+                    (unsigned long long)cases[i].timeout_ms,
+                    (unsigned long long)cases[i].bytes,
+                    (unsigned long long)got, (unsigned long long)cases[i].want_ms);
+            return 1;
+         }
+      }
+   }
    printf("TCP stall timeout test passed (%llu ms)\n",
           (unsigned long long)elapsed);
    return 0;

@@ -141,7 +141,7 @@ fi
 # says it is alive, so a flush longer than the stall timeout -- one that shows
 # no progress at all, as on a network filesystem -- does not fail a transfer
 # whose data has arrived. The sender bounds the finish at the larger of
-# --flush-timeout and 1 s per 4 MiB transferred, and reports a destination that
+# --flush-timeout and 1 s per 2 MiB transferred, and reports a destination that
 # never confirms its data with exit 4. The fsync shim makes every fsync of a
 # regular file take MSC_TEST_FSYNC_DELAY_MS.
 shim="$(dirname "$MSC")/build/fsync_fault_shim.so"
@@ -168,12 +168,12 @@ flush()   # label, expected exit, source, sender binary, receiver binary, msc
 flush "a 3 s final fsync" 0 "$work/src" "$MSC" "$MSC" -- MSC_TEST_FSYNC_DELAY_MS=3000
 grep -q "all data delivered; waiting for the destination to confirm it is durable (limit 30m00s" \
    "$work/log" || { echo "FAIL: a long flush was not announced"; sed -n '1,5p' "$work/log"; exit 1; }
-# 1 MiB: the ceiling is max(1 s, 1 MiB at 4 MiB/s) = 1 s; the fsync takes 4 s.
+# 1 MiB: the ceiling is max(1 s, 1 MiB at 2 MiB/s) = 1 s; the fsync takes 4 s.
 flush "a stuck fsync past the ceiling" 4 "$work/mib" "$MSC" "$MSC" --flush-timeout 1s -- \
    MSC_TEST_FSYNC_DELAY_MS=4000
 grep -q "did not confirm it was durable within" "$work/log" \
    || { echo "FAIL: a stuck fsync did not report the ceiling"; sed -n '1,5p' "$work/log"; exit 1; }
-# 20 MiB: the size term (5 s at 4 MiB/s) outlasts --flush-timeout 1s.
+# 20 MiB: the size term (10 s at 2 MiB/s) outlasts --flush-timeout 1s.
 flush "a 3 s fsync inside the size term" 0 "$work/twenty" "$MSC" "$MSC" --flush-timeout 1s -- \
    MSC_TEST_FSYNC_DELAY_MS=3000
 echo "ok: a slow flush completes; one past --flush-timeout and the size term fails with exit 4"
