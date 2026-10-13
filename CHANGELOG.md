@@ -2,7 +2,7 @@
 
 Notable user-facing changes are recorded here.
 
-## Unreleased
+## 1.1.0 - 2026-10-12
 
 ### Added
 
@@ -41,6 +41,10 @@ Notable user-facing changes are recorded here.
   steps, transfers and checksums no longer fail.
 - `contrib/slurm/msc-slurm-smoke.sh` keeps a separate log for each throughput
   run instead of overwriting one shared log.
+
+The session protocol version and the checkpoint format are unchanged. The wait
+for destination preparation is negotiated with a new feature bit, so 1.1.0 and
+1.0.0 peers interoperate, using the earlier behavior.
 
 ## 1.0.0 - 2026-09-26
 
