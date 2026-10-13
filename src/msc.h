@@ -1,6 +1,6 @@
 #define _FILE_OFFSET_BITS 64
 /* release version, reported by `msc --version` and the usage text */
-#define MSC_VERSION "1.0.0"
+#define MSC_VERSION "1.1.0"
 /* program defaults */
 #define DEFAULT_STREAMS 30
 #define MAX_STREAMS 2048
