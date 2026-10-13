@@ -124,6 +124,8 @@ struct msc_progress
    volatile int stop;
    int enabled;
    pthread_t thread;
+   pthread_mutex_t lock;   /* with wake: msc_progress_finish ends the wait */
+   pthread_cond_t wake;
 };
 
 /* --- UDP transport (-U) --------------------------------------------------- */

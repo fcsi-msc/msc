@@ -31,9 +31,10 @@ make check
 | --- | --- |
 | `udp_parity` | Clean/loss transfers, byte comparisons, offsets, recursive manifests, payload/PMTUD policy, offload fallback, ports, checksums, and protocol rejection. Includes recursive control-mode tests. |
 | `udp_resume_suite` | Single-file/tree checkpoint interruption, content mutation, storage failure, signals, packet-size changes, and metadata recovery. |
-| `resume_suite` | TCP checkpoints, recursive resume, retry filtering, exit classes, and stall timeouts; includes UDP resume, stdio, transport-default, and stripe suites. |
+| `resume_suite` | TCP checkpoints, recursive resume, retry filtering, exit classes, and stall timeouts; includes UDP resume, stdio, transport-default, progress, and stripe suites. |
 | `stdio_ctl_suite` | CLI stdio modes, content checks, listener instrumentation, and environment presets. |
 | `transport_suite` | UDP default, explicit `-T`/`-U`, stdin/command TCP fallback, and invalid combinations. |
+| `progress_suite` | TCP, UDP and tree transfers with `--progress=always` finish promptly and print their final summary, whatever the progress interval. |
 | `dest_stripe_suite` | Destination-stripe option parsing, restrictions, and forwarding. |
 | `wanshim` | Synthetic WAN smoke, a WAN profile with throughput/retransmission gates, and MTU black-hole behavior. |
 | `shim_check` | Emulator passthrough, delay, loss, and seeded behavior; GSO/sendmmsg datagram equivalence, MTU, scatter/gather and TOS preservation. |

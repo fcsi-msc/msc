@@ -194,12 +194,17 @@ stdio_ctl_suite: msc $(B)/wan_shim.so $(B)/listen_count_shim.so
 transport_suite: msc
 	sh tests/transport_default_test.sh
 
+# Progress reporting must not hold a finished transfer for the rest of an interval.
+progress_suite: msc
+	sh tests/progress_test.sh
+
 # The sub-suites run one after another rather than as prerequisites: they
 # share loopback UDP ports, so `make -j` must not start them concurrently.
 resume_suite: msc $(addprefix $(B)/,resume_test recursive_test retry_test exit_code_test stall_timeout_test)
 	$(MAKE) udp_resume_suite
 	$(MAKE) stdio_ctl_suite
 	$(MAKE) transport_suite
+	$(MAKE) progress_suite
 	$(MAKE) dest_stripe_suite
 	test "$$(./msc --probe)" = MSC-PROBE-OK
 	sh tests/resume_test.sh
@@ -233,7 +238,8 @@ uninstall:
 # --- Valgrind / Helgrind memory + race checks (see docs/valgrind.md) ---
 .PHONY: all check clean mscclean install uninstall valgrind helgrind helgrind_udp udp_parity \
 	udp_resume_suite resume_suite wanshim wanshim_wan shim_check shims \
-	dest_stripe_suite stdio_ctl_suite transport_suite udp_regressions $(TEST_BINS)
+	dest_stripe_suite stdio_ctl_suite transport_suite progress_suite \
+	udp_regressions $(TEST_BINS)
 
 VALGRIND ?= valgrind
 VG_DIR ?= /tmp/mscvg
