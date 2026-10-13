@@ -55,14 +55,16 @@ EOF
 chmod +x "$work/launcher"
 head -c 1048576 /dev/urandom > "$work/src"
 
-# The receiver's flush sticks for 20 s, far past the sender's limits, so the
-# sender gives up within a few seconds while its peer stays stuck.
+# The receiver's flush sticks for 20 s, far past the 2 s the sender allows a
+# 1 MiB transfer to become durable, so the sender gives up within a few
+# seconds while its peer stays stuck.
 start=$(date +%s)
 { timeout 60 env LD_PRELOAD="$shim" MSC_TEST_FSYNC_DELAY_MS=20000 \
      MSC_TEST_FSYNC_DELAY_MIN_BYTES=1048576 MSC_SSH="$work/launcher" \
      LAUNCHER_PIDFILE="$work/launcher.pid" PEER_PIDFILE="$work/peer.pid" \
-     "$MSC" -T -n 4 --stall-timeout 1s -l localhost -r localhost -B "$MSC" \
-     -i "$work/src" -o "$work/out" 2>&1 && status=0 || status=$?
+     "$MSC" -T -n 4 --stall-timeout 1s --flush-timeout 2s -l localhost \
+     -r localhost -B "$MSC" -i "$work/src" -o "$work/out" 2>&1 \
+     && status=0 || status=$?
   echo "$status" > "$work/rc"; } | cat > "$work/log"
 elapsed=$(( $(date +%s) - start ))
 rc=$(cat "$work/rc")
