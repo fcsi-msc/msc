@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/prctl.h>
 
 #include "msc.h"
 
@@ -18,6 +19,7 @@ void makechild(msc_child_fn pprocess, msc_child_fn cprocess,
 {
 
    pid_t childpid;
+   pid_t parent = getpid();
    int status;
    
    childpid = fork();
@@ -26,6 +28,15 @@ void makechild(msc_child_fn pprocess, msc_child_fn cprocess,
    {
       if (childpid == 0) /* 0 is the child */
       {
+         /* The child is the peer launcher (ssh, or a substitute such as
+          * srun). It must not outlive msc: a sender that gives up exits from
+          * wherever it is, without reaching the waitpid below, and a launcher
+          * left running holds msc's stdout and stderr until its peer exits --
+          * never, for a peer stuck flushing to unresponsive storage. SIGKILL,
+          * because srun answers SIGTERM by waiting for its remote tasks. The
+          * setting survives exec of a launcher that is not setuid. */
+         if (prctl(PR_SET_PDEATHSIG, SIGKILL) == 0 && getppid() != parent)
+            _exit(MSC_EXIT_INTERNAL);   /* msc already exited */
          cprocess(arg);
          /* Child callbacks normally exec or exit.  Never let an accidental
           * return continue through the caller's parent-side control flow. */
