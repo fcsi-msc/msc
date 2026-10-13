@@ -4,6 +4,16 @@ Notable user-facing changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- `--flush-timeout D` bounds how long a TCP single-file sender waits, after all
+  data has arrived, for the receiver to confirm the destination is durable: D
+  or 1 s per 2 MiB transferred, whichever is longer. The default is 30
+  minutes, and 0 waits indefinitely. A wait longer than the stall timeout is
+  announced once with its limit. A destination that does not confirm in time
+  fails the transfer with exit 4 rather than leaving msc waiting forever; a
+  checkpointed transfer then keeps its checkpoint, and `--resume` finishes it.
+
 ### Changed
 
 - TCP single-file transfers that create or truncate a regular destination on a
@@ -37,11 +47,13 @@ Notable user-facing changes are recorded here.
 - A TCP receiver that cannot write its destination reports the byte offset and
   the reason, such as ENOSPC, instead of only that the receiver failed.
 - A TCP single-file transfer to slow storage no longer fails with exit 6 after
-  all of its data has arrived. The receiver flushes the destination before
-  acknowledging it, and a flush longer than the stall timeout made the sender
-  give up. The receiver now tells the sender while the flush is advancing; a
-  flush that stops advancing still fails the transfer. Both ends need this
-  version; with an older peer the earlier behavior remains.
+  all of its data has arrived. The receiver flushes the destination (and, for
+  a checkpointed transfer, publishes it) before acknowledging it, and a flush
+  longer than the stall timeout made the sender give up; on a network
+  filesystem a flush can take minutes and show no progress. The receiver now
+  tells the sender it is alive until it acknowledges, and the sender bounds the
+  wait with `--flush-timeout` instead. Both ends need this version; with an
+  older peer the earlier behavior remains.
 
 ## 1.1.0 - 2026-10-12
 

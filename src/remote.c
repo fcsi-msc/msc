@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -407,135 +408,46 @@ static int receive_into_destination(struct receiver_state *state, int socketfd,
    return rc;
 }
 
-#define MSC_FLUSH_CHUNK_MB 256   /* writeback step; MSC_TEST_FLUSH_CHUNK_MB shrinks it */
-
-/* How often to tell the sender the flush is advancing: well inside its stall
- * timeout, as for the UDP receiver's PREPARING records. */
-static uint64_t flush_heartbeat_ns(uint64_t stall_timeout_ms)
-{
-   uint64_t ns = stall_timeout_ms * UINT64_C(1000000) / 4;
-   if (ns < UINT64_C(100000000)) ns = UINT64_C(100000000);
-   if (ns > UINT64_C(5000000000)) ns = UINT64_C(5000000000);
-   return ns;
-}
-
-static int send_flushing(int socketfd, uint64_t flushed)
+/* One FLUSHING record on stream 0: the receiver is alive and still finishing
+ * the transfer. The beat thread sends it until the ACK is ready. */
+static int send_flushing(void *arg)
 {
    struct segment_header beat;
    memset(&beat, 0, sizeof(beat));
    beat.magic = htonl(MSC_SEGMENT_MAGIC);
    beat.reserved = htonl(MSC_SEGMENT_FLUSHING);
-   beat.offset = host_to_network_64(flushed);
-   return sendall(socketfd, &beat, sizeof(beat));
+   return sendall(*(int *)arg, &beat, sizeof(beat));
 }
 
-/* Keeps sending FLUSHING during the final fsync, until it returns or one
- * stall timeout has passed since the writeback last advanced. */
-struct flush_beat
+/* Whether the sender has closed stream 0. After the data it sends nothing
+ * while it waits for the ACK, so anything readable there is its end of file
+ * or a reset. A failed send is no test: the first write after the peer has
+ * closed can still succeed. */
+static int sender_gone(int socketfd)
 {
-   int socketfd;
-   uint64_t flushed, interval_ns, deadline_ns;
-   pthread_mutex_t lock;
-   pthread_cond_t wake;
-   int stop;
-};
-
-static void *flush_beat_main(void *arg)
-{
-   struct flush_beat *b = arg;
-   pthread_mutex_lock(&b->lock);
-   while (!b->stop)
-   {
-      uint64_t next = receiver_now_ns() + b->interval_ns;
-      struct timespec at;
-      int rc = 0;
-      at.tv_sec = (time_t)(next / UINT64_C(1000000000));
-      at.tv_nsec = (long)(next % UINT64_C(1000000000));
-      while (!b->stop && rc != ETIMEDOUT)
-         rc = pthread_cond_timedwait(&b->wake, &b->lock, &at);
-      if (b->stop || receiver_now_ns() >= b->deadline_ns)
-         break;
-      pthread_mutex_unlock(&b->lock);
-      rc = send_flushing(b->socketfd, b->flushed);
-      pthread_mutex_lock(&b->lock);
-      if (rc != 0)
-         break;
-   }
-   pthread_mutex_unlock(&b->lock);
-   return NULL;
+   struct pollfd p;
+   char byte;
+   p.fd = socketfd;
+   p.events = POLLIN | POLLRDHUP;
+   if (poll(&p, 1, 0) <= 0)
+      return 0;
+   if (p.revents & (POLLRDHUP | POLLHUP | POLLERR))
+      return 1;
+   return recv(socketfd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) <= 0;
 }
 
-/* Flush [base, base + length) of the destination before acknowledging it.
- * A flush to slow storage can outlast the stall timeout that bounds the
- * sender's wait for the acknowledgement, and the sender would report a
- * finished transfer as failed. So when the sender accepts it, write back in
- * chunks and send FLUSHING after each completed chunk (at most once per
- * heartbeat interval), then keep sending it through the final fsync for up to
- * one stall timeout after the last chunk completed. Writeback that stops
- * advancing sends nothing, and the sender still gives up. */
-static int receiver_flush(struct receiver_state *state, off_t base, uint64_t length)
+/* From the end of the data until the ACK -- unmapping, flushing and, for a
+ * checkpointed transfer, publishing -- tell a sender that accepts it that this
+ * receiver is alive. The sender bounds the whole finish itself
+ * (--flush-timeout), so a flush to slow storage, which can show no progress at
+ * all while it runs, does not fail a transfer whose data has arrived. */
+static int finish_beat_start(struct receiver_state *state, struct msc_beat *beat)
 {
-   const char *test = getenv("MSC_TEST_FLUSH_CHUNK_MB");
-   uint64_t chunk = (uint64_t)MSC_FLUSH_CHUNK_MB << 20, interval, now, beat, progress;
-   uint64_t off = 0;
-   struct flush_beat b;
-   pthread_condattr_t attr;
-   pthread_t thread;
-   int started, rc, saved;
-
-   if (!__atomic_load_n(&state->peer_flush_aware, __ATOMIC_RELAXED) ||
-       state->stall_timeout_ms == 0)
-      return fsync(state->outputfd);
-   if (test != NULL && atoll(test) > 0)
-      chunk = (uint64_t)atoll(test) << 20;
-   interval = flush_heartbeat_ns(state->stall_timeout_ms);
-   beat = progress = receiver_now_ns();
-   while (off < length)
-   {
-      uint64_t len = length - off < chunk ? length - off : chunk;
-      if (sync_file_range(state->outputfd, base + (off_t)off, (off_t)len,
-                          SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
-                          SYNC_FILE_RANGE_WAIT_AFTER) != 0)
-      {
-         if (errno == EINVAL || errno == ESPIPE || errno == ENOSYS)
-            break;   /* not supported here: the fsync below does it all */
-         return -1;
-      }
-      off += len;
-      now = progress = receiver_now_ns();
-      if (now - beat >= interval)
-      {
-         if (send_flushing(state->sockets[0], off) != 0)
-            return -1;
-         beat = now;
-      }
-   }
-
-   b.socketfd = state->sockets[0];
-   b.flushed = off;
-   b.interval_ns = interval;
-   b.deadline_ns = progress + state->stall_timeout_ms * UINT64_C(1000000);
-   b.stop = 0;
-   pthread_mutex_init(&b.lock, NULL);
-   pthread_condattr_init(&attr);
-   pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-   pthread_cond_init(&b.wake, &attr);
-   pthread_condattr_destroy(&attr);
-   started = pthread_create(&thread, NULL, flush_beat_main, &b) == 0;
-   rc = fsync(state->outputfd);
-   saved = errno;
-   if (started)
-   {
-      pthread_mutex_lock(&b.lock);
-      b.stop = 1;
-      pthread_cond_signal(&b.wake);
-      pthread_mutex_unlock(&b.lock);
-      pthread_join(thread, NULL);
-   }
-   pthread_cond_destroy(&b.wake);
-   pthread_mutex_destroy(&b.lock);
-   errno = saved;
-   return rc;
+   if (!state->peer_flush_aware)   /* the workers have been joined */
+      return 0;
+   msc_beat_start(beat, msc_beat_interval_ns(state->stall_timeout_ms), send_flushing,
+                  &state->sockets[0]);
+   return 1;
 }
 
 static void *segment_receiver_thread(void *arg)
@@ -543,6 +455,7 @@ static void *segment_receiver_thread(void *arg)
    struct receiver_worker *worker = arg;
    struct receiver_state *state = worker->state;
    char *buffer = checkmalloc(state->segment_size, "receiver worker buffer");
+   int flush_aware = 0;   /* this stream's sender accepts FLUSHING records */
 
    while (!receiver_has_error(state) && !msc_cancelled())
    {
@@ -562,7 +475,7 @@ static void *segment_receiver_thread(void *arg)
          break;
       }
       if (ntohl(header.reserved) & MSC_SEGMENT_FLUSH_AWARE)
-         __atomic_store_n(&state->peer_flush_aware, 1, __ATOMIC_RELAXED);
+         flush_aware = 1;
       offset = network_to_host_64(header.offset);
       length = network_to_host_64(header.length);
       if (length == 0)
@@ -646,6 +559,12 @@ static void *segment_receiver_thread(void *arg)
          break;
       }
    }
+   if (flush_aware)
+   {
+      pthread_mutex_lock(&state->error_lock);
+      state->peer_flush_aware = 1;
+      pthread_mutex_unlock(&state->error_lock);
+   }
    free(buffer);
    return NULL;
 }
@@ -659,8 +578,10 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    struct receiver_state state;
    struct receiver_worker *workers;
    pthread_t *threads;
+   struct msc_beat beat;
    int lc;
    int created = 0;
+   int beating;
 
    bzero(&state, sizeof(state));
    state.outputfd = fileno(outfile);
@@ -691,16 +612,19 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    }
    for (lc = 0; lc < created; lc++)
       pthread_join(threads[lc], NULL);
+   beating = finish_beat_start(&state, &beat);
    destination_map_teardown(&state);
    /* A success ACK means every worker finished and the bytes reached the
     * backing file, not merely the stdio/kernel page cache. */
    if (!state.error)
    {
       uint64_t started = receiver_now_ns();
-      if (receiver_flush(&state, state.destination_base, state.bytes_received) != 0)
+      if (fsync(state.outputfd) != 0)
       { perror("MSC segmented receiver fsync"); state.error = 1; }
       state.flush_ns = receiver_now_ns() - started;
    }
+   if (beating)
+      msc_beat_stop(&beat);
    if (!state.error)
    {
       struct segment_header ack;
@@ -773,6 +697,8 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
    uint64_t source_offset, destination_offset;
    int fd = -1, created = 0, status = 1;
    int exit_code = MSC_EXIT_INCOMPATIBLE;
+   struct msc_beat beat;
+   int beating = 0;   /* the finish beat runs from data end to the ACK */
    const char *fault;
 
    msc_checkpoint_init(&checkpoint);
@@ -950,15 +876,9 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
       created++;
    }
    for (i = 0; i < (uint32_t)created; i++) pthread_join(threads[i], NULL);
-   /* Write the data back (telling the sender while it advances) before the
-    * checkpoint update, whose own fsync then has little left to do. */
-   if (!state.error && transfer_size != 0 &&
-       msc_checkpoint_contains(&checkpoint, 0, transfer_size) &&
-       receiver_flush(&state, state.destination_base, transfer_size) != 0)
-   {
-      perror("MSC resumable receiver fsync");
-      state.error = 1;
-   }
+   /* The checkpoint update below syncs the data, then publication follows:
+    * all of it before the ACK, with the sender told the receiver is alive. */
+   beating = finish_beat_start(&state, &beat);
    pthread_mutex_lock(&state.error_lock);
    if (persist_receiver_checkpoint(&state) != 0) state.error = 1;
    pthread_mutex_unlock(&state.error_lock);
@@ -967,6 +887,17 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
    {
       fprintf(stderr, "MSC transfer interrupted; durable partial data and checkpoint retained at %s\n",
               AD->checkpoint_path);
+      pthread_mutex_destroy(&state.error_lock);
+      goto cleanup;
+   }
+   /* A sender that has given up waiting (the destination outlasted its
+    * --flush-timeout) has reported a failure. Publishing now would leave a
+    * complete file and no checkpoint behind that report, and break the
+    * --resume it suggests, so keep both as they are instead. */
+   if (sender_gone(newsockfds[0]))
+   {
+      fprintf(stderr, "MSC sender stopped waiting; keeping %s and its checkpoint "
+                      "for --resume\n", temp_path);
       pthread_mutex_destroy(&state.error_lock);
       goto cleanup;
    }
@@ -979,6 +910,11 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
        (unlink(AD->checkpoint_path) != 0 ||
         msc_fsync_parent(AD->checkpoint_path) != 0))
    { fprintf(stderr, "MSC published data but could not remove checkpoint %s: %s\n", AD->checkpoint_path, strerror(errno)); pthread_mutex_destroy(&state.error_lock); goto cleanup; }
+   if (beating)
+   {
+      msc_beat_stop(&beat);
+      beating = 0;
+   }
    {
       struct segment_header ack;
       memset(&ack, 0, sizeof(ack)); ack.magic = htonl(MSC_SEGMENT_MAGIC);
@@ -997,6 +933,8 @@ reject:
    reply.status = htonl(1);
    sendall(newsockfds[0], &reply, sizeof(reply));
 cleanup:
+   if (beating)
+      msc_beat_stop(&beat);
    for (i = 0; i < (uint32_t)numstreams; i++) close(newsockfds[i]);
    if (fd >= 0) close(fd);
    free(workers); free(threads); free(source_path); free(temp_path);

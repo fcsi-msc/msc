@@ -31,11 +31,11 @@ make check
 | --- | --- |
 | `udp_parity` | Clean/loss transfers, byte comparisons, offsets, recursive manifests, payload/PMTUD policy, offload fallback, ports, checksums, and protocol rejection. Includes recursive control-mode tests. |
 | `udp_resume_suite` | Single-file/tree checkpoint interruption, content mutation, storage failure, signals, packet-size changes, and metadata recovery. |
-| `resume_suite` | TCP checkpoints, recursive resume, retry filtering, exit classes, and stall timeouts; includes UDP resume, stdio, transport-default, progress, TCP destination, and stripe suites. |
+| `resume_suite` | TCP checkpoints, recursive resume, retry filtering, exit classes, stall timeouts, and the finish ceiling's arithmetic; includes UDP resume, stdio, transport-default, progress, TCP destination, and stripe suites. |
 | `stdio_ctl_suite` | CLI stdio modes, content checks, listener instrumentation, and environment presets. |
 | `transport_suite` | UDP default, explicit `-T`/`-U`, stdin/command TCP fallback, and invalid combinations. |
 | `progress_suite` | TCP, UDP and tree transfers with `--progress=always` finish promptly and print their final summary, whatever the progress interval. |
-| `tcp_destination_suite` | TCP single-file write paths: mapped and `pwrite` byte equality across stream counts and segment sizes, segments crossing mapping regions, offsets keeping `pwrite`, and named write failures, including a real full filesystem where unprivileged user and mount namespaces are available. Slow but advancing flushes complete (including checkpointed transfers), stuck ones fail, and older senders receive no `FLUSHING` records. |
+| `tcp_destination_suite` | TCP single-file write paths: mapped and `pwrite` byte equality across stream counts and segment sizes, segments crossing mapping regions, offsets keeping `pwrite`, and named write failures, including a real full filesystem where unprivileged user and mount namespaces are available. A flush longer than the stall timeout completes (also checkpointed, without reconnecting), one past `--flush-timeout` and the size term exits 4, a checkpointed receiver past it keeps its checkpoint for `--resume`, and MSC 1.1.0 peers interoperate. |
 | `dest_stripe_suite` | Destination-stripe option parsing, restrictions, and forwarding. |
 | `wanshim` | Synthetic WAN smoke, a WAN profile with throughput/retransmission gates, and MTU black-hole behavior. |
 | `shim_check` | Emulator passthrough, delay, loss, and seeded behavior; GSO/sendmmsg datagram equivalence, MTU, scatter/gather and TOS preservation. |
@@ -115,10 +115,12 @@ The GRO coalescing shim's `MSC_TEST_COALESCE_AS_ONE=1` makes the receiver
 report the summed probe size, as receivers before the fix did.
 `MSC_TEST_TCP_MAP_REGION_MB` shrinks the TCP receiver's 1 GiB mapping region so
 small files exercise segments that cross regions. The fsync shim's
-`MSC_TEST_FSYNC_DELAY_MS` and `MSC_TEST_SYNC_RANGE_DELAY_MS` slow each
-regular-file flush or writeback step, `MSC_TEST_FLUSH_CHUNK_MB` shrinks the TCP
-receiver's 256 MiB writeback step, and `MSC_TEST_LEGACY_SENDER=1` makes a TCP
-sender behave as one from before `FLUSHING` records. Other `MSC_TEST_*` hooks are
+`MSC_TEST_FSYNC_DELAY_MS` makes each fsync of a regular file with at least
+`MSC_TEST_FSYNC_DELAY_MIN_BYTES` allocated (default 0) take that long, so a test
+can slow the flush of received data without slowing checkpoint files or a sparse
+destination synced before any data. Mixed-version
+cases build MSC 1.1.0 from its release tag in the test's work directory and
+skip themselves when no tag is available. Other `MSC_TEST_*` hooks are
 internal to their owning tests. They are not forwarded configuration for
 ordinary remote use.
 

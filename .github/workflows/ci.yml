@@ -34,6 +34,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+          fetch-depth: 0   # release tags: the suites build v1.1.0 for mixed-version tests
       # The suites push multi-gigabit loopback UDP; the stock 208 KiB socket
       # buffer ceiling makes the throughput-gated WAN tests needlessly noisy.
       - name: Raise socket buffer limits
@@ -54,6 +55,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+          fetch-depth: 0   # release tags: the suites build v1.1.0 for mixed-version tests
       - name: Raise socket buffer limits
         run: sudo sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304
       # The LD_PRELOAD test shims stay uninstrumented; only msc and the
