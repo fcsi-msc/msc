@@ -46,7 +46,9 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -113,6 +115,10 @@ static uint64_t g_stall_timeout_ns =
  *   Gbit/s single-node). Overrides:
  *   MSC_UDP_NO_MMAP=1    force the pwritev coalescer everywhere (never mmap).
  *   MSC_UDP_FORCE_MMAP=1 force mmap even on Lustre (reproduces the old default; for A/B).
+ *   A mapped single file on tmpfs is not reserved up front: there fallocate
+ *   allocates and zeroes every page in one serial pass before any data moves.
+ *   Instead a helper thread per flow prefaults that flow's part of the mapping
+ *   alongside the data. MSC_UDP_RESERVE_UPFRONT=1 keeps the up-front reservation.
  *   MSC_UDP_RECV_BATCH=N receiver: recvmmsg slots per call AND the ceiling on one
  *                   coalesced pwritev run (default 64, cap 1024). ~54 KiB runs
  *                   already hit ~11 Gbit/s; bigger batches gave no further gain.
@@ -171,6 +177,8 @@ static int g_force_mmap = 0;   /* MSC_UDP_FORCE_MMAP=1: mmap even on Lustre (to 
                                 * the old default for the A/B). Default now auto-picks:
                                 * mmap on non-Lustre, pwritev on Lustre (measured 7x
                                 * faster there: 1.6 -> 11 Gbit/s single-node). */
+static int g_reserve_upfront = 0; /* MSC_UDP_RESERVE_UPFRONT=1: reserve a tmpfs destination
+                                   * before data too, instead of alongside it */
 static int g_recv_batch = MSC_UDP_RECV_BATCH; /* MSC_UDP_RECV_BATCH=N: recvmmsg slots per call.
                                 * Also the ceiling on one coalesced pwritev run, so
                                 * bigger batches -> bigger sequential writes (the whole
@@ -690,6 +698,9 @@ static void read_env(void)
       g_no_mmap = 1;
    if (getenv("MSC_UDP_FORCE_MMAP") != NULL && atoi(getenv("MSC_UDP_FORCE_MMAP")) != 0)
       g_force_mmap = 1;
+   if (getenv("MSC_UDP_RESERVE_UPFRONT") != NULL &&
+       atoi(getenv("MSC_UDP_RESERVE_UPFRONT")) != 0)
+      g_reserve_upfront = 1;
    if (getenv("MSC_UDP_RECV_BATCH") != NULL && atoi(getenv("MSC_UDP_RECV_BATCH")) > 0)
    {
       g_recv_batch = atoi(getenv("MSC_UDP_RECV_BATCH"));
@@ -930,6 +941,8 @@ struct msc_udp_file
                         * memcpy into it instead of pwritev'ing -- avoids the
                         * single-inode write-lock serialization that caps a big
                         * file at ~1 writer's rate. Only when base == 0. */
+   int prefault;       /* receiver: the mapping is reserved alongside the data by
+                        * prefaulting each flow's part (tmpfs), not up front */
 };
 
 /* Where a session's wall time went, reported under MSC_UDP_STATS. Each
@@ -4915,6 +4928,24 @@ struct receiver_flow
    int clamp_warned;
    int error;
    int error_code;             /* stable receiver-local failure, when known */
+
+   /* Reservation alongside data (msc_udp_file.prefault): a helper thread
+    * prefaults this flow's byte range [pf_lo, pf_hi) of the mapping in order,
+    * publishing how far it has got in pf_done. flush_run prefaults any run the
+    * helper has not reached yet, so no store ever lands on an unallocated page
+    * (which would raise SIGBUS on a full filesystem). pf_lock guards pf_done,
+    * pf_error and pf_stop; the flow rereads them only past pf_seen. */
+   int prefault;
+   uint64_t pf_lo, pf_hi;
+   pthread_mutex_t pf_lock;
+   uint64_t pf_done;
+   int pf_error;                          /* the helper's failure (errno) */
+   int pf_stop;
+   uint64_t pf_seen;                      /* pf_done when the flow last looked */
+   uint64_t pf_inline_lo, pf_inline_hi;   /* last range flush_run prefaulted */
+   uint64_t pf_catchups;                  /* runs flush_run had to prefault */
+   int pf_running;
+   pthread_t pf_thread;
 };
 
 static int board_test(const uint8_t *b, uint64_t u) { return (b[u >> 3] >> (u & 7)) & 1; }
@@ -5046,6 +5077,54 @@ struct recv_item
    const char *data;
 };
 
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23   /* Linux 5.14 */
+#endif
+#define MSC_UDP_PREFAULT_CHUNK (4ULL << 20)    /* a helper's prefault step */
+#define MSC_UDP_PREFAULT_AHEAD (256ULL << 10)  /* flush_run's catch-up span */
+
+static int prefault_range(const struct msc_udp_file *fl, uint64_t lo, uint64_t hi);
+
+/* Make sure [lo, hi) of a destination reserved alongside the data is
+ * allocated before flush_run stores into it: either the flow's helper has
+ * passed it, or flush_run prefaults it now, with some lookahead. A flow
+ * without a helper range prefaults each run it writes. A failure (the
+ * helper's or this one) fails the flow as a destination error. */
+static int prefault_ensure(struct receiver_flow *cf, const struct msc_udp_file *fl,
+                           uint64_t lo, uint64_t hi)
+{
+   int e;
+   if (hi <= cf->pf_seen || (lo >= cf->pf_inline_lo && hi <= cf->pf_inline_hi))
+      return 0;
+   pthread_mutex_lock(&cf->pf_lock);
+   cf->pf_seen = cf->pf_done;
+   e = cf->pf_error;
+   pthread_mutex_unlock(&cf->pf_lock);
+   if (e == 0 && hi <= cf->pf_seen)
+      return 0;
+   if (e == 0)
+   {
+      uint64_t end;
+      end = hi + MSC_UDP_PREFAULT_AHEAD < cf->pf_hi ? hi + MSC_UDP_PREFAULT_AHEAD
+                                                     : cf->pf_hi;
+      if (end < hi)
+         end = hi;
+      e = prefault_range(fl, lo, end);
+      if (e == 0)
+      {
+         cf->pf_inline_lo = lo;
+         cf->pf_inline_hi = end;
+         cf->pf_catchups++;
+         return 0;
+      }
+   }
+   fprintf(stderr, "MSC UDP receiver flow %d: cannot reserve destination storage: %s\n",
+           cf->flow_id, strerror(e));
+   cf->error = 1;
+   cf->error_code = MSC_EXIT_DESTINATION;
+   return -1;
+}
+
 /* write a run of packets at strictly contiguous offsets with one pwritev, then
  * mark the order receive_bitmap. Marking only after the write means a failed write never
  * leaves a receive_bitmap bit set for data that is not on disk. board_set's return de-
@@ -5069,6 +5148,9 @@ static int flush_run(struct receiver_flow *cf, const struct recv_item *run,
    {
       /* lock-free: memcpy each packet into the shared mapping. run offsets are
        * absolute within the file and base == 0 whenever a file is mapped. */
+      if (fl->prefault &&
+          prefault_ensure(cf, fl, run[0].off, run[n - 1].off + run[n - 1].len) != 0)
+         return -1;
       for (i = 0; i < n; i++)
          memcpy((char *)fl->map + (size_t)run[i].off, run[i].data, (size_t)run[i].len);
       cf->wpath = 1;
@@ -5741,6 +5823,7 @@ static struct receiver_flow *receiver_flows_alloc(struct msc_udp_xfer *x,
    for (f = 0; f < x->flow_count; f++)
    {
       pthread_mutex_init(&flows[f].sample_lock, NULL);
+      pthread_mutex_init(&flows[f].pf_lock, NULL);
       flows[f].x = x;
       flows[f].udpfd = ss->udp_fds[f];
       flows[f].receive_demux = ss->receive_demux_of[f];
@@ -5778,6 +5861,7 @@ static void receiver_flows_free(struct receiver_flow *flows, int n)
    for (f = 0; f < n; f++)
    {
       pthread_mutex_destroy(&flows[f].sample_lock);
+      pthread_mutex_destroy(&flows[f].pf_lock);
       free(flows[f].receive_bitmap);
    }
    free(flows);
@@ -6012,6 +6096,159 @@ static int reserve_destination(int fd, uint64_t size, struct ready_signal *ready
    return 0;
 }
 
+/* Whether this kernel can prefault a mapping with MADV_POPULATE_WRITE, which
+ * reports a page it cannot allocate as an error instead of raising SIGBUS. */
+static int prefault_supported(void)
+{
+   static int cached = -1;
+   if (cached < 0)
+   {
+      size_t page = (size_t)sysconf(_SC_PAGESIZE);
+      void *m = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      cached = m != MAP_FAILED && madvise(m, page, MADV_POPULATE_WRITE) == 0;
+      if (m != MAP_FAILED)
+         munmap(m, page);
+   }
+   return cached;
+}
+
+/* Reserve a mapped destination alongside the data rather than up front? Only
+ * on tmpfs, where fallocate allocates and zeroes every page in one serial pass
+ * (elsewhere it is cheap metadata work), and only for a single file split into
+ * contiguous per-flow ranges. */
+static int reserve_alongside(const struct msc_udp_xfer *x, int fd)
+{
+   struct statfs fs;
+   return !g_reserve_upfront && x->nfiles == 1 &&
+          !(affine_geom_ok(x->flow_count, x->stripe_size, x->stripe_count) &&
+            x->total_units > 0) &&
+          fstatfs(fd, &fs) == 0 && (unsigned long)fs.f_type == 0x01021994UL &&
+          prefault_supported();
+}
+
+/* A destination reserved alongside the data is checked up front for room for
+ * the rest of the file, so an obviously full filesystem still fails before any
+ * data moves. Advisory: another writer can still fill it, and prefaulting then
+ * reports the failure. Sets errno to ENOSPC when there is no room. */
+static int dest_has_room(int fd, uint64_t size)
+{
+   struct stat st;
+   struct statvfs vfs;
+   uint64_t held, need;
+   /* MSC_TEST_IGNORE_ROOM=1 skips the check so tests reach prefault failures. */
+   if (getenv("MSC_TEST_IGNORE_ROOM") != NULL ||
+       fstat(fd, &st) != 0 || fstatvfs(fd, &vfs) != 0)
+      return 0;
+   held = (uint64_t)st.st_blocks * 512;
+   need = size > held ? size - held : 0;
+   if (need > (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize)
+   {
+      errno = ENOSPC;
+      return -1;
+   }
+   return 0;
+}
+
+/* Prefault the pages under [lo, hi) of the mapping for writing. Returns 0 or an
+ * errno. madvise reports a page it could not allocate only as EFAULT or ENOMEM,
+ * so fallocate on the same bytes recovers the filesystem's reason (ENOSPC,
+ * EDQUOT). */
+static int prefault_range(const struct msc_udp_file *fl, uint64_t lo, uint64_t hi)
+{
+   uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+   uint64_t start = lo / page * page;
+   uint64_t end = (hi + page - 1) / page * page;   /* within the mapping's last page */
+   int e;
+   while (madvise((char *)fl->map + start, (size_t)(end - start), MADV_POPULATE_WRITE) != 0)
+   {
+      e = errno;
+      if (e == EINTR)
+         continue;
+      if ((e == EFAULT || e == ENOMEM) &&
+          fallocate(fl->fd, 0, (off_t)start,
+                    (off_t)((hi < fl->size ? hi : fl->size) - start)) != 0 &&
+          errno != EOPNOTSUPP && errno != ENOSYS)
+         e = errno;
+      return e;
+   }
+   return 0;
+}
+
+static void *prefault_worker(void *arg)
+{
+   struct receiver_flow *cf = arg;
+   const struct msc_udp_file *fl = &cf->x->files[0];
+   uint64_t off = cf->pf_lo;
+   while (off < cf->pf_hi)
+   {
+      uint64_t end = cf->pf_hi - off > MSC_UDP_PREFAULT_CHUNK
+                        ? off + MSC_UDP_PREFAULT_CHUNK : cf->pf_hi;
+      int e, stop;
+      pthread_mutex_lock(&cf->pf_lock);
+      stop = cf->pf_stop;
+      pthread_mutex_unlock(&cf->pf_lock);
+      if (stop)
+         break;
+      e = prefault_range(fl, off, end);
+      pthread_mutex_lock(&cf->pf_lock);
+      if (e != 0)
+         cf->pf_error = e;
+      else
+         cf->pf_done = end;
+      pthread_mutex_unlock(&cf->pf_lock);
+      if (e != 0)
+         break;
+      off = end;
+   }
+   return NULL;
+}
+
+/* Start a prefault helper for each flow's byte range of a destination
+ * reserved alongside the data. A helper that cannot start only costs speed:
+ * flush_run prefaults whatever no helper has reached. */
+static void prefault_start(struct msc_udp_xfer *x, struct receiver_flow *flows)
+{
+   const struct msc_udp_file *fl = &x->files[0];
+   uint64_t payload = (uint64_t)x->payload_size;
+   int f;
+   if (x->nfiles != 1 || fl->map == NULL || !fl->prefault)
+      return;
+   for (f = 0; f < x->flow_count; f++)
+   {
+      struct receiver_flow *cf = &flows[f];
+      uint64_t lo = cf->part.lo_unit * payload;
+      uint64_t hi = (cf->part.lo_unit + cf->part.units) * payload;
+      if (hi > fl->size)
+         hi = fl->size;
+      if (lo >= hi)
+         continue;
+      cf->pf_lo = lo;
+      cf->pf_hi = hi;
+      cf->pf_done = cf->pf_seen = lo;
+      cf->pf_inline_lo = cf->pf_inline_hi = lo;
+      cf->prefault = 1;
+      /* MSC_TEST_NO_PREFAULT_HELPERS=1 leaves every run to flush_run. */
+      if (getenv("MSC_TEST_NO_PREFAULT_HELPERS") == NULL &&
+          pthread_create(&cf->pf_thread, NULL, prefault_worker, cf) == 0)
+         cf->pf_running = 1;
+   }
+}
+
+static void prefault_stop(struct msc_udp_xfer *x, struct receiver_flow *flows)
+{
+   int f;
+   for (f = 0; f < x->flow_count; f++)
+      if (flows[f].pf_running)
+      {
+         pthread_mutex_lock(&flows[f].pf_lock);
+         flows[f].pf_stop = 1;
+         pthread_mutex_unlock(&flows[f].pf_lock);
+         pthread_join(flows[f].pf_thread, NULL);
+         flows[f].pf_running = 0;
+      }
+}
+
 static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_sockset *ss)
 {
    struct receiver_flow *flows;
@@ -6039,9 +6276,15 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
           * whose first write kills the process with SIGBUS on a full device.
           * Unsupported allocation falls back to pwritev, which reports errno. */
          void *m = MAP_FAILED;
+         int alongside = 0;
          if (ftruncate(x->files[i].fd, (off_t)x->files[i].size) == 0)
          {
-            if (reserve_destination(x->files[i].fd, x->files[i].size, x->ready) == 0)
+            int reserved;
+            alongside = reserve_alongside(x, x->files[i].fd);
+            reserved = alongside ? dest_has_room(x->files[i].fd, x->files[i].size)
+                                 : reserve_destination(x->files[i].fd, x->files[i].size,
+                                                       x->ready);
+            if (reserved == 0)
                m = mmap(NULL, (size_t)x->files[i].size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, x->files[i].fd, 0);
             else if (errno == ENOSPC || errno == EDQUOT || errno == EIO ||
@@ -6064,20 +6307,30 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
                return abandoned ? -1 : MSC_EXIT_DESTINATION;
             }
          }
-         if (m != MAP_FAILED) x->files[i].map = m;   /* else fall back to pwritev */
+         if (m != MAP_FAILED)
+         {
+            x->files[i].map = m;
+            x->files[i].prefault = alongside;
+         }
+         /* else fall back to pwritev */
       }
    }
    if (g_stats)
    {
-      uint64_t mapped = 0;
+      uint64_t mapped = 0, alongside = 0;
       for (i = 0; i < x->nfiles; i++)
+      {
          if (x->files[i].map != NULL) mapped++;
-      fprintf(stderr, "MSC UDP receiver write-path: mmap %llu pwritev %llu\n",
+         if (x->files[i].map != NULL && x->files[i].prefault) alongside++;
+      }
+      fprintf(stderr, "MSC UDP receiver write-path: mmap %llu pwritev %llu%s\n",
               (unsigned long long)mapped,
-              (unsigned long long)(x->nfiles - mapped));
+              (unsigned long long)(x->nfiles - mapped),
+              alongside ? ", reserved alongside data" : "");
    }
 
    flows = receiver_flows_alloc(x, ss);
+   prefault_start(x, flows);
    threads = msc_udp_alloc(sizeof(pthread_t) * (size_t)x->flow_count, "threads");
 
    /* MSC_UDP_STATS: snapshot host-wide UDP receive drops and start the rx-rate
@@ -6132,6 +6385,7 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
       created++;
    }
    for (f = 0; f < created; f++) pthread_join(threads[f], NULL);
+   prefault_stop(x, flows);
    phase_mark(x->phases, PH_DATA);
    if (created < x->flow_count) rc = -1;
    for (f = 0; f < x->flow_count; f++)
@@ -6162,6 +6416,17 @@ static int receiver_run_flows(struct msc_udp_xfer *x, const struct msc_udp_socks
    }
    if (g_stats)
    {
+      uint64_t catchups = 0;
+      int prefaulting = 0;
+      for (f = 0; f < x->flow_count; f++)
+      {
+         catchups += flows[f].pf_catchups;
+         prefaulting += flows[f].prefault;
+      }
+      if (prefaulting > 0)
+         fprintf(stderr, "MSC UDP receiver reserve: %d flows prefaulting, "
+                 "%llu catch-up prefaults\n", prefaulting,
+                 (unsigned long long)catchups);
       pthread_cond_destroy(&samp.wake);
       pthread_mutex_destroy(&samp.lock);
    }
