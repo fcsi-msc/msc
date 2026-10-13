@@ -41,6 +41,12 @@ Notable user-facing changes are recorded here.
 
 ### Fixed
 
+- msc's peer launcher (ssh, or a substitute such as srun) no longer outlives
+  msc. When a transfer failed, msc exited without stopping its launcher, which
+  then held msc's output open until the remote peer exited. If the peer was
+  stuck, for example flushing to unresponsive storage, a script or pipe
+  reading msc's output waited indefinitely after msc had already reported the
+  failure.
 - A transfer with progress reporting enabled (`--progress=always`, or
   `--progress=auto` on a terminal) no longer waits up to one progress interval
   after it finishes before exiting.

@@ -198,6 +198,10 @@ transport_suite: msc
 progress_suite: msc
 	sh tests/progress_test.sh
 
+# A sender that gives up must take its peer launcher with it.
+launcher_suite: msc $(B)/fsync_fault_shim.so
+	sh tests/launcher_test.sh
+
 # How the TCP single-file receiver writes: mapped for a destination it
 # creates, pwrite for offsets and MSC_TCP_NO_MMAP=1, and named write failures.
 tcp_destination_suite: msc $(B)/fsync_fault_shim.so
@@ -211,6 +215,7 @@ resume_suite: msc $(addprefix $(B)/,resume_test recursive_test retry_test exit_c
 	$(MAKE) transport_suite
 	$(MAKE) progress_suite
 	$(MAKE) tcp_destination_suite
+	$(MAKE) launcher_suite
 	$(MAKE) dest_stripe_suite
 	test "$$(./msc --probe)" = MSC-PROBE-OK
 	sh tests/resume_test.sh
@@ -245,7 +250,7 @@ uninstall:
 .PHONY: all check clean mscclean install uninstall valgrind helgrind helgrind_udp udp_parity \
 	udp_resume_suite resume_suite wanshim wanshim_wan shim_check shims \
 	dest_stripe_suite stdio_ctl_suite transport_suite progress_suite \
-	tcp_destination_suite \
+	tcp_destination_suite launcher_suite \
 	udp_regressions $(TEST_BINS)
 
 VALGRIND ?= valgrind
