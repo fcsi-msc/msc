@@ -189,7 +189,10 @@ reported_ports "$ROOT/ports.err" receiver | in_window 17400 17415
 reported_ports "$ROOT/ports.err" sender | in_window 17400 17415
 test "$(reported_ports "$ROOT/ports.err" receiver | wc -l)" -eq 4
 # stderr, never stdout: stdout may be the transferred file itself (-o -)
-! grep -q "data port" "$ROOT/ports.out"
+if grep -q "data port" "$ROOT/ports.out"; then
+   echo "the data-port report leaked onto stdout" >&2
+   exit 1
+fi
 # both ends must name the SAME ports -- the sender's line is what a user reads
 # to write a firewall rule for the receiver
 reported_ports "$ROOT/ports.err" receiver > "$ROOT/ports.rx"
@@ -219,7 +222,10 @@ if MSC_UDP_PORT_LIST=21500,21502-21504 \
 fi
 unsquat
 grep -q "requested data port 21502 is in use by another transfer" "$ROOT/busy.err"
-! grep -q "21500" "$ROOT/busy.err"
+if grep -q "21500" "$ROOT/busy.err"; then
+   echo "the busy-port error named port 21500, which was free" >&2
+   exit 1
+fi
 test ! -e "$ROOT/busy.bin"
 
 # Scanning steps over a busy port instead of failing -- this is what lets two

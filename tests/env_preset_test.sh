@@ -20,11 +20,15 @@ if [ ! -f "$SHIM" ]; then
    exit 0
 fi
 
+# The receiver gets its own stderr file. glibc writes a long unbuffered
+# fprintf in 128-byte chunks, so a receiver line written into a shared log
+# between two chunks would split the sender's guard line and drop its tail
+# (startup_queue_mult, bw_restart).
 cat > "$work/fakessh" <<'EOF'
 #!/bin/sh
 while [ "$1" = "-o" ]; do shift 2; done
 shift
-exec /bin/sh -c "$*"
+exec /bin/sh -c "$*" 2>"$(dirname "$0")/remote.log"
 EOF
 chmod +x "$work/fakessh"
 head -c 4194304 /dev/urandom > "$work/src"
