@@ -1,8 +1,9 @@
 #!/bin/sh
 # tcp_destination_test.sh - how a TCP single-file receiver writes its destination.
 #
-# A destination the transfer creates or truncates is received straight into
-# shared mappings of the file. Offsets and MSC_TCP_NO_MMAP=1 keep pwrite. Both
+# A destination the transfer creates or truncates on a local filesystem (tmpfs,
+# ext2/3/4, XFS, Btrfs) is received straight into shared mappings of the file.
+# Other filesystems, offsets and MSC_TCP_NO_MMAP=1 keep pwrite. Both
 # paths must deliver identical bytes for any segment size, including segments
 # that cross mapping regions (MSC_TEST_TCP_MAP_REGION_MB=1 shrinks a region to
 # 1 MiB), and a destination that cannot be written must name the reason.
@@ -23,6 +24,13 @@ exec /bin/sh -c "$*"
 EOF
 chmod +x "$work/fakessh"
 MSC_SSH="$work/fakessh"; export MSC_SSH
+
+# The path a fresh destination in $work should take.
+case "$(stat -f -c %t "$work")" in
+   1021994|ef53|58465342|9123683e) maps=mmap ;;
+   *) maps=pwrite
+      echo "note: $work is not on a local filesystem MSC maps; expecting pwrite" ;;
+esac
 
 head -c 5242881 /dev/urandom > "$work/src"    # five regions and one byte
 : > "$work/empty"
@@ -49,7 +57,7 @@ transfer()
 
 for streams in 1 8; do
    for segment in 1048576 100000 4097; do
-      transfer "mapped -n$streams -s$segment" mmap MSC_TEST_TCP_MAP_REGION_MB=1 \
+      transfer "mapped -n$streams -s$segment" "$maps" MSC_TEST_TCP_MAP_REGION_MB=1 \
          "$work/src" -n "$streams" -s "$segment"
       transfer "pwrite -n$streams -s$segment" pwrite MSC_TCP_NO_MMAP=1 \
          "$work/src" -n "$streams" -s "$segment"
@@ -57,10 +65,10 @@ for streams in 1 8; do
 done
 echo "ok: mapped and pwrite destinations match for 1 and 8 streams and odd segment sizes"
 
-transfer "default region" mmap "" "$work/src" -n 8
-transfer "empty source" mmap "" "$work/empty" -n 4
+transfer "default region" "$maps" "" "$work/src" -n 8
+transfer "empty source" "$maps" "" "$work/empty" -n 4
 head -c 9437184 /dev/urandom > "$work/out"
-transfer "longer existing destination" mmap "" "$work/src" -n 8
+transfer "longer existing destination" "$maps" "" "$work/src" -n 8
 echo "ok: an empty source and a longer existing destination end at the source length"
 
 # A destination offset continues an existing file, so it keeps pwrite and the

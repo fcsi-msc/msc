@@ -105,15 +105,17 @@ vectored path. `MSC_UDP_NO_MMAP=1` forces it; `MSC_UDP_FORCE_MMAP=1` requests
 mapping on eligible paths even on Lustre.
 
 A TCP single-file transfer that creates or truncates a regular destination on a
-non-Lustre filesystem receives each segment straight into a shared mapping of
-the file. Streams then copy into the destination in parallel, instead of taking
+local filesystem (tmpfs, ext2/3/4, XFS or Btrfs) receives each segment straight
+into a shared mapping of the file. Streams then copy into the destination in parallel, instead of taking
 turns on the file's write lock as `pwrite` does on common Linux filesystems,
 and each segment is copied once instead of twice. The file grows to cover each
 segment as it arrives, so no space is reserved up front. A page the kernel
 cannot allocate fails that receive with an error that names the filesystem's
-reason, such as ENOSPC, and does not crash the receiver. Destination offsets,
-checkpointed transfers, multiple-machine slices, and Lustre keep `pwrite`;
-`MSC_TCP_NO_MMAP=1` keeps it everywhere. With `--stats`, the receiver prints
+reason, such as ENOSPC, and does not crash the receiver. Network filesystems keep
+`pwrite`: mapped writeback on Lustre cannot issue large RPCs and is several
+times slower, and NFS and CephFS have not been measured. Other filesystems,
+destination offsets, checkpointed transfers and multiple-machine slices also
+keep `pwrite`; `MSC_TCP_NO_MMAP=1` keeps it everywhere. With `--stats`, the receiver prints
 `MSC TCP receiver write-path: mmap` or `pwrite`. The `--progress` summary's
 destination write time on the mapped path is the CPU time spent receiving into
 the destination, excluding time spent waiting for the network.

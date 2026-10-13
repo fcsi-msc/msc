@@ -153,7 +153,7 @@ Defaults below are the base values before profile adjustments.
 | `MSC_UDP_AUTOTUNE_MAX` | Positive autotune ceiling in bytes; 256 MiB, capped at `INT_MAX`; kernel limits still apply. |
 | `MSC_UDP_NO_MMAP` | 1 forces vectored writes; default 0. |
 | `MSC_UDP_FORCE_MMAP` | 1 requests mapping for eligible paths including Lustre; default 0. Avoid combining the two overrides. |
-| `MSC_TCP_NO_MMAP` | 1 makes TCP single-file receivers write with `pwrite` instead of receiving into a mapping of the destination; default 0. Forwarded to the receiver. |
+| `MSC_TCP_NO_MMAP` | 1 makes TCP single-file receivers write with `pwrite` instead of receiving into a mapping of a local-filesystem destination; default 0. Forwarded to the receiver. |
 | `MSC_UDP_FSYNC_THREADS` | Positive recursive tail-sync worker count; 64. |
 | `MSC_UDP_NO_AFFINITY` | 1 disables source stripe-affine partitioning; default 0. |
 | `MSC_DEST_STRIPE_COUNT` | Destination stripe count; explicit CLI flag wins. Forwarded for TCP as well as UDP. |
