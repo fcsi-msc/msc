@@ -122,7 +122,10 @@ session to choose a different payload size or path MTU.
 
 SIGINT and SIGTERM retain exit statuses 130 and 143. The default no-progress
 timeout is 30 s; `--stall-timeout 0` disables it. It is a liveness bound, not a
-limit on total transfer duration.
+limit on total transfer duration. A TCP single-file receiver flushes the
+destination before acknowledging it; while that flush keeps advancing, it tells
+the sender so, and a slow destination does not fail a finished transfer. A
+flush that stops advancing for the stall timeout still does.
 
 Only network/transport exit 6 is retried. `--retries` controls bounded retries
 with backoff. Checkpointed transfers also enable reconnect probing by default

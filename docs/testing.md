@@ -35,7 +35,7 @@ make check
 | `stdio_ctl_suite` | CLI stdio modes, content checks, listener instrumentation, and environment presets. |
 | `transport_suite` | UDP default, explicit `-T`/`-U`, stdin/command TCP fallback, and invalid combinations. |
 | `progress_suite` | TCP, UDP and tree transfers with `--progress=always` finish promptly and print their final summary, whatever the progress interval. |
-| `tcp_destination_suite` | TCP single-file write paths: mapped and `pwrite` byte equality across stream counts and segment sizes, segments crossing mapping regions, offsets keeping `pwrite`, and named write failures, including a real full filesystem where unprivileged user and mount namespaces are available. |
+| `tcp_destination_suite` | TCP single-file write paths: mapped and `pwrite` byte equality across stream counts and segment sizes, segments crossing mapping regions, offsets keeping `pwrite`, and named write failures, including a real full filesystem where unprivileged user and mount namespaces are available. Slow but advancing flushes complete (including checkpointed transfers), stuck ones fail, and older senders receive no `FLUSHING` records. |
 | `dest_stripe_suite` | Destination-stripe option parsing, restrictions, and forwarding. |
 | `wanshim` | Synthetic WAN smoke, a WAN profile with throughput/retransmission gates, and MTU black-hole behavior. |
 | `shim_check` | Emulator passthrough, delay, loss, and seeded behavior; GSO/sendmmsg datagram equivalence, MTU, scatter/gather and TOS preservation. |
@@ -77,7 +77,7 @@ Always compare outputs even when an internal checksum is enabled.
 | [wan_shim.c](../tests/shims/wan_shim.c) | Preload-based UDP delay, jitter, independent loss, duplication, initial ACK/FIN drops, MTU black holes, and local MTU limits. |
 | [storage_fault_shim.c](../tests/shims/storage_fault_shim.c) | Destination write failures after a byte threshold; used with the non-mapped write path. Can also delay every `fallocate` to emulate slow destination storage. |
 | [gro_coalesce_shim.c](../tests/shims/gro_coalesce_shim.c) | Delivers back-to-back PMTUD probes in one receive buffer, as UDP GRO can, to test probe-size accounting. |
-| [fsync_fault_shim.c](../tests/shims/fsync_fault_shim.c) | Worker creation failures, fsync recording, and forced file/directory sync errors. |
+| [fsync_fault_shim.c](../tests/shims/fsync_fault_shim.c) | Worker creation failures, fsync recording, forced file/directory sync errors, and slow flush and writeback steps. |
 | [udp_offload_shim.c](../tests/shims/udp_offload_shim.c) | Unsupported GSO/GRO fallback paths; a single GSO send failing with a chosen errno, with sent-datagram counts. |
 | [listen_count_shim.c](../tests/shims/listen_count_shim.c) | Records TCP `listen()` calls to verify the stdio port footprint. |
 
@@ -114,7 +114,11 @@ transfer so a full filesystem is found by prefaulting.
 The GRO coalescing shim's `MSC_TEST_COALESCE_AS_ONE=1` makes the receiver
 report the summed probe size, as receivers before the fix did.
 `MSC_TEST_TCP_MAP_REGION_MB` shrinks the TCP receiver's 1 GiB mapping region so
-small files exercise segments that cross regions. Other `MSC_TEST_*` hooks are
+small files exercise segments that cross regions. The fsync shim's
+`MSC_TEST_FSYNC_DELAY_MS` and `MSC_TEST_SYNC_RANGE_DELAY_MS` slow each
+regular-file flush or writeback step, `MSC_TEST_FLUSH_CHUNK_MB` shrinks the TCP
+receiver's 256 MiB writeback step, and `MSC_TEST_LEGACY_SENDER=1` makes a TCP
+sender behave as one from before `FLUSHING` records. Other `MSC_TEST_*` hooks are
 internal to their owning tests. They are not forwarded configuration for
 ordinary remote use.
 

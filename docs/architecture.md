@@ -30,6 +30,14 @@ from shared scheduling state, read them, and send them on parallel TCP streams.
 Receiver workers write to the supplied offsets. This allows each worker to
 progress without a single application thread serializing all file/socket work.
 The kernel provides each stream's packet reliability and congestion control.
+After the last segment, the receiver flushes the destination and acknowledges
+the byte count on stream 0. During a long flush it writes the data back in
+chunks and sends a `FLUSHING` record on stream 0 after chunks complete, at most
+every quarter of the stall timeout, and keeps sending it through the final
+`fsync` for up to one stall timeout after the last chunk. The sender accepts
+these records while it waits for the acknowledgement. A sender marks its
+segment headers to say it accepts them; a receiver sends none to a sender that
+does not, so mixed versions keep the earlier behavior.
 
 The stdin/remote-command path uses streaming behavior suited to pipes. It does
 not have the same random-access and checkpoint guarantees as a regular file.
