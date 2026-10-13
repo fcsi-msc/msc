@@ -37,7 +37,7 @@ sends a `FLUSHING` record on stream 0 every quarter of the stall timeout
 (within 100 ms to 5 s). It says only that the receiver is alive: a flush to a
 network filesystem shows no progress while it runs. The sender skips these
 records while it waits, requires one within each stall timeout, and bounds the
-whole wait at the larger of `--flush-timeout` and 1 s per MiB transferred. A
+whole wait at the larger of `--flush-timeout` and 1 s per 4 MiB transferred. A
 sender marks its segment headers to say it accepts the records; a receiver
 sends none to a sender that does not, so mixed versions keep the earlier
 behavior.
