@@ -75,7 +75,7 @@ $(B)/child_status_test: $(call o,child_status_test fork cancellation)
 $(B)/udp_test: $(call o,udp_test udp_transport recursive resume progress cancellation netutil) $(UDP_ENGINE_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LDLIBS)
 
-$(B)/udp_protocol_test: $(call o,udp_protocol_test netutil) $(UDP_ENGINE_OBJS)
+$(B)/udp_protocol_test: $(call o,udp_protocol_test netutil cancellation) $(UDP_ENGINE_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LDLIBS)
 
 $(B)/resume_test: $(call o,resume_test local_sockets remote recursive fork netutil resume progress cancellation udp_transport) $(UDP_ENGINE_OBJS)
@@ -84,7 +84,7 @@ $(B)/resume_test: $(call o,resume_test local_sockets remote recursive fork netut
 $(B)/retry_test: $(call o,retry_test local_single local_sockets remote recursive fork netutil resume progress cancellation udp_transport) $(UDP_ENGINE_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LDLIBS)
 
-$(B)/stall_timeout_test: $(call o,stall_timeout_test netutil)
+$(B)/stall_timeout_test: $(call o,stall_timeout_test netutil cancellation)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
 
 $(B)/exit_code_test: $(call o,exit_code_test)

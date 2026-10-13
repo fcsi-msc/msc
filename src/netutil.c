@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -44,6 +46,195 @@ int msc_configure_tcp_socket(int fd, uint64_t timeout_ms)
       return -1;
 #endif
    return 0;
+}
+
+/* A beat well inside the stall timeout, within [100 ms, 5 s]. */
+uint64_t msc_beat_interval_ns(uint64_t stall_timeout_ms)
+{
+   uint64_t ns = stall_timeout_ms * UINT64_C(1000000) / 4;
+   if (ns == 0 || ns > UINT64_C(5000000000)) ns = UINT64_C(5000000000);
+   if (ns < UINT64_C(100000000)) ns = UINT64_C(100000000);
+   return ns;
+}
+
+static void *beat_main(void *arg)
+{
+   struct msc_beat *b = arg;
+   pthread_mutex_lock(&b->lock);
+   while (!b->stop)
+   {
+      struct timespec at;
+      int rc = 0;
+      clock_gettime(CLOCK_MONOTONIC, &at);
+      at.tv_sec += (time_t)(b->interval_ns / UINT64_C(1000000000));
+      at.tv_nsec += (long)(b->interval_ns % UINT64_C(1000000000));
+      if (at.tv_nsec >= 1000000000L)
+      {
+         at.tv_sec++;
+         at.tv_nsec -= 1000000000L;
+      }
+      while (!b->stop && rc != ETIMEDOUT)
+         rc = pthread_cond_timedwait(&b->wake, &b->lock, &at);
+      if (b->stop || b->send(b->arg) != 0)
+         break;   /* sent under the lock, between other writers' records */
+   }
+   pthread_mutex_unlock(&b->lock);
+   return NULL;
+}
+
+void msc_beat_start(struct msc_beat *b, uint64_t interval_ns,
+                    int (*send)(void *), void *arg)
+{
+   pthread_condattr_t attr;
+   b->stop = 0;
+   b->interval_ns = interval_ns;
+   b->send = send;
+   b->arg = arg;
+   pthread_mutex_init(&b->lock, NULL);
+   pthread_condattr_init(&attr);
+   pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+   pthread_cond_init(&b->wake, &attr);
+   pthread_condattr_destroy(&attr);
+   b->running = pthread_create(&b->thread, NULL, beat_main, b) == 0;
+}
+
+void msc_beat_stop(struct msc_beat *b)
+{
+   pthread_mutex_lock(&b->lock);
+   b->stop = 1;
+   pthread_cond_signal(&b->wake);
+   pthread_mutex_unlock(&b->lock);
+   if (b->running)
+      pthread_join(b->thread, NULL);
+   b->running = 0;
+   pthread_cond_destroy(&b->wake);
+   pthread_mutex_destroy(&b->lock);
+}
+
+/* The slowest destination flush rate a sender waits for: 4 MiB/s, half the
+ * slowest measured for a network filesystem committing a whole file in one
+ * fsync (8-17 MiB/s). */
+#define MSC_FLUSH_FLOOR_BYTES_PER_S (UINT64_C(4) << 20)
+
+uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes)
+{
+   uint64_t by_size = bytes / MSC_FLUSH_FLOOR_BYTES_PER_S * 1000U +
+                      bytes % MSC_FLUSH_FLOOR_BYTES_PER_S * 1000U / MSC_FLUSH_FLOOR_BYTES_PER_S;
+   if (flush_timeout_ms == 0)
+      return 0;
+   return by_size > flush_timeout_ms ? by_size : flush_timeout_ms;
+}
+
+static uint64_t netutil_now_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000U + (uint64_t)ts.tv_nsec / 1000000U;
+}
+
+static void describe_ms(char *text, size_t size, uint64_t ms)
+{
+   unsigned long long s = (unsigned long long)(ms / 1000U);
+   if (ms >= 3600000U)
+      snprintf(text, size, "%lluh%02llum", s / 3600U, s % 3600U / 60U);
+   else if (ms >= 60000U)
+      snprintf(text, size, "%llum%02llus", s / 60U, s % 60U);
+   else
+      snprintf(text, size, "%.1fs", (double)ms / 1000.0);
+}
+
+/* The one place a sender waits for a receiver to finish a transfer whose data
+ * it has sent: read records of size bytes from socketfd into record until one
+ * that is_beat() does not call a beat. Each record must arrive within the
+ * stall timeout, which a receiver that is alive but still flushing meets with
+ * beats, and the whole wait ends at msc_finish_ceiling_ms(flush_timeout_ms,
+ * bytes). A wait longer than one stall timeout (or 30 s) says so once, so a
+ * long flush does not look like a hang. Returns 0 with the final record in
+ * record, MSC_EXIT_NETWORK when the receiver went quiet or the stream failed,
+ * and MSC_EXIT_DESTINATION when the receiver stayed alive but the destination
+ * never confirmed the data. checkpointed adds that interrupting keeps the
+ * checkpoint. */
+int msc_await_final_record(int socketfd, void *record, size_t size,
+                           int (*is_beat)(const void *record),
+                           uint64_t stall_timeout_ms, uint64_t flush_timeout_ms,
+                           uint64_t bytes, int checkpointed)
+{
+   uint64_t ceiling = msc_finish_ceiling_ms(flush_timeout_ms, bytes);
+   uint64_t start = netutil_now_ms(), heard = start;
+   uint64_t notice = stall_timeout_ms != 0 ? stall_timeout_ms : 30000U;
+   int noticed = 0;
+   char text[32];
+
+   for (;;)
+   {
+      uint64_t now = netutil_now_ms();
+      int64_t wait = -1;
+      struct pollfd p;
+      int r;
+      if (!noticed && now >= start + notice)
+      {
+         if (ceiling != 0)
+            describe_ms(text, sizeof(text), ceiling);
+         fprintf(stderr, "MSC all data delivered; waiting for the destination to confirm "
+                         "it is durable (limit %s; --flush-timeout changes it%s)\n",
+                 ceiling != 0 ? text : "none",
+                 checkpointed ? "; Ctrl-C keeps the checkpoint for --resume" : "");
+         noticed = 1;
+      }
+      if (!noticed)
+         wait = (int64_t)(start + notice > now ? start + notice - now : 0);
+      if (stall_timeout_ms != 0)
+      {
+         int64_t quiet = (int64_t)(heard + stall_timeout_ms > now ? heard + stall_timeout_ms - now : 0);
+         if (wait < 0 || quiet < wait)
+            wait = quiet;
+      }
+      if (ceiling != 0)
+      {
+         int64_t left = (int64_t)(start + ceiling > now ? start + ceiling - now : 0);
+         if (wait < 0 || left < wait)
+            wait = left;
+      }
+      p.fd = socketfd;
+      p.events = POLLIN;
+      r = poll(&p, 1, wait < 0 ? -1 : wait > INT_MAX ? INT_MAX : (int)wait);
+      if (r < 0 && errno == EINTR)
+      {
+         if (msc_cancelled())
+            return MSC_EXIT_NETWORK;
+         continue;
+      }
+      if (r < 0)
+      {
+         perror("MSC waiting for the receiver to finish");
+         return MSC_EXIT_NETWORK;
+      }
+      now = netutil_now_ms();
+      if (r == 0)
+      {
+         if (ceiling != 0 && now >= start + ceiling)
+         {
+            describe_ms(text, sizeof(text), ceiling);
+            fprintf(stderr, "MSC delivered all data, but the destination did not confirm "
+                            "it was durable within %s (--flush-timeout, or 1 s per 4 MiB "
+                            "transferred if longer)\n", text);
+            return MSC_EXIT_DESTINATION;
+         }
+         if (stall_timeout_ms != 0 && now >= heard + stall_timeout_ms)
+         {
+            describe_ms(text, sizeof(text), stall_timeout_ms);
+            fprintf(stderr, "MSC receiver sent nothing for %s while finishing the "
+                            "transfer (--stall-timeout)\n", text);
+            return MSC_EXIT_NETWORK;
+         }
+         continue;
+      }
+      if (recvall_exact(socketfd, record, size) != 0)
+         return MSC_EXIT_NETWORK;
+      if (!is_beat(record))
+         return 0;
+      heard = netutil_now_ms();
+   }
 }
 
 void *checkmalloc(size_t size, const char *msg)

@@ -10,6 +10,7 @@
  * typo fails at parse time rather than as a Lustre error after the ssh launch. */
 #define MAX_DEST_STRIPE_COUNT 2000
 #define DEFAULT_STALL_TIMEOUT_MS 30000U
+#define DEFAULT_FLUSH_TIMEOUT_MS 1800000U   /* --flush-timeout: 30 minutes */
 #define DEFAULT_RECONNECT_INTERVAL_MS 10000U
 #define ACCEPT_TIMEOUT_SECONDS 120
 #define MAX_INTERPROCESS_BUFFER_SIZE 1024*1024*2  /* 2MB, legacy pipe path */
@@ -327,6 +328,7 @@ struct argdata
    int progress_mode;          /* enum msc_progress_mode */
    uint64_t progress_interval_ms;
    uint64_t stall_timeout_ms;  /* maximum interval without network progress */
+   uint64_t flush_timeout_ms;  /* sender: bound on the receiver's finish; 0 = none */
    uint64_t reconnect_interval_ms; /* SSH probe cadence after a resumable stall */
    int my_ost_start;           /* multi-machine Lustre slice metadata */
    int my_ost_count;
@@ -398,6 +400,32 @@ extern int preadall(int fd, void *buffer, size_t size, off_t offset);
 extern int pwriteall(int fd, const void *buffer, size_t size, off_t offset);
 extern int pwritevall(int fd, struct iovec *iov, int iovcnt, off_t offset);
 extern int msc_configure_tcp_socket(int fd, uint64_t timeout_ms);
+
+/* Receiver liveness while it finishes a transfer (flush, publish): a timer
+ * thread calls send(arg) every interval until stopped. It touches nothing but
+ * its timer and that send, so storage stuck in the kernel cannot stall it. */
+struct msc_beat
+{
+   pthread_t thread;
+   pthread_mutex_t lock;
+   pthread_cond_t wake;
+   int stop, running;
+   uint64_t interval_ns;
+   int (*send)(void *arg);   /* one beat record; nonzero ends the beat */
+   void *arg;
+};
+extern uint64_t msc_beat_interval_ns(uint64_t stall_timeout_ms);
+extern void msc_beat_start(struct msc_beat *b, uint64_t interval_ns,
+                           int (*send)(void *), void *arg);
+extern void msc_beat_stop(struct msc_beat *b);
+/* How long a sender waits for the receiver to finish after the data:
+ * max(flush_timeout_ms, bytes at the floor rate); 0 when unbounded. */
+extern uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes);
+/* Sender: read the receiver's final record after the data, skipping beats. */
+extern int msc_await_final_record(int socketfd, void *record, size_t size,
+                                  int (*is_beat)(const void *record),
+                                  uint64_t stall_timeout_ms, uint64_t flush_timeout_ms,
+                                  uint64_t bytes, int checkpointed);
 extern const char *msc_ssh_program(void);
 
 /* SSH connect/keepalive budgets, scaled by the declared path class (see
