@@ -1552,6 +1552,111 @@ static int recv_ready(int fd, volatile sig_atomic_t *cancel, uint32_t *tag)
          deadline = msc_udp_now_ns() + g_stall_timeout_ns;
    }
 }
+/* ===== single-file finish (MSC_UDP_FEAT_FINISH) ==========================
+ * From the end of the data until FINISHED, the receiver says it is alive with
+ * a FLUSHING record every quarter of the stall timeout, sent by a timer thread
+ * (msc_beat) that touches nothing else, so storage stuck in the kernel cannot
+ * stall it. The control channel has one user at a time: the beat runs only
+ * while the receiver leaves the channel alone (flushing, checksumming,
+ * publishing) and stops before the receiver sends or reads. The sender bounds
+ * the whole finish with --flush-timeout. */
+static uint64_t g_flush_timeout_ms = DEFAULT_FLUSH_TIMEOUT_MS;
+
+void msc_udp_set_flush_timeout(uint64_t ms)
+{
+   g_flush_timeout_ms = ms;
+}
+
+static int send_flushing(void *arg)
+{
+   return send_u32(*(int *)arg, MSC_UDP_CTL_FLUSHING);
+}
+
+void msc_udp_finish_beat_start(struct msc_beat *beat, int *beating, int *controlfd)
+{
+   msc_beat_start(beat, msc_beat_interval_ns(g_stall_timeout_ns / 1000000ULL),
+                  send_flushing, controlfd);
+   *beating = 1;
+}
+
+void msc_udp_finish_beat_stop(struct msc_beat *beat, int *beating)
+{
+   if (*beating)
+      msc_beat_stop(beat);
+   *beating = 0;
+}
+
+/* Sender: one control record's tag at a time, for msc_finish_await(). */
+struct finish_reader
+{
+   int fd;
+   volatile sig_atomic_t *cancel;
+   uint32_t tag;
+};
+
+static int read_finish_record(void *ctx, int timeout_ms)
+{
+   struct finish_reader *reader = ctx;
+   struct msc_udp_control_channel *channel = msc_udp_control_channel_lookup(reader->fd);
+   uint64_t until = timeout_ms < 0 ? 0 : msc_udp_now_ns() + (uint64_t)timeout_ms * 1000000ULL;
+   for (;;)
+   {
+      int slice = 100, r;
+      if (reader->cancel != NULL && *reader->cancel)
+         return -1;
+      if (timeout_ms >= 0)
+      {
+         uint64_t now = msc_udp_now_ns();
+         if (now >= until)
+            return 0;
+         if (until - now < 100000000ULL)
+            slice = (int)((until - now + 999999ULL) / 1000000ULL);
+      }
+      if (channel != NULL)
+         r = msc_udp_control_channel_wait_readable(channel, slice);
+      else
+      {
+         struct pollfd p;
+         p.fd = reader->fd;
+         p.events = POLLIN;
+         r = poll(&p, 1, slice);
+         if (r < 0 && errno == EINTR)
+            r = 0;
+      }
+      if (r < 0)
+         return -1;
+      if (r > 0)
+         return recv_u32(reader->fd, &reader->tag) == 0 ? 1 : -1;
+   }
+}
+
+static int finish_record_is_beat(void *ctx)
+{
+   return ((struct finish_reader *)ctx)->tag == MSC_UDP_CTL_FLUSHING;
+}
+
+/* A reply that is not a control record, such as a chunk check or a durable
+ * acknowledgement, begins with a magic number that FLUSHING never equals. */
+int msc_udp_finish_read(int fd, volatile sig_atomic_t *cancel, uint64_t bytes,
+                        void *record, size_t size)
+{
+   struct msc_finish finish;
+   struct finish_reader reader;
+   uint32_t first;
+   int code;
+   reader.fd = fd;
+   reader.cancel = cancel;
+   msc_finish_begin(&finish, g_stall_timeout_ns / 1000000ULL, g_flush_timeout_ms, bytes, 1);
+   code = msc_finish_await(&finish, read_finish_record, finish_record_is_beat, &reader);
+   if (code != 0)
+      return code;
+   first = htonl(reader.tag);
+   memcpy(record, &first, size < 4 ? size : 4);
+   if (size > 4 && msc_udp_recv_all(fd, (char *)record + 4, size - 4) != 0)
+      return MSC_EXIT_NETWORK;
+   return 0;
+}
+
 static int recv_u64(int fd, uint64_t *v)
 {
    uint64_t n;
@@ -1684,6 +1789,16 @@ static int recv_u64_stall_bounded(int fd, uint64_t *v)
 
 static uint32_t g_feat_agreed = 0;   /* intersection of both ends' feature bits */
 
+int msc_udp_finish_agreed(void)
+{
+   return (g_feat_agreed & MSC_UDP_FEAT_FINISH) != 0;
+}
+
+int msc_udp_sender_stopped_waiting(int fd)
+{
+   return ready_sender_gone(fd);
+}
+
 /* the feature set this end is willing to run; bits light up as the kernel-
  * parity features land (the transport design notes) */
 static uint32_t my_feature_bits(void)
@@ -1696,6 +1811,7 @@ static uint32_t my_feature_bits(void)
    if (g_dsack) bits |= MSC_UDP_FEAT_DSACK;
    bits |= MSC_UDP_FEAT_DATA_RTT;
    bits |= MSC_UDP_FEAT_READY;
+   bits |= MSC_UDP_FEAT_FINISH;
    return bits;
 }
 
@@ -6668,6 +6784,9 @@ static int sender_send_file(void *session, struct msc_udp_config *cfg)
    uint64_t vis_t0 = 0;
    off_t base;
    struct stat st;
+   struct msc_finish finish;
+   struct finish_reader reader;
+   int finishing = 0;   /* MSC_UDP_FEAT_FINISH: the wait for the receiver is bounded */
 
    if (s == NULL)
    {
@@ -6835,8 +6954,27 @@ static int sender_send_file(void *session, struct msc_udp_config *cfg)
       goto out;
    }
 
-   /* transfer complete: the receiver confirms the whole byte count over the control_channel */
-   if (recv_u32(s->controlfd, &tag) != 0)
+   /* transfer complete: the receiver confirms the whole byte count over the
+    * control_channel. With MSC_UDP_FEAT_FINISH it says it is alive meanwhile,
+    * and the wait (here and for FINISHED below) ends at the finish ceiling. */
+   finishing = (g_feat_agreed & MSC_UDP_FEAT_FINISH) != 0;
+   if (finishing)
+   {
+      int code;
+      reader.fd = s->controlfd;
+      reader.cancel = cfg->cancel_flag;
+      msc_finish_begin(&finish, g_stall_timeout_ns / 1000000ULL, g_flush_timeout_ms,
+                       x.total_bytes, 0);
+      code = msc_finish_await(&finish, read_finish_record, finish_record_is_beat, &reader);
+      if (code != 0)
+      {
+         error_code = code;
+         rc = -1;
+         goto out;
+      }
+      tag = reader.tag;
+   }
+   else if (recv_u32(s->controlfd, &tag) != 0)
    {
       fprintf(stderr, "MSC UDP sender: receiver did not acknowledge transfer\n");
       rc = -1;
@@ -6892,6 +7030,33 @@ static int sender_send_file(void *session, struct msc_udp_config *cfg)
          goto out;
       }
       cfg->checksum = local_sum;
+   }
+   /* The receiver publishes the file, then confirms it. */
+   if (finishing)
+   {
+      int code = msc_finish_await(&finish, read_finish_record, finish_record_is_beat, &reader);
+      if (code != 0)
+      {
+         error_code = code;
+         rc = -1;
+         goto out;
+      }
+      if (reader.tag == MSC_UDP_CTL_ERROR)
+      {
+         uint32_t status;
+         if (recv_u32(s->controlfd, &status) == 0 && transfer_status_valid(status))
+            error_code = (int)status;
+         fprintf(stderr, "MSC UDP sender: receiver reported exit %d\n",
+                 error_code > 0 ? error_code : MSC_EXIT_NETWORK);
+         rc = -1;
+         goto out;
+      }
+      if (reader.tag != MSC_UDP_CTL_FINISHED)
+      {
+         fprintf(stderr, "MSC UDP sender: receiver sent an invalid completion record\n");
+         rc = -1;
+         goto out;
+      }
    }
    cfg->bytes_done = x.total_bytes;
 
@@ -7263,6 +7428,8 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
    struct msc_udp_file onefile;
    int destfd = -1, rc = 0, error_code = 0;
    struct ready_signal *ready = NULL;
+   struct msc_beat beat;
+   int finishing = 0, beating = 0;   /* MSC_UDP_FEAT_FINISH: FLUSHING until FINISHED */
    uint32_t tag, version, nflip, payload, stripe_count = 0, dest_stripes = 0;
    long dest_stripe_count;
    uint64_t filesize, transfer_id, stripe_size = 0, sum = 0;
@@ -7384,6 +7551,11 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
       goto out;
    }
 
+   /* With MSC_UDP_FEAT_FINISH, say this end is alive from here until FINISHED,
+    * and checksum before DONE so the sender's wait covers it. */
+   finishing = (g_feat_agreed & MSC_UDP_FEAT_FINISH) != 0;
+   if (finishing)
+      msc_udp_finish_beat_start(&beat, &beating, &s->controlfd);
    if (fsync(destfd) != 0 && errno != EINVAL)   /* EINVAL: e.g. a pipe dest */
    {
       fprintf(stderr, "MSC UDP receiver: fsync failed: %s\n", strerror(errno));
@@ -7391,13 +7563,22 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
       rc = -1;
       goto out;
    }
+   if (finishing && cfg->verify_checksum &&
+       msc_udp_checksum_fd(destfd, cfg->dst_offset, x.total_bytes, &sum) != 0)
+   {
+      fprintf(stderr, "MSC UDP receiver: failed checksumming destination\n");
+      rc = -1;
+      goto out;
+   }
+   msc_udp_finish_beat_stop(&beat, &beating);
 
    /* transfer complete: confirm the whole byte count over the reliable control_channel */
    if (send_u32(s->controlfd, MSC_UDP_CTL_DONE) != 0 || send_u64(s->controlfd, x.total_bytes) != 0)
    { fprintf(stderr, "MSC UDP receiver: failed sending final ack\n"); rc = -1; goto out; }
    if (cfg->verify_checksum)
    {
-      if (msc_udp_checksum_fd(destfd, cfg->dst_offset, x.total_bytes, &sum) != 0)
+      if (!finishing &&
+          msc_udp_checksum_fd(destfd, cfg->dst_offset, x.total_bytes, &sum) != 0)
       {
          fprintf(stderr, "MSC UDP receiver: failed checksumming destination\n");
          rc = -1;
@@ -7412,6 +7593,20 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
          goto out;
       }
       cfg->checksum = sum;
+   }
+   if (finishing)
+   {
+      /* Without a checksum the sender approves nothing, so check that it is
+       * still waiting: one that gave up (it closed the channel, or sent
+       * ABORT) must not have a file published behind its failure. */
+      if (!cfg->verify_checksum && cfg->final_dest_path != NULL &&
+          cfg->dest_path != NULL && ready_sender_gone(s->controlfd))
+      {
+         fprintf(stderr, "MSC UDP receiver: the sender stopped waiting; not publishing\n");
+         rc = -1;
+         goto out;
+      }
+      msc_udp_finish_beat_start(&beat, &beating, &s->controlfd);
    }
    if (cfg->final_dest_path != NULL && cfg->dest_path != NULL)
    {
@@ -7442,10 +7637,21 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
          goto out;
       }
    }
+   if (finishing)
+   {
+      msc_udp_finish_beat_stop(&beat, &beating);
+      if (send_u32(s->controlfd, MSC_UDP_CTL_FINISHED) != 0)
+      {
+         fprintf(stderr, "MSC UDP receiver: failed sending completion\n");
+         rc = -1;
+         goto out;
+      }
+   }
    cfg->bytes_done = x.total_bytes;
 
 out:
-   ready_quiesce(ready);   /* before anything else writes to the control channel */
+   msc_udp_finish_beat_stop(&beat, &beating);   /* before anything else writes to the control channel */
+   ready_quiesce(ready);
    if (rc != 0 && error_code == MSC_EXIT_DESTINATION &&
        s != NULL && s->controlfd >= 0)
       (void)msc_udp_send_transfer_error(s->controlfd, error_code);

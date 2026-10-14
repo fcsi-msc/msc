@@ -432,6 +432,20 @@ extern void msc_beat_stop(struct msc_beat *b);
 /* How long a sender waits for the receiver to finish after the data:
  * max(flush_timeout_ms, bytes at the floor rate); 0 when unbounded. */
 extern uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes);
+/* Sender: wait for the receiver to finish after the data, in one or more
+ * steps under one ceiling. read_record waits up to timeout_ms (-1: no limit)
+ * and returns 1 when it read a record, 0 when none came, and -1 when the
+ * stream failed or the wait was cancelled; is_beat says whether that record
+ * was a beat. */
+struct msc_finish
+{
+   uint64_t start_ms, heard_ms, ceiling_ms, notice_ms, stall_timeout_ms;
+   int noticed, checkpointed;
+};
+extern void msc_finish_begin(struct msc_finish *f, uint64_t stall_timeout_ms,
+                             uint64_t flush_timeout_ms, uint64_t bytes, int checkpointed);
+extern int msc_finish_await(struct msc_finish *f, int (*read_record)(void *ctx, int timeout_ms),
+                            int (*is_beat)(void *ctx), void *ctx);
 /* Sender: read the receiver's final record after the data, skipping beats. */
 extern int msc_await_final_record(int socketfd, void *record, size_t size,
                                   int (*is_beat)(const void *record),
