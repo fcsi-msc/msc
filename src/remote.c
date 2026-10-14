@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <linux/sockios.h>
 #include <poll.h>
 #include <netinet/in.h>
 #include <fcntl.h>
@@ -82,7 +84,13 @@ struct receiver_state
    volatile uint64_t write_ns;
    uint64_t flush_ns;
    uint64_t stall_timeout_ms;  /* the sender's no-progress limit; 0 = none */
-   int peer_flush_aware;       /* the sender accepts FLUSHING records */
+   int peer_flush_aware;       /* the sender accepts FLUSHING and FAILED records */
+   /* The first destination failure, for the sender's FAILED record; under
+    * error_lock while workers run. */
+   uint32_t failed_phase;      /* MSC_FAILED_*; 0 = none */
+   uint64_t failed_offset;     /* UINT64_MAX when no byte applies */
+   int failed_errno;
+   int streams_closed;         /* abandon_streams() has run */
    /* A fresh regular single-file destination is received straight into
     * shared mappings of the file, so the workers do not take turns on the
     * inode's write lock as they do with pwrite. Region i maps the file from
@@ -199,14 +207,31 @@ int recvall(int fd, char *buffer, int size)
    return numread;
 }
 
+/* Stop every worker. Shutting down only the receiving side wakes a worker
+ * blocked in recv without telling the sender anything: a stream closed for
+ * sending would be reset as more data arrived, and the sender would fail
+ * before a FAILED record could reach it. */
 static void set_receiver_error(struct receiver_state *state)
 {
    int i;
    pthread_mutex_lock(&state->error_lock);
    state->error = 1;
    for (i = 0; i < state->numstreams; i++)
-      shutdown(state->sockets[i], SHUT_RDWR);
+      shutdown(state->sockets[i], SHUT_RD);
    pthread_mutex_unlock(&state->error_lock);
+}
+
+/* Record the first destination failure; the caller holds error_lock or is
+ * the only thread left. */
+static void note_failure(struct receiver_state *state, uint32_t phase,
+                         uint64_t offset, int error)
+{
+   state->error = 1;
+   if (state->failed_phase != 0)
+      return;
+   state->failed_phase = phase;
+   state->failed_offset = offset;
+   state->failed_errno = error;
 }
 
 static int receiver_has_error(struct receiver_state *state)
@@ -231,8 +256,10 @@ static int persist_receiver_checkpoint(struct receiver_state *state)
                                           state->checkpoint_data_path) != 0 ||
        msc_checkpoint_write_atomic(state->checkpoint_path, state->checkpoint) != 0)
    {
+      int error = errno;
       fprintf(stderr, "MSC could not durably update checkpoint %s: %s\n",
-              state->checkpoint_path, strerror(errno));
+              state->checkpoint_path, strerror(error));
+      note_failure(state, MSC_FAILED_CHECKPOINT, UINT64_MAX, error);
       return -1;
    }
    state->flush_ns += receiver_now_ns() - started;
@@ -247,6 +274,9 @@ static void report_destination_failure(struct receiver_state *state,
            (unsigned long long)offset,
            error == EFAULT ? "the kernel could not allocate its pages"
                            : strerror(error));
+   pthread_mutex_lock(&state->error_lock);
+   note_failure(state, MSC_FAILED_WRITE, offset, error);
+   pthread_mutex_unlock(&state->error_lock);
    set_receiver_error(state);
 }
 
@@ -436,6 +466,50 @@ static int sender_gone(int socketfd)
    return recv(socketfd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) <= 0;
 }
 
+/* Tell a sender that accepts it why the destination failed, in place of the
+ * ACK. Closing a stream with data still unread resets it and drops whatever
+ * this end has not yet sent, so wait (up to 1 s) until the sender's end has
+ * acknowledged the record: once there, it stays readable ahead of the reset.
+ * The receiver's own message may never reach the user (its launcher can be
+ * gone with the sender), so the record carries the cause itself. */
+static void send_failed(struct receiver_state *state)
+{
+   struct segment_header record;
+   uint64_t deadline;
+   int unsent;
+
+   if (!state->peer_flush_aware || state->failed_phase == 0 || state->streams_closed)
+      return;
+   memset(&record, 0, sizeof(record));
+   record.magic = htonl(MSC_SEGMENT_MAGIC);
+   record.reserved = htonl(MSC_SEGMENT_FAILED | state->failed_phase << 16);
+   record.offset = host_to_network_64(state->failed_offset);
+   record.length = host_to_network_64((uint64_t)state->failed_errno);
+   if (sendall(state->sockets[0], &record, sizeof(record)) != 0)
+      return;
+   deadline = receiver_now_ns() + UINT64_C(1000000000);
+   while (ioctl(state->sockets[0], SIOCOUTQ, &unsent) == 0 && unsent > 0 &&
+          receiver_now_ns() < deadline)
+   {
+      struct timespec pause = { 0, 5 * 1000 * 1000 };
+      nanosleep(&pause, NULL);
+   }
+}
+
+/* After a failure during the data, tell the sender at once (FAILED, if the
+ * destination failed) and close the streams, before any slow work such as a
+ * checkpoint update: a sender blocked on a full window would otherwise reach
+ * its stall timeout first. No FLUSHING record may go out ahead of FAILED, so
+ * the finish beat never starts after such a failure. */
+static void abandon_streams(struct receiver_state *state)
+{
+   int i;
+   send_failed(state);
+   for (i = 0; i < state->numstreams; i++)
+      close(state->sockets[i]);
+   state->streams_closed = 1;
+}
+
 /* From the end of the data until the ACK -- unmapping, flushing and, for a
  * checkpointed transfer, publishing -- tell a sender that accepts it that this
  * receiver is alive. The sender bounds the whole finish itself
@@ -581,7 +655,7 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    struct msc_beat beat;
    int lc;
    int created = 0;
-   int beating;
+   int beating = 0;   /* the finish beat runs from data end to the ACK */
 
    bzero(&state, sizeof(state));
    state.outputfd = fileno(outfile);
@@ -612,7 +686,10 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    }
    for (lc = 0; lc < created; lc++)
       pthread_join(threads[lc], NULL);
-   beating = finish_beat_start(&state, &beat);
+   if (state.error)
+      abandon_streams(&state);
+   else
+      beating = finish_beat_start(&state, &beat);
    destination_map_teardown(&state);
    /* A success ACK means every worker finished and the bytes reached the
     * backing file, not merely the stdio/kernel page cache. */
@@ -620,7 +697,11 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    {
       uint64_t started = receiver_now_ns();
       if (fsync(state.outputfd) != 0)
-      { perror("MSC segmented receiver fsync"); state.error = 1; }
+      {
+         int error = errno;
+         fprintf(stderr, "MSC segmented receiver fsync: %s\n", strerror(error));
+         note_failure(&state, MSC_FAILED_FLUSH, UINT64_MAX, error);
+      }
       state.flush_ns = receiver_now_ns() - started;
    }
    if (beating)
@@ -638,16 +719,29 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
       if (sendall(newsockfds[0], &ack, sizeof(ack)) != 0)
          state.error = 1;
    }
-   for (lc = 0; lc < numstreams; lc++)
-      close(newsockfds[lc]);
+   else
+      send_failed(&state);
+   if (!state.streams_closed)
+      for (lc = 0; lc < numstreams; lc++)
+         close(newsockfds[lc]);
    pthread_mutex_destroy(&state.error_lock);
    free(workers);
    free(threads);
    if (state.error)
    {
       fprintf(stderr, "MSC segmented receiver failed\n");
-      exit(MSC_EXIT_NETWORK);
+      exit(state.failed_phase != 0 ? MSC_EXIT_DESTINATION : MSC_EXIT_NETWORK);
    }
+}
+
+/* A publication step failed: say which, and record it for the sender. */
+static void publish_failed(struct receiver_state *state, const char *format,
+                           const char *path)
+{
+   int error = errno;
+   fprintf(stderr, format, path, strerror(error));
+   note_failure(state, MSC_FAILED_PUBLISH, UINT64_MAX, error);
+   pthread_mutex_destroy(&state->error_lock);
 }
 
 static char *resume_temp_path(const char *destination)
@@ -877,8 +971,13 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
    }
    for (i = 0; i < (uint32_t)created; i++) pthread_join(threads[i], NULL);
    /* The checkpoint update below syncs the data, then publication follows:
-    * all of it before the ACK, with the sender told the receiver is alive. */
-   beating = finish_beat_start(&state, &beat);
+    * all of it before the ACK, with the sender told the receiver is alive.
+    * After a failure, the sender is told first and the update keeps what
+    * arrived. */
+   if (state.error)
+      abandon_streams(&state);
+   else
+      beating = finish_beat_start(&state, &beat);
    pthread_mutex_lock(&state.error_lock);
    if (persist_receiver_checkpoint(&state) != 0) state.error = 1;
    pthread_mutex_unlock(&state.error_lock);
@@ -903,13 +1002,13 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
    }
    if ((AD->force ? rename(temp_path, AD->destfile) :
         (link(temp_path, AD->destfile) == 0 && unlink(temp_path) == 0 ? 0 : -1)) != 0)
-   { fprintf(stderr, "MSC could not atomically publish %s: %s\n", AD->destfile, strerror(errno)); pthread_mutex_destroy(&state.error_lock); goto cleanup; }
+   { publish_failed(&state, "MSC could not atomically publish %s: %s\n", AD->destfile); goto cleanup; }
    if (msc_fsync_parent(AD->destfile) != 0)
-   { fprintf(stderr, "MSC could not make publication of %s durable: %s\n", AD->destfile, strerror(errno)); pthread_mutex_destroy(&state.error_lock); goto cleanup; }
+   { publish_failed(&state, "MSC could not make publication of %s durable: %s\n", AD->destfile); goto cleanup; }
    if (!AD->keep_checkpoint &&
        (unlink(AD->checkpoint_path) != 0 ||
         msc_fsync_parent(AD->checkpoint_path) != 0))
-   { fprintf(stderr, "MSC published data but could not remove checkpoint %s: %s\n", AD->checkpoint_path, strerror(errno)); pthread_mutex_destroy(&state.error_lock); goto cleanup; }
+   { publish_failed(&state, "MSC published data but could not remove checkpoint %s: %s\n", AD->checkpoint_path); goto cleanup; }
    if (beating)
    {
       msc_beat_stop(&beat);
@@ -935,7 +1034,13 @@ reject:
 cleanup:
    if (beating)
       msc_beat_stop(&beat);
-   for (i = 0; i < (uint32_t)numstreams; i++) close(newsockfds[i]);
+   if (status != 0 && state.failed_phase != 0)
+   {
+      send_failed(&state);
+      exit_code = MSC_EXIT_DESTINATION;
+   }
+   if (!state.streams_closed)
+      for (i = 0; i < (uint32_t)numstreams; i++) close(newsockfds[i]);
    if (fd >= 0) close(fd);
    free(workers); free(threads); free(source_path); free(temp_path);
    msc_checkpoint_destroy(&checkpoint);

@@ -134,6 +134,13 @@ checkpointed receiver that finds its sender gone does not publish: it keeps the
 partial file and the checkpoint, and rerunning with `--resume` once the
 destination responds finishes the transfer.
 
+A TCP single-file destination that fails outright (a write, the flush, a
+checkpoint update or publication fails, for example with ENOSPC, EDQUOT or EIO)
+is reported to the sender, which names the failure and exits 4, so `--retries`
+does not resend data the destination cannot take. A checkpointed transfer that
+fails before publication keeps its partial file and checkpoint, and `--resume`
+finishes it once the destination is fixed.
+
 Only network/transport exit 6 is retried. `--retries` controls bounded retries
 with backoff. Checkpointed transfers also enable reconnect probing by default
 every 10 s after retries are exhausted; `--reconnect-interval 0` disables that

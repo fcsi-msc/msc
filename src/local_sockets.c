@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -30,6 +31,7 @@ struct sender_state
    off_t next_offset;          /* shared cursor, claimed via __atomic_fetch_add */
    pthread_mutex_t error_lock;
    int error;
+   int peer_closed;            /* the first error: the receiver closed a stream */
    struct msc_checkpoint *checkpoint;
    volatile uint64_t current_bytes;
    volatile uint64_t read_ns;
@@ -285,11 +287,25 @@ static void set_sender_error(struct sender_state *state)
    pthread_mutex_lock(&state->error_lock);
    if (!state->error)
    {
+      /* Stream 0 stays open for receiving: a record arriving after its
+       * receiving side is shut would reset the stream instead, and the
+       * receiver's FAILED record, sent as it closes, would be lost. */
       state->error = 1;
       for (i = 0; i < state->numstreams; i++)
-         shutdown(state->sockets[i], SHUT_RDWR);
+         shutdown(state->sockets[i], i == 0 ? SHUT_WR : SHUT_RDWR);
    }
    pthread_mutex_unlock(&state->error_lock);
+}
+
+/* A send failed with errno error. If it is the first failure and the
+ * receiver closed the stream, the receiver may have said why on stream 0. */
+static void set_sender_send_error(struct sender_state *state, int error)
+{
+   pthread_mutex_lock(&state->error_lock);
+   if (!state->error && (error == EPIPE || error == ECONNRESET))
+      state->peer_closed = 1;
+   pthread_mutex_unlock(&state->error_lock);
+   set_sender_error(state);
 }
 
 static int sender_has_error(struct sender_state *state)
@@ -312,8 +328,14 @@ static int send_iov_all(int fd, struct iovec *iov, int iovcnt)
          continue;
       if (written <= 0)
       {
-         if (written < 0)
-            fprintf(stderr, "MSC socket writev failed: %s\n", strerror(errno));
+         /* A receiver that closed its streams is reported once, by the
+          * caller, with its reason when it sent one. */
+         if (written < 0 && errno != EPIPE && errno != ECONNRESET)
+         {
+            int error = errno;
+            fprintf(stderr, "MSC socket writev failed: %s\n", strerror(error));
+            errno = error;
+         }
          return -1;
       }
 
@@ -338,6 +360,60 @@ static int segment_is_beat(const void *record)
    const struct segment_header *h = record;
    return ntohl(h->magic) == MSC_SEGMENT_MAGIC &&
           (ntohl(h->reserved) & 0xffU) == MSC_SEGMENT_FLUSHING;
+}
+
+static int segment_is_failed(const struct segment_header *h)
+{
+   return ntohl(h->magic) == MSC_SEGMENT_MAGIC &&
+          (ntohl(h->reserved) & 0xffU) == MSC_SEGMENT_FAILED;
+}
+
+/* The receiver closed its streams after a failure. It sends its FAILED record
+ * on stream 0 and waits for it to arrive before closing, so the record, if
+ * any, is already here; poll briefly in case. */
+static int read_failed_record(int socketfd, struct segment_header *record)
+{
+   struct pollfd p;
+   size_t got = 0;
+   p.fd = socketfd;
+   p.events = POLLIN;
+   if (poll(&p, 1, 1000) <= 0)
+      return 0;
+   while (got < sizeof(*record))
+   {
+      ssize_t n = recv(socketfd, (char *)record + got, sizeof(*record) - got,
+                       MSG_DONTWAIT);
+      if (n < 0 && errno == EINTR)
+         continue;
+      if (n <= 0)
+         return 0;
+      got += (size_t)n;
+   }
+   return segment_is_failed(record);
+}
+
+/* Name the receiver's destination failure. A checkpointed transfer keeps its
+ * partial file and checkpoint unless publication had begun. */
+static void report_failed(const struct segment_header *record, int checkpointed)
+{
+   static const char *const doing[] = {
+      "finishing", "writing", "flushing", "updating the checkpoint", "publishing"
+   };
+   uint32_t phase = (ntohl(record->reserved) >> 16) & 0xffU;
+   uint64_t offset = network_to_host_64(record->offset);
+   int error = (int)network_to_host_64(record->length);
+   const char *cause = error == EFAULT ? "the kernel could not allocate its pages"
+                                       : strerror(error);
+   const char *what = phase < sizeof(doing) / sizeof(doing[0]) ? doing[phase] : doing[0];
+
+   if (offset != UINT64_MAX)
+      fprintf(stderr, "MSC the destination failed while %s at byte %llu: %s\n",
+              what, (unsigned long long)offset, cause);
+   else
+      fprintf(stderr, "MSC the destination failed while %s: %s\n", what, cause);
+   if (checkpointed && phase != MSC_FAILED_PUBLISH)
+      fprintf(stderr, "MSC kept the checkpoint; rerun with --resume to finish "
+                      "once the destination is fixed\n");
 }
 
 static void *segment_sender_thread(void *arg)
@@ -392,7 +468,7 @@ static void *segment_sender_thread(void *arg)
          uint64_t started = socket_now_ns();
          if (send_iov_all(worker->socketfd, iov, 2) != 0)
          {
-            set_sender_error(state);
+            set_sender_send_error(state, errno);
             break;
          }
          __atomic_fetch_add(&state->send_ns, socket_now_ns() - started, __ATOMIC_RELAXED);
@@ -569,6 +645,18 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
    for (lc = 0; lc < created; lc++)
       AD->childinfo->xfercount += workers[lc].bytes_sent;
 
+   if (state.error && state.peer_closed)
+   {
+      struct segment_header failed;
+      if (read_failed_record(sockfd[0], &failed))
+      {
+         finish_code = MSC_EXIT_DESTINATION;
+         report_failed(&failed, have_checkpoint);
+      }
+      else
+         fprintf(stderr, "MSC socket send failed: the receiver closed the connection\n");
+   }
+
    if (!state.error)
    {
       struct segment_header ack;
@@ -577,7 +665,13 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
       finish_code = msc_await_final_record(sockfd[0], &ack, sizeof(ack), segment_is_beat,
                                            AD->stall_timeout_ms, AD->flush_timeout_ms,
                                            (uint64_t)state.transfer_length, have_checkpoint);
-      if (finish_code != 0)
+      if (finish_code == 0 && segment_is_failed(&ack))
+      {
+         state.error = 1;
+         finish_code = MSC_EXIT_DESTINATION;
+         report_failed(&ack, have_checkpoint);
+      }
+      else if (finish_code != 0)
       {
          state.error = 1;
          if (finish_code == MSC_EXIT_DESTINATION && have_checkpoint)

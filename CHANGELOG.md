@@ -41,6 +41,13 @@ Notable user-facing changes are recorded here.
 
 ### Fixed
 
+- A TCP single-file transfer whose destination fails, for example with a full
+  filesystem, an exceeded quota or a failed flush, now exits 4 (destination)
+  with the sender naming the failure, such as "the destination failed while
+  writing at byte N: No space left on device". It used to exit 6 (network)
+  with "socket closed during record", so `--retries` resent data the
+  destination could not take. A checkpointed transfer keeps its checkpoint for
+  `--resume`. Peers from before this change behave as before.
 - msc's peer launcher (ssh, or a substitute such as srun) no longer outlives
   msc. When a transfer failed, msc exited without stopping its launcher, which
   then held msc's output open until the remote peer exited. If the peer was
