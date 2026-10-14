@@ -50,6 +50,7 @@
 #include <sys/types.h>
 #include <sys/vfs.h>
 #include <time.h>
+#include <stdarg.h>
 #include <unistd.h>
 
 /* UDP GSO (UDP_SEGMENT): one sendmsg of many contiguous packets that the kernel
@@ -1106,6 +1107,34 @@ static void phase_transfer_end(struct msc_udp_phases *p)
    p->transfers++;
 }
 
+/* One stderr line in one write. glibc writes to the unbuffered stderr in
+ * pieces of 128 bytes, so a longer line from the sender and one from the
+ * receiver sharing stderr (a peer on this host, a test harness) interleaved
+ * mid-line; a single write of up to PIPE_BUF bytes to a pipe is never split. */
+static void report_line(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void report_line(const char *format, ...)
+{
+   char line[4096];
+   va_list ap;
+   size_t length, done = 0;
+   int n;
+   va_start(ap, format);
+   n = vsnprintf(line, sizeof(line), format, ap);
+   va_end(ap);
+   if (n < 0)
+      return;
+   length = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
+   while (done < length)
+   {
+      ssize_t w = write(STDERR_FILENO, line + done, length - done);
+      if (w < 0 && errno == EINTR)
+         continue;
+      if (w <= 0)
+         break;
+      done += (size_t)w;
+   }
+}
+
 static void phase_report(const struct msc_udp_phases *p, const char *side)
 {
    static const char *const names[PH_COUNT] = {
@@ -1122,8 +1151,8 @@ static void phase_report(const struct msc_udp_phases *p, const char *side)
       used += (size_t)snprintf(line + used, sizeof(line) - used, " %s %.3fs",
                                names[i], (double)p->ns[i] / 1e9);
    }
-   fprintf(stderr, "%s total %.3fs transfers %llu\n", line, (double)total / 1e9,
-           (unsigned long long)p->transfers);
+   report_line("%s total %.3fs transfers %llu\n", line, (double)total / 1e9,
+               (unsigned long long)p->transfers);
 }
 
 /* flows on socket k under f -> f % K: k, k+K, k+2K, ... */
@@ -1987,7 +2016,7 @@ static void set_shared_bufs(int fd, int share, const char *side)
    rcv = set_buf_size(fd, SO_RCVBUF, rcv_target);
    snd = set_buf_size(fd, SO_SNDBUF, (int)agg);
    if (g_stats)
-      fprintf(stderr, "MSC UDP %s: shared socket SO_RCVBUF %dKiB "
+      report_line("MSC UDP %s: shared socket SO_RCVBUF %dKiB "
               "SO_SNDBUF %dKiB (aggregate target %lldKiB for %d flows)\n",
               side, rcv / 1024, snd / 1024, (long long)(agg / 1024), share);
 }
@@ -2172,14 +2201,14 @@ fail:
 static void report_data_ports(const char *side, const char *host,
                               const unsigned int *ports, int n, int flow_count)
 {
-   char list[MSC_UDP_PORT_TEXTLEN];
+   char list[MSC_UDP_PORT_TEXTLEN], sockets[48] = "";
    msc_port_spec_format(ports, n, list, sizeof(list));
-   fprintf(stderr, "MSC UDP %s: %d data port%s%s%s: %s (%d flow%s", side, n,
-           n == 1 ? "" : "s", host != NULL ? " on " : "",
-           host != NULL ? host : "", list, flow_count, flow_count == 1 ? "" : "s");
    if (n < flow_count)
-      fprintf(stderr, ", flow f -> socket f mod %d", n);
-   fprintf(stderr, ")\n");
+      snprintf(sockets, sizeof(sockets), ", flow f -> socket f mod %d", n);
+   report_line("MSC UDP %s: %d data port%s%s%s: %s (%d flow%s%s)\n", side, n,
+               n == 1 ? "" : "s", host != NULL ? " on " : "",
+               host != NULL ? host : "", list, flow_count, flow_count == 1 ? "" : "s",
+               sockets);
 }
 
 /* sender: create N udp sockets, connect each to the receiver's matching port */
@@ -2248,7 +2277,7 @@ static void sockset_build(struct msc_udp_sockset *ss, int flow_count, int nports
       ss->receive_demux_of[f] = ss->receive_demux[f % nports];
    }
    if (g_stats && nports != flow_count)
-      fprintf(stderr, "MSC UDP %s: %d flows over %d data socket%s "
+      report_line("MSC UDP %s: %d flows over %d data socket%s "
               "(flow f -> socket f %% %d)\n", side, flow_count, nports,
               nports == 1 ? "" : "s", nports);
 }
@@ -4950,7 +4979,7 @@ static void *sender_flow_worker(void *arg)
    }
 
    if (g_stats)
-      fprintf(stderr, "MSC UDP sender flow %d: units %llu tx %llu retransmitted %llu "
+      report_line("MSC UDP sender flow %d: units %llu tx %llu retransmitted %llu "
               "rtxrto %llu rtxsack %llu rtxdupack %llu spurious %llu undo %llu "
               "acknowledgments %llu cwnd %.0f srtt %.0fus rto %lluus reorder %.1fms "
               "cc %s wmax %.0f "
@@ -4974,7 +5003,7 @@ static void *sender_flow_worker(void *arg)
    {
       static const char *const state_names[] =
          { "startup", "drain", "probe_bw", "probe_rtt" };
-      fprintf(stderr, "MSC UDP sender flow %d: rate btlbw %.3f Gbit/s "
+      report_line("MSC UDP sender flow %d: rate btlbw %.3f Gbit/s "
               "minrtt %.3fms bdp %.0f inflhi %.0f state %s filled %d "
               "restarts %llu samples %llu applimited %d\n",
               g->flow_id,
@@ -5759,7 +5788,7 @@ out:
                       (unsigned long long)cf->adv_rwnd,
                       (unsigned long long)cf->ce_units);
    if (g_stats)
-      fprintf(stderr, "MSC UDP receiver flow %d: units %llu rx %llu dup %llu "
+      report_line("MSC UDP receiver flow %d: units %llu rx %llu dup %llu "
               "acknowledgments %llu gro_slots %llu gro_segs %llu writes %llu avgwrite %lluB "
               "rwnd %llu wstall %lluus ce %llu rcvbuf %dKiB%s grows %llu "
               "clampdrops %llu\n",
@@ -7567,6 +7596,7 @@ static int receiver_recv_file(void *session, struct msc_udp_config *cfg)
        msc_udp_checksum_fd(destfd, cfg->dst_offset, x.total_bytes, &sum) != 0)
    {
       fprintf(stderr, "MSC UDP receiver: failed checksumming destination\n");
+      error_code = MSC_EXIT_DESTINATION;   /* reported as ERROR in place of DONE */
       rc = -1;
       goto out;
    }
