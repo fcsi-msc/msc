@@ -42,7 +42,8 @@ If the destination fails instead (a write, the flush, a checkpoint update or
 publication), the receiver sends a `FAILED` record on stream 0 in place of the
 acknowledgement, giving the phase, the byte offset where one applies, and the
 errno. During the data, it stops its workers, sends the record, waits up to 1 s
-for the sender's end to acknowledge it, and only then closes its streams; a
+for the sender's end to acknowledge it, and only then closes its streams, all
+before any checkpoint update and without starting the `FLUSHING` records; a
 stream closed with data unread is reset, but a record already acknowledged
 stays readable ahead of the reset. The sender reads it once a send fails
 because the receiver closed, and exits 4 naming the failure. A sender marks its

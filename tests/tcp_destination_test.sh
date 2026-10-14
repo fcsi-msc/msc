@@ -165,6 +165,34 @@ if unshare -Urm true 2>/dev/null; then
          exit 1
       fi
       echo "ok: a checkpointed transfer to a full filesystem exits 4, keeps its checkpoint, and --resume finishes"
+      # Far more than the socket buffers hold, so the sender is still sending
+      # when the destination fills, and the checkpoint update that follows
+      # outlasts the stall timeout: the sender must hear FAILED first, not
+      # stall into a reconnect.
+      head -c 268435456 /dev/urandom > "$work/big"
+      rc=0
+      start=$(date +%s)
+      timeout 120 unshare -Urm sh -c '
+         mount -t tmpfs -o size=8m msc-full "$1/full" || exit 99
+         head -c 6291456 /dev/zero > "$1/full/filler"
+         env LD_PRELOAD="$3" MSC_TEST_FSYNC_DELAY_MS=3000 \
+            MSC_TEST_FSYNC_DELAY_MIN_BYTES=1048576 \
+            "$2" -T -n 4 --stall-timeout 1s --checkpoint "$1/big.ckpt" \
+            -l localhost -r localhost -B "$2" -i "$1/big" -o "$1/full/out"' \
+         sh "$work" "$MSC" "$(dirname "$MSC")/build/fsync_fault_shim.so" \
+         >/dev/null 2>"$work/log" || rc=$?
+      elapsed=$(( $(date +%s) - start ))
+      if [ "$rc" -ne 4 ] || [ "$elapsed" -ge 10 ] || grep -q "msc reconnect" "$work/log"; then
+         echo "FAIL: a large checkpointed transfer to a full filesystem exited $rc after ${elapsed}s"
+         sed -n '1,10p' "$work/log"
+         exit 1
+      fi
+      waited=0
+      while pgrep -f "$work/full/out" >/dev/null 2>&1 && [ "$waited" -lt 100 ]; do
+         sleep 0.1
+         waited=$((waited + 1))
+      done
+      echo "ok: a large checkpointed transfer to a full filesystem exits 4 before its checkpoint update (${elapsed}s)"
    fi
 else
    echo "skip: unprivileged user namespaces are unavailable; full-filesystem case not run"

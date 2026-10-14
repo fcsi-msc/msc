@@ -90,6 +90,7 @@ struct receiver_state
    uint32_t failed_phase;      /* MSC_FAILED_*; 0 = none */
    uint64_t failed_offset;     /* UINT64_MAX when no byte applies */
    int failed_errno;
+   int streams_closed;         /* abandon_streams() has run */
    /* A fresh regular single-file destination is received straight into
     * shared mappings of the file, so the workers do not take turns on the
     * inode's write lock as they do with pwrite. Region i maps the file from
@@ -477,7 +478,7 @@ static void send_failed(struct receiver_state *state)
    uint64_t deadline;
    int unsent;
 
-   if (!state->peer_flush_aware || state->failed_phase == 0)
+   if (!state->peer_flush_aware || state->failed_phase == 0 || state->streams_closed)
       return;
    memset(&record, 0, sizeof(record));
    record.magic = htonl(MSC_SEGMENT_MAGIC);
@@ -493,6 +494,20 @@ static void send_failed(struct receiver_state *state)
       struct timespec pause = { 0, 5 * 1000 * 1000 };
       nanosleep(&pause, NULL);
    }
+}
+
+/* After a failure during the data, tell the sender at once (FAILED, if the
+ * destination failed) and close the streams, before any slow work such as a
+ * checkpoint update: a sender blocked on a full window would otherwise reach
+ * its stall timeout first. No FLUSHING record may go out ahead of FAILED, so
+ * the finish beat never starts after such a failure. */
+static void abandon_streams(struct receiver_state *state)
+{
+   int i;
+   send_failed(state);
+   for (i = 0; i < state->numstreams; i++)
+      close(state->sockets[i]);
+   state->streams_closed = 1;
 }
 
 /* From the end of the data until the ACK -- unmapping, flushing and, for a
@@ -640,7 +655,7 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    struct msc_beat beat;
    int lc;
    int created = 0;
-   int beating;
+   int beating = 0;   /* the finish beat runs from data end to the ACK */
 
    bzero(&state, sizeof(state));
    state.outputfd = fileno(outfile);
@@ -671,7 +686,10 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    }
    for (lc = 0; lc < created; lc++)
       pthread_join(threads[lc], NULL);
-   beating = finish_beat_start(&state, &beat);
+   if (state.error)
+      abandon_streams(&state);
+   else
+      beating = finish_beat_start(&state, &beat);
    destination_map_teardown(&state);
    /* A success ACK means every worker finished and the bytes reached the
     * backing file, not merely the stdio/kernel page cache. */
@@ -703,8 +721,9 @@ void readsocket_segmented(int numstreams, int newsockfds[], FILE *outfile,
    }
    else
       send_failed(&state);
-   for (lc = 0; lc < numstreams; lc++)
-      close(newsockfds[lc]);
+   if (!state.streams_closed)
+      for (lc = 0; lc < numstreams; lc++)
+         close(newsockfds[lc]);
    pthread_mutex_destroy(&state.error_lock);
    free(workers);
    free(threads);
@@ -952,8 +971,13 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
    }
    for (i = 0; i < (uint32_t)created; i++) pthread_join(threads[i], NULL);
    /* The checkpoint update below syncs the data, then publication follows:
-    * all of it before the ACK, with the sender told the receiver is alive. */
-   beating = finish_beat_start(&state, &beat);
+    * all of it before the ACK, with the sender told the receiver is alive.
+    * After a failure, the sender is told first and the update keeps what
+    * arrived. */
+   if (state.error)
+      abandon_streams(&state);
+   else
+      beating = finish_beat_start(&state, &beat);
    pthread_mutex_lock(&state.error_lock);
    if (persist_receiver_checkpoint(&state) != 0) state.error = 1;
    pthread_mutex_unlock(&state.error_lock);
@@ -1015,7 +1039,8 @@ cleanup:
       send_failed(&state);
       exit_code = MSC_EXIT_DESTINATION;
    }
-   for (i = 0; i < (uint32_t)numstreams; i++) close(newsockfds[i]);
+   if (!state.streams_closed)
+      for (i = 0; i < (uint32_t)numstreams; i++) close(newsockfds[i]);
    if (fd >= 0) close(fd);
    free(workers); free(threads); free(source_path); free(temp_path);
    msc_checkpoint_destroy(&checkpoint);

@@ -328,7 +328,9 @@ static int send_iov_all(int fd, struct iovec *iov, int iovcnt)
          continue;
       if (written <= 0)
       {
-         if (written < 0)
+         /* A receiver that closed its streams is reported once, by the
+          * caller, with its reason when it sent one. */
+         if (written < 0 && errno != EPIPE && errno != ECONNRESET)
          {
             int error = errno;
             fprintf(stderr, "MSC socket writev failed: %s\n", strerror(error));
@@ -651,6 +653,8 @@ void xferdata_segmented(FILE *in, struct argdata *AD)
          finish_code = MSC_EXIT_DESTINATION;
          report_failed(&failed, have_checkpoint);
       }
+      else
+         fprintf(stderr, "MSC socket send failed: the receiver closed the connection\n");
    }
 
    if (!state.error)
