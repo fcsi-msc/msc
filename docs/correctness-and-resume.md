@@ -122,10 +122,12 @@ session to choose a different payload size or path MTU.
 
 SIGINT and SIGTERM retain exit statuses 130 and 143. The default no-progress
 timeout is 30 s; `--stall-timeout 0` disables it. It is a liveness bound, not a
-limit on total transfer duration. A TCP single-file receiver flushes the
+limit on total transfer duration. A single-file receiver flushes the
 destination before acknowledging it and tells the sender meanwhile that it is
 alive, so a flush longer than the stall timeout does not fail a transfer whose
-data has arrived. `--flush-timeout` (default 30 minutes; 0 waits indefinitely)
+data has arrived. Over UDP (when both ends support it) this also covers the
+checksum, each checkpointed chunk's check and checkpoint update, and
+publication, which the receiver confirms before the session closes. `--flush-timeout` (default 30 minutes; 0 waits indefinitely)
 bounds that wait instead, extended to 1 s per 2 MiB transferred for large
 transfers. Once the wait passes one stall timeout, the sender says so once,
 with the limit. A destination that never confirms its data within it fails the
