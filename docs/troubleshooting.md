@@ -115,7 +115,7 @@ settings when the data transfer runs on TCP.
 | 0 | Success |
 | 2 | Command-line/configuration error |
 | 3 | Source error |
-| 4 | Destination error, including a destination that did not confirm delivered data was durable within `--flush-timeout` |
+| 4 | Destination error, such as a full filesystem, an exceeded quota or a failed flush, named by the sender; also a destination that did not confirm delivered data was durable within `--flush-timeout` |
 | 5 | Authentication or remote-launch error |
 | 6 | Network/transport error; eligible for retry |
 | 7 | Integrity failure |

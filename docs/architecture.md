@@ -37,10 +37,17 @@ sends a `FLUSHING` record on stream 0 every quarter of the stall timeout
 (within 100 ms to 5 s). It says only that the receiver is alive: a flush to a
 network filesystem shows no progress while it runs. The sender skips these
 records while it waits, requires one within each stall timeout, and bounds the
-whole wait at the larger of `--flush-timeout` and 1 s per 2 MiB transferred. A
-sender marks its segment headers to say it accepts the records; a receiver
-sends none to a sender that does not, so mixed versions keep the earlier
-behavior.
+whole wait at the larger of `--flush-timeout` and 1 s per 2 MiB transferred.
+If the destination fails instead (a write, the flush, a checkpoint update or
+publication), the receiver sends a `FAILED` record on stream 0 in place of the
+acknowledgement, giving the phase, the byte offset where one applies, and the
+errno. During the data, it stops its workers, sends the record, waits up to 1 s
+for the sender's end to acknowledge it, and only then closes its streams; a
+stream closed with data unread is reset, but a record already acknowledged
+stays readable ahead of the reset. The sender reads it once a send fails
+because the receiver closed, and exits 4 naming the failure. A sender marks its
+segment headers to say it accepts both records; a receiver sends neither to a
+sender that does not, so mixed versions keep the earlier behavior.
 
 The stdin/remote-command path uses streaming behavior suited to pipes. It does
 not have the same random-access and checkpoint guarantees as a regular file.
