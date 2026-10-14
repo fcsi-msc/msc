@@ -83,8 +83,8 @@ grep -q '^MSC TCP receiver write-path: pwrite$' "$work/log" \
    || { echo "FAIL: an offset transfer changed the bytes around it"; exit 1; }
 echo "ok: a destination offset keeps pwrite and the bytes before it"
 
-# A file-size limit stops either write path partway; the receiver must say
-# where and why rather than only that the transfer failed.
+# A file-size limit stops either write path partway; the transfer must fail
+# as the destination's (exit 4) and the sender must say where and why.
 python3 - "$MSC" "$work" <<'PY'
 import os
 import resource
@@ -104,35 +104,68 @@ for name, assign in (("mapped", {}), ("pwrite", {"MSC_TCP_NO_MMAP": "1"})):
                              "-i", work + "/src", "-o", work + "/limited"],
                             env=dict(os.environ, **assign), preexec_fn=limit,
                             capture_output=True, text=True, timeout=120)
-    assert result.returncode != 0, name + " transfer passed a file-size limit"
-    assert "MSC could not write the destination at byte" in result.stderr and \
+    assert result.returncode == 4, \
+        "%s transfer past a file-size limit exited %d" % (name, result.returncode)
+    assert "MSC the destination failed while writing at byte" in result.stderr and \
         "File too large" in result.stderr, result.stderr
     print("ok: the " + name + " path names a file-size limit")
 PY
 
 # A real full filesystem: the mapped path receives into pages the kernel cannot
 # allocate, and must report the filesystem's reason instead of dying of SIGBUS.
+# The receiver tells the sender in a FAILED record, then closes its streams,
+# resetting them; the runs repeat so the record is seen to arrive every time.
 mkdir "$work/full"
 if unshare -Urm true 2>/dev/null; then
+   full=yes
    for assign in "" MSC_TCP_NO_MMAP=1; do
+      run=0
+      while [ "$run" -lt 10 ]; do
+         run=$((run + 1))
+         rc=0
+         timeout 120 unshare -Urm sh -c '
+            mount -t tmpfs -o size=1m msc-full "$1/full" || exit 99
+            env ${3:+"$3"} "$2" -T --stats -n 4 -l localhost -r localhost -B "$2" \
+               -i "$1/src" -o "$1/full/out"' sh "$work" "$MSC" "$assign" \
+            >/dev/null 2>"$work/log" || rc=$?
+         if [ "$rc" -eq 99 ]; then
+            echo "skip: tmpfs cannot be mounted in a user namespace here"
+            full=no
+            break 2
+         fi
+         if [ "$rc" -ne 4 ] ||
+            ! grep -q 'MSC could not write the destination at byte .*: No space left on device' "$work/log" ||
+            ! grep -q 'MSC the destination failed while writing at byte .*: No space left on device' "$work/log"; then
+            echo "FAIL: a full filesystem (${assign:-mapped}, run $run) exited $rc without the sender naming ENOSPC"
+            sed -n '1,8p' "$work/log"
+            exit 1
+         fi
+      done
+      echo "ok: a full filesystem exits 4 with ENOSPC named by the sender, 10 of 10 (${assign:-mapped})"
+   done
+   # Checkpointed: the partial file and checkpoint stay, and --resume finishes
+   # once there is room.
+   if [ "$full" = yes ]; then
       rc=0
       timeout 120 unshare -Urm sh -c '
-         mount -t tmpfs -o size=1m msc-full "$1/full" || exit 99
-         env ${3:+"$3"} "$2" -T --stats -n 4 -l localhost -r localhost -B "$2" \
-            -i "$1/src" -o "$1/full/out"' sh "$work" "$MSC" "$assign" \
-         >/dev/null 2>"$work/log" || rc=$?
-      if [ "$rc" -eq 99 ]; then
-         echo "skip: tmpfs cannot be mounted in a user namespace here"
-         break
-      fi
-      if [ "$rc" -eq 0 ] || [ "$rc" -gt 128 ] ||
-         ! grep -q 'MSC could not write the destination at byte .*: No space left on device' "$work/log"; then
-         echo "FAIL: a full filesystem (${assign:-mapped}) exited $rc without naming ENOSPC"
-         sed -n '1,8p' "$work/log"
+         mount -t tmpfs -o size=8m msc-full "$1/full" || exit 99
+         head -c 6291456 /dev/zero > "$1/full/filler"
+         "$2" -T -n 4 --checkpoint "$1/full.ckpt" -l localhost -r localhost -B "$2" \
+            -i "$1/src" -o "$1/full/out" 2>"$1/log" && first=0 || first=$?
+         [ "$first" -eq 4 ] || exit 90
+         grep -q "rerun with --resume" "$1/log" || exit 91
+         test -e "$1/full/out.msc-part" && test -e "$1/full.ckpt" || exit 92
+         : > "$1/full/filler"
+         "$2" -T -n 4 --resume --checkpoint "$1/full.ckpt" -l localhost -r localhost \
+            -B "$2" -i "$1/src" -o "$1/full/out" 2>>"$1/log" || exit 93
+         cmp -s "$1/src" "$1/full/out" || exit 94' sh "$work" "$MSC" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+         echo "FAIL: a checkpointed transfer to a full filesystem (step $rc)"
+         sed -n '1,10p' "$work/log"
          exit 1
       fi
-      echo "ok: a full filesystem fails with ENOSPC named (${assign:-mapped})"
-   done
+      echo "ok: a checkpointed transfer to a full filesystem exits 4, keeps its checkpoint, and --resume finishes"
+   fi
 else
    echo "skip: unprivileged user namespaces are unavailable; full-filesystem case not run"
 fi
@@ -177,6 +210,12 @@ grep -q "did not confirm it was durable within" "$work/log" \
 flush "a 3 s fsync inside the size term" 0 "$work/twenty" "$MSC" "$MSC" --flush-timeout 1s -- \
    MSC_TEST_FSYNC_DELAY_MS=3000
 echo "ok: a slow flush completes; one past --flush-timeout and the size term fails with exit 4"
+
+# A flush that fails is the destination's failure: exit 4, named by the sender.
+flush "a failed fsync" 4 "$work/src" "$MSC" "$MSC" -- MSC_TEST_FAIL_FSYNC=files
+grep -q "MSC the destination failed while flushing: Input/output error" "$work/log" \
+   || { echo "FAIL: the sender did not name a failed fsync"; sed -n '1,5p' "$work/log"; exit 1; }
+echo "ok: a failed fsync exits 4 and the sender names it"
 
 # A checkpointed transfer flushes and publishes before its ACK.
 rm -f "$work/out" "$work/out.ckpt"
@@ -237,7 +276,12 @@ if git -C "$root" rev-parse -q --verify 'v1.1.0^{commit}' >/dev/null 2>&1 &&
       MSC_TEST_FSYNC_DELAY_MS=500
    flush "new sender, 1.1.0 receiver, long flush" 6 "$work/src" "$MSC" "$old/msc" -- \
       MSC_TEST_FSYNC_DELAY_MS=2500
-   echo "ok: 1.1.0 peers interoperate; an older receiver's long flush fails as before"
+   # Neither sends nor expects a FAILED record: a failed fsync exits 6 as before.
+   flush "new sender, 1.1.0 receiver, failed fsync" 6 "$work/src" "$MSC" "$old/msc" -- \
+      MSC_TEST_FAIL_FSYNC=files
+   flush "1.1.0 sender, new receiver, failed fsync" 6 "$work/src" "$old/msc" "$MSC" -- \
+      MSC_TEST_FAIL_FSYNC=files
+   echo "ok: 1.1.0 peers interoperate; with one, a long or failed flush fails as before"
 else
    echo "skip: cannot build v1.1.0 from a release tag here; mixed-version cases not run"
 fi

@@ -30,11 +30,20 @@
 
 #define MSC_SEGMENT_MAGIC 0x4d534331U
 #define MSC_SEGMENT_ACK 1U
-/* Receiver -> sender on stream 0 before the ACK: the destination is being
- * flushed and the flush is still advancing. Sent only to a sender whose
- * segment headers carry MSC_SEGMENT_FLUSH_AWARE. */
+/* Receiver -> sender on stream 0 before the ACK: the receiver is alive and
+ * still finishing the transfer. */
 #define MSC_SEGMENT_FLUSHING 2U
-#define MSC_SEGMENT_FLUSH_AWARE 0x100U   /* sender -> receiver header flag */
+/* Receiver -> sender on stream 0 in place of the ACK: the destination failed.
+ * Bits 16-23 of reserved give the phase (MSC_FAILED_*), offset the destination
+ * byte (UINT64_MAX when none applies), and length the errno. */
+#define MSC_SEGMENT_FAILED 3U
+#define MSC_FAILED_WRITE 1U
+#define MSC_FAILED_FLUSH 2U
+#define MSC_FAILED_CHECKPOINT 3U
+#define MSC_FAILED_PUBLISH 4U
+/* Sender -> receiver header flag: the sender accepts FLUSHING and FAILED
+ * records. A receiver sends neither to a sender without it. */
+#define MSC_SEGMENT_FLUSH_AWARE 0x100U
 #define MSC_RESUME_MAGIC 0x4d535252U
 #define MSC_RESUME_REPLY_MAGIC 0x4d535250U
 #define MSC_UDP_DURABLE_MAGIC 0x4d535544U
@@ -151,8 +160,10 @@ struct segment_header
    /* A zero length is the per-stream end marker.  For data records, offset is
     * relative to this transfer (destination offsets are applied separately).
     * Every field is sent in network byte order, including the 64-bit fields.
-    * On sender records, reserved carries flags; on the receiver's records its
-    * low byte is the type (MSC_SEGMENT_ACK or MSC_SEGMENT_FLUSHING). */
+    * reserved has one layout per direction. Sender records: flags
+    * (MSC_SEGMENT_FLUSH_AWARE, bit 8). Receiver records: bits 0-7 the type
+    * (MSC_SEGMENT_ACK, _FLUSHING or _FAILED); bits 8-31 the flush time in ms
+    * on an ACK; bits 16-23 the phase on a FAILED record. */
    uint32_t magic;
    uint32_t reserved;
    uint64_t offset;
