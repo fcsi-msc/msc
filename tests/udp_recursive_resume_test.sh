@@ -58,8 +58,9 @@ SRC=$ROOT/source
 make_tree "$SRC"
 TOTAL=$((300000 + 400000 + 2097152))
 
-# Fresh success removes the checkpoint. CHUNK falls in a file on the first
-# boundary, and the second chunk crosses from b into sparse.
+# Fresh success removes the checkpoint. Whatever order the source directory
+# lists the files in, no file ends on a chunk boundary, so chunks cross from
+# one file into the next.
 MSC_TEST_CHECKPOINT="$ROOT/fresh.cp" MSC_UDP_CHECKPOINT_BYTES=$CHUNK \
    ./build/udp_test "$SRC" "$ROOT/fresh" 4
 assert_tree "$SRC" "$ROOT/fresh"
@@ -77,12 +78,17 @@ MSC_TEST_CHECKPOINT="$ROOT/basic.cp" MSC_TEST_RESUME=1 \
 grep -q "udp transfer of $((TOTAL - CHUNK)) bytes complete" "$ROOT/basic.log"
 assert_tree "$SRC" "$ROOT/basic"
 
-# Claimed destination corruption is content-verified and permanent.
+# Claimed destination corruption is content-verified and permanent. Manifest
+# order is directory order, which depends on the filesystem, so corrupt the
+# start of every file with data: the first of them begins the durable prefix.
+# Random bytes, since sparse starts with a hole.
 expect_code 6 env MSC_TEST_CHECKPOINT="$ROOT/content.cp" \
    MSC_TEST_INTERRUPT_AFTER_CHECKPOINTS=1 MSC_UDP_CHECKPOINT_BYTES=$CHUNK \
    ./build/udp_test "$SRC" "$ROOT/content" 4
-dd if=/dev/zero of="$ROOT/content/a" bs=4096 count=1 \
-   conv=notrunc status=none
+for file in a sub/b sparse; do
+   dd if=/dev/urandom of="$ROOT/content/$file" bs=4096 count=1 \
+      conv=notrunc status=none
+done
 expect_code 7 env MSC_TEST_CHECKPOINT="$ROOT/content.cp" MSC_TEST_RESUME=1 \
    MSC_UDP_CHECKPOINT_BYTES=$CHUNK ./build/udp_test "$SRC" "$ROOT/content" 4
 
