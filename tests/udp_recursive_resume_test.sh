@@ -58,9 +58,8 @@ SRC=$ROOT/source
 make_tree "$SRC"
 TOTAL=$((300000 + 400000 + 2097152))
 
-# Fresh success removes the checkpoint. Whatever order the source directory
-# lists the files in, no file ends on a chunk boundary, so chunks cross from
-# one file into the next.
+# Fresh success removes the checkpoint. The tree spans several chunks, and in
+# any directory order some of them cross from one file into the next.
 MSC_TEST_CHECKPOINT="$ROOT/fresh.cp" MSC_UDP_CHECKPOINT_BYTES=$CHUNK \
    ./build/udp_test "$SRC" "$ROOT/fresh" 4
 assert_tree "$SRC" "$ROOT/fresh"
