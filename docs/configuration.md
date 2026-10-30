@@ -38,7 +38,7 @@ Run `msc -h` or `msc man` for offline help.
 | `--retries N` | Bounded retries for network failures; default zero. |
 | `--retry-delay D` | Initial retry delay; default 1 s, with backoff/jitter. |
 | `--stall-timeout D` | No-progress limit; default 30 s, zero disables. |
-| `--flush-timeout D` | After all data has arrived, how long the sender waits for the receiver to confirm the destination is durable: D or 1 s per 2 MiB transferred, whichever is longer. Default 30 min; zero waits indefinitely. Exceeding it exits 4. Single-file transfers, TCP and UDP (with a UDP peer of this version or later). |
+| `--flush-timeout D` | After all data has arrived, how long the sender waits for the receiver to confirm the destination is durable: D or 1 s per 2 MiB transferred, whichever is longer. Default 30 min; zero waits indefinitely. Exceeding it exits 4. Single-file transfers, TCP and UDP (with a UDP peer of this version or later), and recursive TCP transfers, which add 50 ms per tree entry to the size term. |
 | `--reconnect-interval D` | Checkpointed-transfer SSH reconnect interval; default 10 s, zero disables. |
 | `--progress=auto\|always\|never` | Progress on stderr; default auto. |
 | `--progress-interval D` | Progress cadence; default 1 s. |

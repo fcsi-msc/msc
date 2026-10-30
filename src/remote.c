@@ -449,23 +449,6 @@ static int send_flushing(void *arg)
    return sendall(*(int *)arg, &beat, sizeof(beat));
 }
 
-/* Whether the sender has closed stream 0. After the data it sends nothing
- * while it waits for the ACK, so anything readable there is its end of file
- * or a reset. A failed send is no test: the first write after the peer has
- * closed can still succeed. */
-static int sender_gone(int socketfd)
-{
-   struct pollfd p;
-   char byte;
-   p.fd = socketfd;
-   p.events = POLLIN | POLLRDHUP;
-   if (poll(&p, 1, 0) <= 0)
-      return 0;
-   if (p.revents & (POLLRDHUP | POLLHUP | POLLERR))
-      return 1;
-   return recv(socketfd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) <= 0;
-}
-
 /* Tell a sender that accepts it why the destination failed, in place of the
  * ACK. Closing a stream with data still unread resets it and drops whatever
  * this end has not yet sent, so wait (up to 1 s) until the sender's end has
@@ -993,7 +976,7 @@ void readsocket_segmented_resume(int numstreams, int newsockfds[], struct argdat
     * --flush-timeout) has reported a failure. Publishing now would leave a
     * complete file and no checkpoint behind that report, and break the
     * --resume it suggests, so keep both as they are instead. */
-   if (sender_gone(newsockfds[0]))
+   if (msc_sender_gone(newsockfds[0]))
    {
       fprintf(stderr, "MSC sender stopped waiting; keeping %s and its checkpoint "
                       "for --resume\n", temp_path);

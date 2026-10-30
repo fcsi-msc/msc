@@ -5,6 +5,7 @@
  * local_sockets.c, recursive.c, and remote.c. They are consolidated here so
  * the TCP data paths and the UDP control channel share one implementation.
  */
+#define _GNU_SOURCE   /* POLLRDHUP */
 #include "msc.h"
 
 #include <errno.h>
@@ -115,11 +116,16 @@ void msc_beat_stop(struct msc_beat *b)
  * a loaded network filesystem committing a whole file in one fsync, which can
  * fall to a few MiB/s and vary twofold from one run to the next. */
 #define MSC_FLUSH_FLOOR_BYTES_PER_S (UINT64_C(2) << 20)
+/* What a tree's finish may take per entry on top of its bytes: a sync of the
+ * entry and its mode and timestamp updates, each a round trip on a network
+ * filesystem. At most MAX_MANIFEST_ENTRIES (2^20) entries, about 14.6 h. */
+#define MSC_FLUSH_ENTRY_MS 50U
 
-uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes)
+uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes, uint64_t entries)
 {
    uint64_t by_size = bytes / MSC_FLUSH_FLOOR_BYTES_PER_S * 1000U +
-                      bytes % MSC_FLUSH_FLOOR_BYTES_PER_S * 1000U / MSC_FLUSH_FLOOR_BYTES_PER_S;
+                      bytes % MSC_FLUSH_FLOOR_BYTES_PER_S * 1000U / MSC_FLUSH_FLOOR_BYTES_PER_S +
+                      entries * MSC_FLUSH_ENTRY_MS;
    if (flush_timeout_ms == 0)
       return 0;
    return by_size > flush_timeout_ms ? by_size : flush_timeout_ms;
@@ -144,14 +150,16 @@ static void describe_ms(char *text, size_t size, uint64_t ms)
 }
 
 /* The one place a sender waits for a receiver to finish a transfer whose data
- * it has sent. The ceiling, msc_finish_ceiling_ms(flush_timeout_ms, bytes),
- * runs from msc_finish_begin(); a wait longer than one stall timeout (or
- * 30 s) says so once, so a long flush does not look like a hang. */
+ * it has sent. The ceiling, msc_finish_ceiling_ms(flush_timeout_ms, bytes,
+ * entries), runs from msc_finish_begin(); a wait longer than one stall timeout
+ * (or 30 s) says so once, so a long flush does not look like a hang. */
 void msc_finish_begin(struct msc_finish *f, uint64_t stall_timeout_ms,
-                      uint64_t flush_timeout_ms, uint64_t bytes, int checkpointed)
+                      uint64_t flush_timeout_ms, uint64_t bytes, uint64_t entries,
+                      int checkpointed)
 {
    f->start_ms = f->heard_ms = netutil_now_ms();
-   f->ceiling_ms = msc_finish_ceiling_ms(flush_timeout_ms, bytes);
+   f->ceiling_ms = msc_finish_ceiling_ms(flush_timeout_ms, bytes, entries);
+   f->entries = entries;
    f->notice_ms = stall_timeout_ms != 0 ? stall_timeout_ms : 30000U;
    f->stall_timeout_ms = stall_timeout_ms;
    f->noticed = 0;
@@ -212,7 +220,8 @@ int msc_finish_await(struct msc_finish *f, int (*read_record)(void *ctx, int tim
             describe_ms(text, sizeof(text), f->ceiling_ms);
             fprintf(stderr, "MSC delivered all data, but the destination did not confirm "
                             "it was durable within %s (--flush-timeout, or 1 s per 2 MiB "
-                            "transferred if longer)\n", text);
+                            "transferred%s if longer)\n", text,
+                    f->entries != 0 ? " plus 50 ms per entry" : "");
             return MSC_EXIT_DESTINATION;
          }
          if (f->stall_timeout_ms != 0 && now >= f->heard_ms + f->stall_timeout_ms)
@@ -264,13 +273,30 @@ static int segment_record_is_beat(void *ctx)
    return reader->is_beat(reader->record);
 }
 
+/* Whether the sender has closed stream 0. After the data it sends nothing
+ * while it waits for the ACK, so anything readable there is its end of file
+ * or a reset. A failed send is no test: the first write after the peer has
+ * closed can still succeed. */
+int msc_sender_gone(int socketfd)
+{
+   struct pollfd p;
+   char byte;
+   p.fd = socketfd;
+   p.events = POLLIN | POLLRDHUP;
+   if (poll(&p, 1, 0) <= 0)
+      return 0;
+   if (p.revents & (POLLRDHUP | POLLHUP | POLLERR))
+      return 1;
+   return recv(socketfd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) <= 0;
+}
+
 /* TCP: read records of size bytes from socketfd into record until one that
- * is_beat() does not call a beat. checkpointed adds that interrupting keeps
- * the checkpoint. */
+ * is_beat() does not call a beat. entries is a tree's entry count (0 for one
+ * file); checkpointed adds that interrupting keeps the checkpoint. */
 int msc_await_final_record(int socketfd, void *record, size_t size,
                            int (*is_beat)(const void *record),
                            uint64_t stall_timeout_ms, uint64_t flush_timeout_ms,
-                           uint64_t bytes, int checkpointed)
+                           uint64_t bytes, uint64_t entries, int checkpointed)
 {
    struct msc_finish finish;
    struct segment_reader reader;
@@ -278,7 +304,7 @@ int msc_await_final_record(int socketfd, void *record, size_t size,
    reader.record = record;
    reader.size = size;
    reader.is_beat = is_beat;
-   msc_finish_begin(&finish, stall_timeout_ms, flush_timeout_ms, bytes, checkpointed);
+   msc_finish_begin(&finish, stall_timeout_ms, flush_timeout_ms, bytes, entries, checkpointed);
    return msc_finish_await(&finish, read_segment_record, segment_record_is_beat, &reader);
 }
 

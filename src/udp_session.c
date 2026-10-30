@@ -1675,7 +1675,7 @@ int msc_udp_finish_read(int fd, volatile sig_atomic_t *cancel, uint64_t bytes,
    int code;
    reader.fd = fd;
    reader.cancel = cancel;
-   msc_finish_begin(&finish, g_stall_timeout_ns / 1000000ULL, g_flush_timeout_ms, bytes, 1);
+   msc_finish_begin(&finish, g_stall_timeout_ns / 1000000ULL, g_flush_timeout_ms, bytes, 0, 1);
    code = msc_finish_await(&finish, read_finish_record, finish_record_is_beat, &reader);
    if (code != 0)
       return code;
@@ -6993,7 +6993,7 @@ static int sender_send_file(void *session, struct msc_udp_config *cfg)
       reader.fd = s->controlfd;
       reader.cancel = cfg->cancel_flag;
       msc_finish_begin(&finish, g_stall_timeout_ns / 1000000ULL, g_flush_timeout_ms,
-                       x.total_bytes, 0);
+                       x.total_bytes, 0, 0);
       code = msc_finish_await(&finish, read_finish_record, finish_record_is_beat, &reader);
       if (code != 0)
       {

@@ -59,6 +59,12 @@
 #define MSC_RECORD_SYMLINK 7
 #define MSC_RECORD_HARDLINK 8
 #define MSC_RECORD_HOLE 9
+/* Receiver -> sender on stream 0 before the ACK: the receiver is alive and
+ * still finishing the tree. Sent only to a sender whose WORKER_DONE records
+ * carry MSC_RECORD_FLAG_FLUSH_AWARE in their mode field, which receivers
+ * ignored before. */
+#define MSC_RECORD_FLUSHING 10
+#define MSC_RECORD_FLAG_FLUSH_AWARE 1U
 
 /* Public process exit status contract.  Keep these values stable: scripts and
  * the SSH parent use them to distinguish permanent from retryable failures. */
@@ -430,8 +436,10 @@ extern void msc_beat_start(struct msc_beat *b, uint64_t interval_ns,
                            int (*send)(void *), void *arg);
 extern void msc_beat_stop(struct msc_beat *b);
 /* How long a sender waits for the receiver to finish after the data:
- * max(flush_timeout_ms, bytes at the floor rate); 0 when unbounded. */
-extern uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes);
+ * max(flush_timeout_ms, bytes at the floor rate plus a fixed time per tree
+ * entry); 0 when unbounded. entries is 0 for a single file. */
+extern uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes,
+                                      uint64_t entries);
 /* Sender: wait for the receiver to finish after the data, in one or more
  * steps under one ceiling. read_record waits up to timeout_ms (-1: no limit)
  * and returns 1 when it read a record, 0 when none came, and -1 when the
@@ -439,18 +447,22 @@ extern uint64_t msc_finish_ceiling_ms(uint64_t flush_timeout_ms, uint64_t bytes)
  * was a beat. */
 struct msc_finish
 {
-   uint64_t start_ms, heard_ms, ceiling_ms, notice_ms, stall_timeout_ms;
+   uint64_t start_ms, heard_ms, ceiling_ms, notice_ms, stall_timeout_ms, entries;
    int noticed, checkpointed;
 };
 extern void msc_finish_begin(struct msc_finish *f, uint64_t stall_timeout_ms,
-                             uint64_t flush_timeout_ms, uint64_t bytes, int checkpointed);
+                             uint64_t flush_timeout_ms, uint64_t bytes, uint64_t entries,
+                             int checkpointed);
 extern int msc_finish_await(struct msc_finish *f, int (*read_record)(void *ctx, int timeout_ms),
                             int (*is_beat)(void *ctx), void *ctx);
+/* Receiver: whether the sender has closed stream 0 while waiting for the
+ * final record, for example after giving up at its ceiling. */
+extern int msc_sender_gone(int socketfd);
 /* Sender: read the receiver's final record after the data, skipping beats. */
 extern int msc_await_final_record(int socketfd, void *record, size_t size,
                                   int (*is_beat)(const void *record),
                                   uint64_t stall_timeout_ms, uint64_t flush_timeout_ms,
-                                  uint64_t bytes, int checkpointed);
+                                  uint64_t bytes, uint64_t entries, int checkpointed);
 extern const char *msc_ssh_program(void);
 
 /* SSH connect/keepalive budgets, scaled by the declared path class (see

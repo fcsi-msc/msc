@@ -118,6 +118,18 @@ Recursive transfers reject offsets and length slices. Checkpointed UDP also
 rejects offsets/slices for a single file. Byte-based UDP checkpoints allow a new
 session to choose a different payload size or path MTU.
 
+## Recursive durability
+
+Before a recursive TCP receiver acknowledges a tree, every regular file and
+directory in it, the destination root and the directory holding the root are
+synced, so the data and names of a tree reported complete survive a crash. Files
+and directories are synced 64 at a time. Modes and timestamps are applied after
+that sync and are not synced again; a crash soon after a transfer can leave them
+as they were. Hard links and symlinks need no sync of their own: their names are
+covered by their directory's sync, and a hard link shares its file's data. A
+checkpointed recursive transfer, TCP or UDP, also syncs the tree this way at
+each checkpoint.
+
 ## Cancellation, retries, and stalled peers
 
 SIGINT and SIGTERM retain exit statuses 130 and 143. The default no-progress
@@ -127,14 +139,17 @@ before acknowledging it and tells the sender meanwhile that it is alive, so a
 flush longer than the stall timeout does not fail a transfer whose data has
 arrived. Over UDP (when both ends support it) this also covers the checksum,
 each checkpointed chunk's check and checkpoint update, and publication, which
-the receiver confirms before the session closes. `--flush-timeout` (default 30
-minutes; 0 waits indefinitely) bounds that wait instead, extended to 1 s per 2
-MiB transferred for large transfers. Once the wait passes one stall timeout, the
+the receiver confirms before the session closes. A recursive TCP receiver does
+the same while it syncs the tree, updates its checkpoint and applies modes and
+timestamps. `--flush-timeout` (default 30 minutes; 0 waits indefinitely) bounds
+that wait instead, extended to 1 s per 2 MiB transferred for large transfers,
+plus 50 ms per entry for a tree. Once the wait passes one stall timeout, the
 sender says so once, with the limit. A destination that never confirms its data
 within it fails the transfer with exit 4: all data was delivered, and retrying
 cannot help. A checkpointed receiver that finds its sender gone does not
-publish: it keeps the partial file and the checkpoint, and rerunning with
-`--resume` once the destination responds finishes the transfer.
+publish, or for a tree does not remove its checkpoint: it keeps the partial file
+or tree and the checkpoint, and rerunning with `--resume` once the destination
+responds finishes the transfer.
 
 A TCP single-file destination that fails outright (a write, the flush, a
 checkpoint update or publication fails, for example with ENOSPC, EDQUOT or EIO)

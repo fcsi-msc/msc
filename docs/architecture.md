@@ -78,6 +78,18 @@ when necessary, up to the process hard limit. Large trees can therefore require
 many descriptors. Resume ranges use a concatenated byte space, while transport
 units also account for per-file and stripe tails. These are different indices.
 
+Over TCP, each stream ends with a `WORKER_DONE` record, and the receiver
+acknowledges the tree on stream 0 once it has synced every file and directory,
+updated any checkpoint and applied modes and timestamps. Until then a timer
+thread sends a `FLUSHING` directory record on stream 0 every quarter of the
+stall timeout (within 100 ms to 5 s), as for a single file, and the sender
+bounds the wait at the larger of `--flush-timeout` and 1 s per 2 MiB sent plus
+50 ms per manifest entry. A sender sets a flag in its `WORKER_DONE` records'
+mode field, which receivers ignored before, to say it accepts `FLUSHING`; a
+receiver sends none to a sender without it. The workers' last files stay open
+until the tree is synced: on a network filesystem, closing a written file waits
+for the server to commit it, and that wait belongs inside the heartbeat.
+
 ## Multiple machine pairs and Lustre
 
 Matching source/destination machine lists divide a file among child transfers.
