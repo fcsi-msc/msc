@@ -9,10 +9,10 @@ Notable user-facing changes are recorded here.
 - `--flush-timeout D` bounds how long a single-file sender, TCP or UDP, waits,
   after all data has arrived, for the receiver to confirm the destination is
   durable: D or 1 s per 2 MiB transferred, whichever is longer. Over UDP it
-  covers the flush, the checksum, each checkpointed chunk's check and
-  checkpoint update, and publication; before, a UDP sender waited for these
-  without any bound, so a stuck destination could hang it indefinitely. UDP
-  needs both ends at this version; with an older peer it waits as before. The default is 30
+  covers the flush, the checksum, each checkpointed chunk's check and checkpoint
+  update, and publication; before, a UDP sender waited for these without any
+  bound, so a stuck destination could hang it indefinitely. UDP needs both ends
+  at this version; with an older peer it waits as before. The default is 30
   minutes, and 0 waits indefinitely. A wait longer than the stall timeout is
   announced once with its limit. A destination that does not confirm in time
   fails the transfer with exit 4 rather than leaving msc waiting forever; a

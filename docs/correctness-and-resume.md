@@ -122,19 +122,19 @@ session to choose a different payload size or path MTU.
 
 SIGINT and SIGTERM retain exit statuses 130 and 143. The default no-progress
 timeout is 30 s; `--stall-timeout 0` disables it. It is a liveness bound, not a
-limit on total transfer duration. A single-file receiver flushes the
-destination before acknowledging it and tells the sender meanwhile that it is
-alive, so a flush longer than the stall timeout does not fail a transfer whose
-data has arrived. Over UDP (when both ends support it) this also covers the
-checksum, each checkpointed chunk's check and checkpoint update, and
-publication, which the receiver confirms before the session closes. `--flush-timeout` (default 30 minutes; 0 waits indefinitely)
-bounds that wait instead, extended to 1 s per 2 MiB transferred for large
-transfers. Once the wait passes one stall timeout, the sender says so once,
-with the limit. A destination that never confirms its data within it fails the
-transfer with exit 4: all data was delivered, and retrying cannot help. A
-checkpointed receiver that finds its sender gone does not publish: it keeps the
-partial file and the checkpoint, and rerunning with `--resume` once the
-destination responds finishes the transfer.
+limit on total transfer duration. A single-file receiver flushes the destination
+before acknowledging it and tells the sender meanwhile that it is alive, so a
+flush longer than the stall timeout does not fail a transfer whose data has
+arrived. Over UDP (when both ends support it) this also covers the checksum,
+each checkpointed chunk's check and checkpoint update, and publication, which
+the receiver confirms before the session closes. `--flush-timeout` (default 30
+minutes; 0 waits indefinitely) bounds that wait instead, extended to 1 s per 2
+MiB transferred for large transfers. Once the wait passes one stall timeout, the
+sender says so once, with the limit. A destination that never confirms its data
+within it fails the transfer with exit 4: all data was delivered, and retrying
+cannot help. A checkpointed receiver that finds its sender gone does not
+publish: it keeps the partial file and the checkpoint, and rerunning with
+`--resume` once the destination responds finishes the transfer.
 
 A TCP single-file destination that fails outright (a write, the flush, a
 checkpoint update or publication fails, for example with ENOSPC, EDQUOT or EIO)
