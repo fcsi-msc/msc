@@ -144,97 +144,142 @@ static void describe_ms(char *text, size_t size, uint64_t ms)
 }
 
 /* The one place a sender waits for a receiver to finish a transfer whose data
- * it has sent: read records of size bytes from socketfd into record until one
- * that is_beat() does not call a beat. Each record must arrive within the
- * stall timeout, which a receiver that is alive but still flushing meets with
- * beats, and the whole wait ends at msc_finish_ceiling_ms(flush_timeout_ms,
- * bytes). A wait longer than one stall timeout (or 30 s) says so once, so a
- * long flush does not look like a hang. Returns 0 with the final record in
- * record, MSC_EXIT_NETWORK when the receiver went quiet or the stream failed,
- * and MSC_EXIT_DESTINATION when the receiver stayed alive but the destination
- * never confirmed the data. checkpointed adds that interrupting keeps the
- * checkpoint. */
-int msc_await_final_record(int socketfd, void *record, size_t size,
-                           int (*is_beat)(const void *record),
-                           uint64_t stall_timeout_ms, uint64_t flush_timeout_ms,
-                           uint64_t bytes, int checkpointed)
+ * it has sent. The ceiling, msc_finish_ceiling_ms(flush_timeout_ms, bytes),
+ * runs from msc_finish_begin(); a wait longer than one stall timeout (or
+ * 30 s) says so once, so a long flush does not look like a hang. */
+void msc_finish_begin(struct msc_finish *f, uint64_t stall_timeout_ms,
+                      uint64_t flush_timeout_ms, uint64_t bytes, int checkpointed)
 {
-   uint64_t ceiling = msc_finish_ceiling_ms(flush_timeout_ms, bytes);
-   uint64_t start = netutil_now_ms(), heard = start;
-   uint64_t notice = stall_timeout_ms != 0 ? stall_timeout_ms : 30000U;
-   int noticed = 0;
+   f->start_ms = f->heard_ms = netutil_now_ms();
+   f->ceiling_ms = msc_finish_ceiling_ms(flush_timeout_ms, bytes);
+   f->notice_ms = stall_timeout_ms != 0 ? stall_timeout_ms : 30000U;
+   f->stall_timeout_ms = stall_timeout_ms;
+   f->noticed = 0;
+   f->checkpointed = checkpointed;
+}
+
+/* Read records until one that is not a beat. Each must arrive within the stall
+ * timeout of the last (or of this call), which a receiver that is alive but
+ * still finishing meets with beats. Returns 0 with the final record read,
+ * MSC_EXIT_NETWORK when the receiver went quiet or the stream failed, and
+ * MSC_EXIT_DESTINATION when the receiver stayed alive but the destination
+ * never confirmed the data. */
+int msc_finish_await(struct msc_finish *f, int (*read_record)(void *ctx, int timeout_ms),
+                     int (*is_beat)(void *ctx), void *ctx)
+{
    char text[32];
 
+   f->heard_ms = netutil_now_ms();
    for (;;)
    {
       uint64_t now = netutil_now_ms();
       int64_t wait = -1;
-      struct pollfd p;
       int r;
-      if (!noticed && now >= start + notice)
+      if (!f->noticed && now >= f->start_ms + f->notice_ms)
       {
-         if (ceiling != 0)
-            describe_ms(text, sizeof(text), ceiling);
+         if (f->ceiling_ms != 0)
+            describe_ms(text, sizeof(text), f->ceiling_ms);
          fprintf(stderr, "MSC all data delivered; waiting for the destination to confirm "
                          "it is durable (limit %s; --flush-timeout changes it%s)\n",
-                 ceiling != 0 ? text : "none",
-                 checkpointed ? "; Ctrl-C keeps the checkpoint for --resume" : "");
-         noticed = 1;
+                 f->ceiling_ms != 0 ? text : "none",
+                 f->checkpointed ? "; Ctrl-C keeps the checkpoint for --resume" : "");
+         f->noticed = 1;
       }
-      if (!noticed)
-         wait = (int64_t)(start + notice > now ? start + notice - now : 0);
-      if (stall_timeout_ms != 0)
+      if (!f->noticed)
+         wait = (int64_t)(f->start_ms + f->notice_ms > now ? f->start_ms + f->notice_ms - now : 0);
+      if (f->stall_timeout_ms != 0)
       {
-         int64_t quiet = (int64_t)(heard + stall_timeout_ms > now ? heard + stall_timeout_ms - now : 0);
+         int64_t quiet = (int64_t)(f->heard_ms + f->stall_timeout_ms > now
+                                   ? f->heard_ms + f->stall_timeout_ms - now : 0);
          if (wait < 0 || quiet < wait)
             wait = quiet;
       }
-      if (ceiling != 0)
+      if (f->ceiling_ms != 0)
       {
-         int64_t left = (int64_t)(start + ceiling > now ? start + ceiling - now : 0);
+         int64_t left = (int64_t)(f->start_ms + f->ceiling_ms > now
+                                  ? f->start_ms + f->ceiling_ms - now : 0);
          if (wait < 0 || left < wait)
             wait = left;
       }
-      p.fd = socketfd;
-      p.events = POLLIN;
-      r = poll(&p, 1, wait < 0 ? -1 : wait > INT_MAX ? INT_MAX : (int)wait);
-      if (r < 0 && errno == EINTR)
-      {
-         if (msc_cancelled())
-            return MSC_EXIT_NETWORK;
-         continue;
-      }
+      r = read_record(ctx, wait < 0 ? -1 : wait > INT_MAX ? INT_MAX : (int)wait);
       if (r < 0)
-      {
-         perror("MSC waiting for the receiver to finish");
          return MSC_EXIT_NETWORK;
-      }
       now = netutil_now_ms();
       if (r == 0)
       {
-         if (ceiling != 0 && now >= start + ceiling)
+         if (f->ceiling_ms != 0 && now >= f->start_ms + f->ceiling_ms)
          {
-            describe_ms(text, sizeof(text), ceiling);
+            describe_ms(text, sizeof(text), f->ceiling_ms);
             fprintf(stderr, "MSC delivered all data, but the destination did not confirm "
                             "it was durable within %s (--flush-timeout, or 1 s per 2 MiB "
                             "transferred if longer)\n", text);
             return MSC_EXIT_DESTINATION;
          }
-         if (stall_timeout_ms != 0 && now >= heard + stall_timeout_ms)
+         if (f->stall_timeout_ms != 0 && now >= f->heard_ms + f->stall_timeout_ms)
          {
-            describe_ms(text, sizeof(text), stall_timeout_ms);
+            describe_ms(text, sizeof(text), f->stall_timeout_ms);
             fprintf(stderr, "MSC receiver sent nothing for %s while finishing the "
                             "transfer (--stall-timeout)\n", text);
             return MSC_EXIT_NETWORK;
          }
          continue;
       }
-      if (recvall_exact(socketfd, record, size) != 0)
-         return MSC_EXIT_NETWORK;
-      if (!is_beat(record))
+      if (!is_beat(ctx))
          return 0;
-      heard = netutil_now_ms();
+      f->heard_ms = now;
    }
+}
+
+struct segment_reader
+{
+   int socketfd;
+   void *record;
+   size_t size;
+   int (*is_beat)(const void *record);
+};
+
+static int read_segment_record(void *ctx, int timeout_ms)
+{
+   struct segment_reader *reader = ctx;
+   struct pollfd p;
+   int r;
+   p.fd = reader->socketfd;
+   p.events = POLLIN;
+   r = poll(&p, 1, timeout_ms);
+   if (r < 0 && errno == EINTR)
+      return msc_cancelled() ? -1 : 0;
+   if (r < 0)
+   {
+      perror("MSC waiting for the receiver to finish");
+      return -1;
+   }
+   if (r == 0)
+      return 0;
+   return recvall_exact(reader->socketfd, reader->record, reader->size) == 0 ? 1 : -1;
+}
+
+static int segment_record_is_beat(void *ctx)
+{
+   struct segment_reader *reader = ctx;
+   return reader->is_beat(reader->record);
+}
+
+/* TCP: read records of size bytes from socketfd into record until one that
+ * is_beat() does not call a beat. checkpointed adds that interrupting keeps
+ * the checkpoint. */
+int msc_await_final_record(int socketfd, void *record, size_t size,
+                           int (*is_beat)(const void *record),
+                           uint64_t stall_timeout_ms, uint64_t flush_timeout_ms,
+                           uint64_t bytes, int checkpointed)
+{
+   struct msc_finish finish;
+   struct segment_reader reader;
+   reader.socketfd = socketfd;
+   reader.record = record;
+   reader.size = size;
+   reader.is_beat = is_beat;
+   msc_finish_begin(&finish, stall_timeout_ms, flush_timeout_ms, bytes, checkpointed);
+   return msc_finish_await(&finish, read_segment_record, segment_record_is_beat, &reader);
 }
 
 void *checkmalloc(size_t size, const char *msg)

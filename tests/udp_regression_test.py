@@ -251,6 +251,108 @@ def main():
             assert "fsync" in out
         print("ok: file and publication-directory fsync failures reach CLI exit 4", flush=True)
 
+        # The single-file finish: the receiver says it is alive while it
+        # flushes and publishes, and the sender bounds that wait with
+        # --flush-timeout (or 1 s per 2 MiB) instead of waiting forever. The
+        # shim slows the data file's fsync, or every directory fsync.
+        slow = {"MSC_SSH": str(fake), "LD_PRELOAD": fault,
+                "MSC_TEST_FSYNC_DELAY_MIN_BYTES": str(1024 * 1024)}
+
+        def finish(name, sender, receiver, extra, settings, expected):
+            """Time msc's own exit. The stand-in ssh runs the receiver here,
+            where it shares msc's output, so the output goes to a file and a
+            receiver still flushing is given time to finish (and to show it
+            publishes nothing behind a failed sender) before it is stopped."""
+            dest = work / f"finish-{name}"
+            log = work / f"finish-{name}.log"
+            started = time.monotonic()
+            with open(log, "w") as output:
+                process = subprocess.Popen(
+                    [str(a) for a in (sender, "-n1", "--stall-timeout", "1s", *extra,
+                                      "-l", "localhost", "-r", "127.0.0.1",
+                                      "-B", receiver, "-i", source, "-o", dest)],
+                    cwd=ROOT, env=dict(BASE, **slow, **settings), stdout=output,
+                    stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    code = process.wait(timeout=60)
+                    took = time.monotonic() - started
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        os.killpg(process.pid, 0)
+                        time.sleep(0.1)
+                except ProcessLookupError:
+                    pass
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            out = log.read_text()
+            assert code == expected, (name, code, expected, out)
+            return out, dest, took
+
+        out, dest, _ = finish("slow-flush", ROOT / "msc", ROOT / "msc", [],
+                              {"MSC_TEST_FSYNC_DELAY_MS": "3000"}, 0)
+        assert dest.read_bytes() == source.read_bytes()
+        assert "waiting for the destination to confirm it is durable (limit 30m00s" in out, out
+        out, dest, took = finish("stuck-flush", ROOT / "msc", ROOT / "msc",
+                                 ["--flush-timeout", "1s"],
+                                 {"MSC_TEST_FSYNC_DELAY_MS": "4000"}, 4)
+        assert "did not confirm it was durable within 1.0s" in out, out
+        assert took < 3.5, (took, out)
+        assert not dest.exists(), out
+        out, dest, took = finish("slow-publish", ROOT / "msc", ROOT / "msc",
+                                 ["--flush-timeout", "1s"],
+                                 {"MSC_TEST_DIR_FSYNC_DELAY_MS": "4000"}, 4)
+        assert "did not confirm it was durable within 1.0s" in out, out
+        assert took < 3.5, (took, out)
+        print("ok: a slow UDP finish completes; a stuck flush or publication exits 4 "
+              "at --flush-timeout", flush=True)
+
+        # Checkpointed, each chunk also has its check and its checkpoint update,
+        # and the file is published after the last: all bounded the same way.
+        ckpt = work / "finish-ckpt-slow.ckpt"
+        out, dest, _ = finish("ckpt-slow", ROOT / "msc", ROOT / "msc", ["--checkpoint", ckpt],
+                              {"MSC_TEST_FSYNC_DELAY_MS": "2000"}, 0)
+        assert dest.read_bytes() == source.read_bytes(), out
+        assert not ckpt.exists() and "msc reconnect" not in out, out
+        ckpt = work / "finish-ckpt-stuck.ckpt"
+        out, dest, took = finish("ckpt-stuck", ROOT / "msc", ROOT / "msc",
+                                 ["--checkpoint", ckpt, "--flush-timeout", "1s"],
+                                 {"MSC_TEST_FSYNC_DELAY_MS": "4000"}, 4)
+        assert "did not confirm it was durable within 1.0s" in out, out
+        assert took < 3.5 and ckpt.exists() and not dest.exists(), (took, out)
+        run([ROOT / "msc", "-n1", "--resume", "--checkpoint", ckpt, "-l", "localhost",
+             "-r", "127.0.0.1", "-B", ROOT / "msc", "-i", source, "-o", dest],
+            {"MSC_SSH": str(fake)})
+        assert dest.read_bytes() == source.read_bytes() and not ckpt.exists()
+        print("ok: a checkpointed UDP finish survives slow storage; stuck, it exits 4 "
+              "and --resume finishes", flush=True)
+
+        # Against MSC 1.1.0, built from its release tag, neither side bounds the
+        # finish: a flush longer than the stall timeout and --flush-timeout
+        # still completes, as before.
+        old = work / "v1.1.0"
+        tagged = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify",
+                                 "v1.1.0^{commit}"], capture_output=True).returncode == 0
+        if tagged:
+            old.mkdir()
+            archive = subprocess.run(["git", "-C", str(ROOT), "archive", "v1.1.0"],
+                                     capture_output=True, check=True).stdout
+            subprocess.run(["tar", "-x", "-C", str(old)], input=archive, check=True)
+            built = subprocess.run(["make", "-C", str(old), "msc"],
+                                   capture_output=True).returncode == 0
+        if tagged and built:
+            finish("old-receiver", ROOT / "msc", old / "msc", ["--flush-timeout", "1s"],
+                   {"MSC_TEST_FSYNC_DELAY_MS": "3000"}, 0)
+            finish("old-sender", old / "msc", ROOT / "msc", [],
+                   {"MSC_TEST_FSYNC_DELAY_MS": "3000"}, 0)
+            print("ok: with a 1.1.0 peer the UDP finish waits without a bound, as before",
+                  flush=True)
+        else:
+            print("skip: cannot build v1.1.0 from a release tag here; "
+                  "mixed-version UDP finish cases not run", flush=True)
+
         for failure in ("nospc", "unsupported"):
             dest = work / f"mapped-{failure}"
             out = run([ROOT / "msc", "-n1", "--stats", "--stall-timeout", "2s",

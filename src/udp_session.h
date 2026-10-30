@@ -163,6 +163,12 @@ extern int msc_port_spec_contains(const struct msc_port_spec *spec, unsigned int
                                                * the destination; repeated well
                                                * inside the stall timeout until
                                                * MSC_UDP_CTL_READY */
+#define MSC_UDP_CTL_FLUSHING 16                /* receiver -> sender: alive and still
+                                               * finishing a single-file transfer
+                                               * (MSC_UDP_FEAT_FINISH) */
+#define MSC_UDP_CTL_FINISHED 17                /* receiver -> sender: the single-file
+                                               * transfer is durable and published
+                                               * (MSC_UDP_FEAT_FINISH) */
 
 /* ----- HELLO feature bits (uint32_t, intersected by both ends) ------------
  * Reserved now so a feature can ship on one end at a time; each bit lights up
@@ -181,6 +187,10 @@ extern int msc_port_spec_contains(const struct msc_port_spec *spec, unsigned int
 #define MSC_UDP_FEAT_READY (1u << 6)          /* the session's first single-file
                                            * transfer waits for MSC_UDP_CTL_READY
                                            * before its data flows start */
+#define MSC_UDP_FEAT_FINISH (1u << 7)         /* single-file finish: the receiver
+                                           * sends FLUSHING from the end of the data
+                                           * until FINISHED, after publication, and
+                                           * the sender bounds that wait */
 
 /* ----- transport tunables ------------------------------------------------- */
 #define MSC_UDP_RECV_BATCH   64               /* packets per recvmmsg syscall */
@@ -447,6 +457,21 @@ extern int msc_udp_receiver_run(struct msc_udp_config *cfg, int controlfd);
 extern void *msc_udp_sender_open(struct msc_udp_config *cfg);
 extern int msc_udp_sender_fd(void *session);
 extern int msc_udp_sender_send(void *session, struct msc_udp_config *cfg);
+/* The sender's --flush-timeout, which bounds a single-file finish
+ * (MSC_UDP_FEAT_FINISH); 0 waits indefinitely. */
+extern void msc_udp_set_flush_timeout(uint64_t ms);
+/* The single-file finish beyond one transfer, for checkpointed files: whether
+ * both ends agreed to it; the receiver's FLUSHING beat, run only while it
+ * leaves the control channel alone; the sender's bounded read of the reply
+ * (size bytes, FLUSHING skipped) to work on bytes of data, returning 0 or an
+ * MSC exit code; and whether the sender has stopped waiting. */
+struct msc_beat;
+extern int msc_udp_finish_agreed(void);
+extern void msc_udp_finish_beat_start(struct msc_beat *beat, int *beating, int *controlfd);
+extern void msc_udp_finish_beat_stop(struct msc_beat *beat, int *beating);
+extern int msc_udp_finish_read(int fd, volatile sig_atomic_t *cancel, uint64_t bytes,
+                               void *record, size_t size);
+extern int msc_udp_sender_stopped_waiting(int fd);
 extern void msc_udp_sender_close(void *session);
 extern void *msc_udp_receiver_open(struct msc_udp_config *cfg, int controlfd);
 extern int msc_udp_receiver_fd(void *session);

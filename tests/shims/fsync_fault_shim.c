@@ -21,7 +21,7 @@ static atomic_int calls;
 static int fail_at, record_fd = -1;
 static const char *fail_kind;
 static const char *allocation_error;
-static int fsync_delay_ms;
+static int fsync_delay_ms, dir_fsync_delay_ms;
 static long long fsync_delay_min_bytes;
 
 __attribute__((constructor)) static void init(void)
@@ -31,6 +31,8 @@ __attribute__((constructor)) static void init(void)
    next_create = dlsym(RTLD_NEXT, "pthread_create");
    next_fsync = dlsym(RTLD_NEXT, "fsync");
    fsync_delay_ms = getenv("MSC_TEST_FSYNC_DELAY_MS") ? atoi(getenv("MSC_TEST_FSYNC_DELAY_MS")) : 0;
+   dir_fsync_delay_ms = getenv("MSC_TEST_DIR_FSYNC_DELAY_MS")
+                           ? atoi(getenv("MSC_TEST_DIR_FSYNC_DELAY_MS")) : 0;
    fsync_delay_min_bytes = getenv("MSC_TEST_FSYNC_DELAY_MIN_BYTES")
                               ? atoll(getenv("MSC_TEST_FSYNC_DELAY_MIN_BYTES")) : 0;
 
@@ -89,6 +91,9 @@ int fsync(int fd)
 {
    struct stat st;
    storage_delay(fd, fsync_delay_ms);
+   /* Slow publication: each fsync of a directory takes this long. */
+   if (dir_fsync_delay_ms > 0 && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
+      usleep((useconds_t)dir_fsync_delay_ms * 1000U);
    if (fstat(fd, &st) == 0)
    {
       if (record_fd >= 0)

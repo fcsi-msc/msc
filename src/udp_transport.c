@@ -901,9 +901,11 @@ out:
    return ok ? 0 : code;
 }
 
+/* With the single-file finish agreed (finishing), the receiver says it is
+ * alive while it reads the chunk back, and the wait for its check is bounded. */
 static int udp_sender_verify_chunk(int fd, int sourcefd, off_t source_offset,
                                    uint64_t end, uint64_t length,
-                                   int initial_status)
+                                   int initial_status, int finishing)
 {
    struct udp_chunk_check check, decision;
    uint64_t local;
@@ -911,7 +913,12 @@ static int udp_sender_verify_chunk(int fd, int sourcefd, off_t source_offset,
    local = initial_status == 0
       ? udp_checksum_fd(sourcefd, source_offset, length, &ok) : 0;
    if (initial_status == 0 && !ok) initial_status = MSC_EXIT_SOURCE;
-   if (msc_udp_recv_all(fd, &check, sizeof(check)) != 0) return MSC_EXIT_NETWORK;
+   if (finishing)
+   {
+      int code = msc_udp_finish_read(fd, NULL, length, &check, sizeof(check));
+      if (code != 0) return code;
+   }
+   else if (msc_udp_recv_all(fd, &check, sizeof(check)) != 0) return MSC_EXIT_NETWORK;
    memset(&decision, 0, sizeof(decision));
    decision.magic = htonl(MSC_UDP_CHECK_MAGIC);
    decision.durable_end = host_to_network_64(end);
@@ -927,12 +934,16 @@ static int udp_sender_verify_chunk(int fd, int sourcefd, off_t source_offset,
 }
 
 static int udp_receiver_verify_chunk(int fd, int destinationfd, off_t offset,
-                                     uint64_t end, uint64_t length)
+                                     uint64_t end, uint64_t length, int finishing)
 {
    struct udp_chunk_check check, decision;
+   struct msc_beat beat;
    uint64_t local;
-   int ok;
+   int ok, beating = 0, controlfd = fd;
+   if (finishing)
+      msc_udp_finish_beat_start(&beat, &beating, &controlfd);
    local = udp_checksum_fd(destinationfd, offset, length, &ok);
+   msc_udp_finish_beat_stop(&beat, &beating);
    if (!ok) return MSC_EXIT_DESTINATION;
    memset(&check, 0, sizeof(check));
    check.magic = htonl(MSC_UDP_CHECK_MAGIC);
@@ -958,17 +969,40 @@ static int udp_send_durable_ack(int fd, int status, uint64_t end)
    return msc_udp_send_all(fd, &ack, sizeof(ack));
 }
 
-static int udp_receive_durable_ack(int fd, uint64_t expected)
+/* length: the chunk the receiver is making durable, for a bounded wait when
+ * finishing (see udp_sender_verify_chunk). */
+static int udp_receive_durable_ack(int fd, uint64_t expected, uint64_t length,
+                                   int finishing)
 {
    struct msc_udp_durable_ack ack;
    uint32_t status;
-   if (msc_udp_recv_all(fd, &ack, sizeof(ack)) != 0) return MSC_EXIT_NETWORK;
+   if (finishing)
+   {
+      int code = msc_udp_finish_read(fd, NULL, length, &ack, sizeof(ack));
+      if (code != 0) return code;
+   }
+   else if (msc_udp_recv_all(fd, &ack, sizeof(ack)) != 0) return MSC_EXIT_NETWORK;
    if (ntohl(ack.magic) != MSC_UDP_DURABLE_MAGIC ||
        network_to_host_64(ack.durable_end) != expected)
       return MSC_EXIT_INCOMPATIBLE;
    status = ntohl(ack.status);
    if (status == 0) return 0;
    return udp_exit_status_valid(status) ? (int)status : MSC_EXIT_INCOMPATIBLE;
+}
+
+/* After the last chunk the receiver publishes the file and removes its
+ * checkpoint, then confirms with FINISHED, or ERROR and a status. */
+static int udp_receive_finished(int fd, volatile sig_atomic_t *cancel)
+{
+   uint32_t tag, status;
+   int code = msc_udp_finish_read(fd, cancel, 0, &tag, sizeof(tag));
+   if (code != 0) return code;
+   tag = ntohl(tag);
+   if (tag == MSC_UDP_CTL_FINISHED) return 0;
+   if (tag == MSC_UDP_CTL_ERROR && msc_udp_recv_all(fd, &status, sizeof(status)) == 0 &&
+       udp_exit_status_valid(ntohl(status)))
+      return (int)ntohl(status);
+   return MSC_EXIT_INCOMPATIBLE;
 }
 
 static int tree_next_missing_chunk(const struct msc_checkpoint *checkpoint,
@@ -1158,7 +1192,7 @@ static int run_send_tree_resume(void *session, struct argdata *AD,
             break;
       }
       failure = udp_receive_durable_ack(
-         msc_udp_sender_fd(session), end);
+         msc_udp_sender_fd(session), end, 0, 0);
       if (failure != 0)
          break;
       *bytes += end - start;
@@ -1169,7 +1203,7 @@ static int run_send_tree_resume(void *session, struct argdata *AD,
       failure = MSC_EXIT_INCOMPATIBLE;
    if (failure == 0)
       failure = udp_receive_durable_ack(
-         msc_udp_sender_fd(session), total);
+         msc_udp_sender_fd(session), total, 0, 0);
 out:
    if (progress_started)
       msc_progress_finish(
@@ -1517,6 +1551,7 @@ void udp_send(struct argdata *AD)
       udp_abort_sender_session(session);
       udp_exit_with(MSC_EXIT_INTERNAL, "could not configure UDP control-session timeout");
    }
+   msc_udp_set_flush_timeout(AD->flush_timeout_ms);
 
    if (AD->recursive)
    {
@@ -1589,17 +1624,20 @@ void udp_send(struct argdata *AD)
             {
                failure = udp_sender_verify_chunk(
                   msc_udp_sender_fd(session), sourcefd, cfg.src_offset,
-                  expected, cfg.xferlen, failure);
+                  expected, cfg.xferlen, failure, msc_udp_finish_agreed());
                if (failure != 0) break;
             }
             else if (failure != 0) break;
-            failure = udp_receive_durable_ack(msc_udp_sender_fd(session), expected);
+            failure = udp_receive_durable_ack(msc_udp_sender_fd(session), expected,
+                                              cfg.xferlen, msc_udp_finish_agreed());
             if (failure != 0) break;
             bytes += cfg.bytes_done;
             __atomic_store_n(&current, bytes, __ATOMIC_RELAXED);
             position = expected;
          }
          close(sourcefd);
+         if (failure == 0 && msc_udp_finish_agreed())
+            failure = udp_receive_finished(msc_udp_sender_fd(session), cfg.cancel_flag);
          msc_progress_finish(&progress, failure == 0,
                              "network/transport or storage limited (timing separation unavailable)");
          if (failure != 0)
@@ -1708,6 +1746,9 @@ void udp_receive(struct argdata *AD, int controlfd)
    if (!AD->recursive && !multi && AD->checkpoint_path != NULL)
    {
       uint64_t position, checkpoint_count = 0;
+      struct msc_beat beat;
+      int beating = 0, durable, finishing, published, unlinked;
+      int ctlfd = msc_udp_receiver_fd(session);   /* the session's control channel */
       const char *fault = getenv("MSC_TEST_INTERRUPT_AFTER_CHECKPOINTS");
       const char *signal_fault = getenv("MSC_TEST_SIGNAL_AFTER_CHECKPOINTS");
       const char *midchunk_fault = getenv("MSC_TEST_FAIL_DURING_CHUNK_MS");
@@ -1753,16 +1794,22 @@ void udp_receive(struct argdata *AD, int controlfd)
          {
             failure = udp_receiver_verify_chunk(msc_udp_receiver_fd(session),
                                                  resume_tempfd, cfg.dst_offset,
-                                                 expected, cfg.xferlen);
+                                                 expected, cfg.xferlen,
+                                                 msc_udp_finish_agreed());
             if (failure != 0) goto resumable_failure;
          }
          /* Receiver-owned durability barrier: data first, then the range and
           * atomic checkpoint publication.  Never leave the in-memory range
-          * ahead of the last valid on-disk checkpoint on an error path. */
-         if (fsync(resume_tempfd) != 0 ||
-             msc_checkpoint_add_range(&checkpoint, 0, expected) != 0 ||
-             msc_checkpoint_capture_destination(&checkpoint, temp) != 0 ||
-             msc_checkpoint_write_atomic(AD->checkpoint_path, &checkpoint) != 0)
+          * ahead of the last valid on-disk checkpoint on an error path. With
+          * the single-file finish, say this end is alive meanwhile. */
+         if (msc_udp_finish_agreed())
+            msc_udp_finish_beat_start(&beat, &beating, &ctlfd);
+         durable = fsync(resume_tempfd) == 0 &&
+                   msc_checkpoint_add_range(&checkpoint, 0, expected) == 0 &&
+                   msc_checkpoint_capture_destination(&checkpoint, temp) == 0 &&
+                   msc_checkpoint_write_atomic(AD->checkpoint_path, &checkpoint) == 0;
+         msc_udp_finish_beat_stop(&beat, &beating);
+         if (!durable)
          {
             checkpoint.range_count = old_count;
             if (old_count != 0) checkpoint.ranges[0].end = old_end;
@@ -1800,16 +1847,46 @@ void udp_receive(struct argdata *AD, int controlfd)
          failure = MSC_EXIT_INTERNAL;
          goto resumable_failure;
       }
-      msc_udp_receiver_close(session); session = NULL;
-      if (udp_publish_destination(temp, AD->destfile, AD->force) != 0 ||
-          udp_fsync_parent(AD->destfile) != 0)
+      /* With the single-file finish, publish before closing and confirm it
+       * (FINISHED), saying this end is alive meanwhile; a sender that has
+       * stopped waiting gets nothing published behind its failure. Without
+       * it, close first, as before. */
+      finishing = msc_udp_finish_agreed();
+      if (finishing && msc_udp_sender_stopped_waiting(ctlfd))
+      {
+         fprintf(stderr, "MSC UDP receiver: the sender stopped waiting; not publishing\n");
+         failure = MSC_EXIT_NETWORK;
+         goto resumable_failure;
+      }
+      if (finishing)
+         msc_udp_finish_beat_start(&beat, &beating, &ctlfd);
+      else
+      {
+         msc_udp_receiver_close(session); session = NULL;
+      }
+      published = udp_publish_destination(temp, AD->destfile, AD->force) == 0 &&
+                  udp_fsync_parent(AD->destfile) == 0;
+      unlinked = published &&
+                 (AD->keep_checkpoint ||
+                  (unlink(AD->checkpoint_path) == 0 &&
+                   udp_fsync_parent(AD->checkpoint_path) == 0));
+      if (finishing)
+      {
+         uint32_t done = htonl(MSC_UDP_CTL_FINISHED);
+         msc_udp_finish_beat_stop(&beat, &beating);
+         if (unlinked)
+            (void)msc_udp_send_all(ctlfd, &done, sizeof(done));
+         else
+            (void)msc_udp_send_transfer_error(ctlfd, MSC_EXIT_DESTINATION);
+         msc_udp_receiver_close(session); session = NULL;
+      }
+      if (!published)
       {
          close(resume_tempfd); resume_tempfd = -1;
          free(temp); msc_checkpoint_destroy(&checkpoint);
          udp_exit_with(MSC_EXIT_DESTINATION, "could not atomically publish durable destination");
       }
-      if (!AD->keep_checkpoint &&
-          (unlink(AD->checkpoint_path) != 0 || udp_fsync_parent(AD->checkpoint_path) != 0))
+      if (!unlinked)
       {
          close(resume_tempfd); resume_tempfd = -1;
          free(temp); msc_checkpoint_destroy(&checkpoint);

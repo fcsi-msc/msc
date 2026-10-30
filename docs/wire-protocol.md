@@ -50,6 +50,17 @@ padding to the wire format.
 6. Transfer DATA and ACK packets; finish each flow with final ACK/FIN behavior.
 7. Report transfer byte count using `DONE`, and perform the optional checksum
    approval. Checkpointed modes have additional durable-range acknowledgements.
+   When both ends advertise FINISH, a single-file transfer's finish is bounded:
+   from the end of its data the receiver sends `FLUSHING` periodically while it
+   flushes, checksums, reads a chunk back, updates its checkpoint and
+   publishes, stopping the beat before each record it sends itself, and
+   confirms publication with `FINISHED` (or reports `ERROR`). The sender skips
+   `FLUSHING`, requires a record within each stall timeout, and gives up after
+   the larger of `--flush-timeout` and 1 s per 2 MiB of the step's data (exit
+   4); a checkpointed file is published, and `FINISHED` sent, before the
+   session closes. A receiver that finds the sender has stopped waiting
+   (input or end of file) before publishing a file the sender did not approve
+   publishes nothing. Tree transfers do not use FINISH.
 
 Control teardown and SSH child status remain part of successful orchestration.
 `DONE` alone is not a universal final-name durability guarantee; see
@@ -127,6 +138,8 @@ state, not by a generic length prefix.
 | 13 | ERROR | u32 stable receiver failure status. |
 | 14 | READY | Receiver has prepared the destination; the sender may start its data flows. No fields. |
 | 15 | PREPARING | Receiver's preparation of the destination has advanced since the previous record. No fields. Sent at most every quarter of the stall timeout (within 100 ms to 5 s). The sender gives up when neither PREPARING nor READY arrives for a stall timeout, so a hung preparation fails the transfer instead of stalling it indefinitely. |
+| 16 | FLUSHING | Receiver is alive and still finishing a single-file transfer (FINISH). No fields. Sent every quarter of the stall timeout (within 100 ms to 5 s) while the receiver is not otherwise using the channel; it says nothing about progress. May precede `DONE`, a chunk check, a durable acknowledgement or `FINISHED`. |
+| 17 | FINISHED | Receiver has published the single-file transfer durably (FINISH). No fields. |
 
 | Feature bit | Name | Purpose |
 | ---: | --- | --- |
@@ -137,6 +150,7 @@ state, not by a generic length prefix.
 | 4 | DSACK | Duplicate range feedback. |
 | 5 | DATA_RTT | Pre-data UDP RTT probe/response. |
 | 6 | READY | The first single-file transfer waits for `READY` before its data flows start. A peer without this bit keeps the earlier behavior. |
+| 7 | FINISH | Single-file finish: the receiver sends `FLUSHING` from the end of the data and `FINISHED` after publication, and the sender bounds that wait. A peer without this bit keeps the earlier, unbounded behavior. |
 
 Recursive table transfer IDs must match the session's expected next ID.
 TABLE_BEGIN count and byte total must agree with the materialized file table.
