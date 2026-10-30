@@ -1,5 +1,9 @@
 # MSC
 
+[![CI](https://github.com/fcsi-msc/msc/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fcsi-msc/msc/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/fcsi-msc/msc)](https://github.com/fcsi-msc/msc/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 MSC (Multi-Socket Copy) transfers large files and directory trees between Linux
 hosts using parallel flows. It launches its peer over SSH and provides reliable
 UDP, congestion control, pacing, path-MTU discovery, checkpoint/resume, and
@@ -177,11 +181,14 @@ payload size on a later session. Checkpointed UDP offsets/slices remain
 unsupported. Successful completion removes the checkpoint unless
 `--keep-checkpoint` is set.
 
-The default stall timeout is 30 s (`--stall-timeout 0` disables it).
-`--retries N` retries network failures. Checkpointed transfers also reconnect by
-default, probing over SSH every 10 s after bounded retries are exhausted; use
-`--reconnect-interval 0` to disable that loop. SIGINT/SIGTERM return 130/143.
-See [exit codes and diagnosis](docs/troubleshooting.md#exit-status).
+The default stall timeout is 30 s (`--stall-timeout 0` disables it). After all
+data of a single file has arrived, `--flush-timeout` (default 30 min, extended
+to 1 s per 2 MiB for large files) bounds the wait for the destination to confirm
+it is durable; exceeding it exits 4. `--retries N` retries network failures.
+Checkpointed transfers also reconnect by default, probing over SSH every 10 s
+after bounded retries are exhausted; use `--reconnect-interval 0` to disable
+that loop. SIGINT/SIGTERM return 130/143. See [exit codes and
+diagnosis](docs/troubleshooting.md#exit-status).
 
 SSH protects the launch and default control stream. The separate UDP/TCP data
 connections are not encrypted or cryptographically authenticated by MSC.
