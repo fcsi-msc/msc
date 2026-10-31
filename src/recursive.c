@@ -105,12 +105,15 @@ struct directory_receiver_state
    uint64_t bytes_since_checkpoint;
    uint64_t segments_received;
    uint64_t interrupt_after;
+   int peer_flush_aware;   /* the sender accepts FLUSHING records */
+   int streams_closed;
 };
 
 struct directory_receiver_worker
 {
    struct directory_receiver_state *state;
    int socketfd;
+   int outputfd;   /* the last file written, left open for receivedirectory */
 };
 
 static void encode_header(struct directory_record_header *header, uint32_t type,
@@ -702,8 +705,27 @@ static int send_done_record(int socketfd)
 {
    struct directory_record_header done;
 
-   encode_header(&done, MSC_RECORD_WORKER_DONE, 0, 0, 0, 0);
+   encode_header(&done, MSC_RECORD_WORKER_DONE, MSC_RECORD_FLAG_FLUSH_AWARE, 0, 0, 0);
    return sendall(socketfd, &done, sizeof(done));
+}
+
+/* One FLUSHING record on stream 0: the receiver is alive and still finishing
+ * the tree. The beat thread sends it until the ACK is ready. */
+static int send_flushing_record(void *arg)
+{
+   struct directory_record_header beat;
+
+   encode_header(&beat, MSC_RECORD_FLUSHING, 0, 0, 0, 0);
+   return sendall(*(int *)arg, &beat, sizeof(beat));
+}
+
+/* Whether a record, still in network byte order, is a FLUSHING record. */
+static int tree_record_is_beat(const void *record)
+{
+   const struct directory_record_header *header = record;
+   return ntohl(header->magic) == MSC_DIRECTORY_MAGIC &&
+          ntohl(header->version) == MSC_DIRECTORY_VERSION &&
+          ntohl(header->type) == MSC_RECORD_FLUSHING;
 }
 
 static int send_ack_record(int socketfd)
@@ -1193,39 +1215,103 @@ static int receiver_has_error(struct directory_receiver_state *state)
    return error;
 }
 
+#define MSC_TREE_SYNC_THREADS 64   /* concurrent fsyncs while syncing a tree */
+
+/* Syncing a received tree: workers claim regular files and directories from
+ * one cursor and fsync each. Concurrent fsyncs on one filesystem share journal
+ * commits, and on a network filesystem their round trips overlap, so a serial
+ * fsync per entry would dominate trees of many small files. Hard links share
+ * their file's inode, and a directory's fsync covers the names in it. */
+struct tree_sync
+{
+   struct directory_manifest *manifest;
+   pthread_mutex_t lock;
+   size_t next;          /* next manifest entry to claim */
+   int error;            /* first failure (errno) */
+   const char *failed;   /* the path that failed */
+};
+
+static void *tree_sync_worker(void *arg)
+{
+   struct tree_sync *t = arg;
+   for (;;)
+   {
+      struct directory_entry *entry = NULL;
+      int fd, error = 0;
+      pthread_mutex_lock(&t->lock);
+      while (entry == NULL && t->error == 0 && t->next < t->manifest->count)
+      {
+         struct directory_entry *candidate = &t->manifest->entries[t->next++];
+         if (candidate->type == MSC_RECORD_FILE || candidate->type == MSC_RECORD_DIRECTORY)
+            entry = candidate;
+      }
+      pthread_mutex_unlock(&t->lock);
+      if (entry == NULL)
+         return NULL;
+      fd = open(entry->full_path, O_RDONLY | O_NOFOLLOW |
+                (entry->type == MSC_RECORD_DIRECTORY ? O_DIRECTORY : 0));
+      if (fd < 0 || fsync(fd) != 0)
+         error = errno;
+      if (fd >= 0)
+         close(fd);
+      if (error != 0)
+      {
+         pthread_mutex_lock(&t->lock);
+         if (t->error == 0)
+         {
+            t->error = error;
+            t->failed = entry->full_path;
+         }
+         pthread_mutex_unlock(&t->lock);
+         return NULL;
+      }
+   }
+}
+
+/* Make every regular file's data and every manifest directory durable, then
+ * the root: a file's fsync does not make its directory entry durable, so a
+ * checkpoint or ACK may claim bytes nested beneath a directory only after it
+ * too has been synced. */
 int manifest_sync_durable(struct directory_manifest *manifest,
                           const char *destination_root)
 {
-   size_t i;
-   int rootfd;
-   /* Flush regular-file data before publishing a checkpoint range. */
-   for (i = 0; i < manifest->count; i++)
+   struct tree_sync t;
+   pthread_t threads[MSC_TREE_SYNC_THREADS];
+   size_t wanted = manifest->count < MSC_TREE_SYNC_THREADS ? manifest->count
+                                                           : MSC_TREE_SYNC_THREADS;
+   size_t i, created = 0;
+
+   memset(&t, 0, sizeof(t));
+   t.manifest = manifest;
+   pthread_mutex_init(&t.lock, NULL);
+   for (i = 0; i < wanted; i++)
    {
-      struct directory_entry *entry = &manifest->entries[i];
-      int fd;
-      if (entry->type != MSC_RECORD_FILE) continue;
-      fd = open(entry->full_path, O_RDONLY | O_NOFOLLOW);
-      if (fd < 0 || fsync(fd) != 0)
-      { if (fd >= 0) close(fd); return -1; }
-      close(fd);
+      if (pthread_create(&threads[created], NULL, tree_sync_worker, &t) != 0)
+         break;
+      created++;
    }
-   /* File fsync does not make its directory entry durable.  Flush every
-    * manifest directory as well as the root before the checkpoint can claim
-    * bytes nested beneath it. */
-   for (i = 0; i < manifest->count; i++)
+   if (created == 0)
+      tree_sync_worker(&t);   /* no thread could start: sync inline */
+   for (i = 0; i < created; i++)
+      pthread_join(threads[i], NULL);
+   pthread_mutex_destroy(&t.lock);
+   if (t.error == 0)
    {
-      struct directory_entry *entry = &manifest->entries[i];
-      int fd;
-      if (entry->type != MSC_RECORD_DIRECTORY) continue;
-      fd = open(entry->full_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-      if (fd < 0 || fsync(fd) != 0)
-      { if (fd >= 0) close(fd); return -1; }
-      close(fd);
+      int rootfd = open(destination_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      if (rootfd < 0 || fsync(rootfd) != 0)
+      {
+         t.error = errno;
+         t.failed = destination_root;
+      }
+      if (rootfd >= 0)
+         close(rootfd);
    }
-   rootfd = open(destination_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-   if (rootfd < 0 || fsync(rootfd) != 0)
-   { if (rootfd >= 0) close(rootfd); return -1; }
-   close(rootfd);
+   if (t.error != 0)
+   {
+      fprintf(stderr, "MSC could not sync %s: %s\n", t.failed, strerror(t.error));
+      errno = t.error;
+      return -1;
+   }
    return 0;
 }
 
@@ -1340,7 +1426,15 @@ static void *directory_receiver_thread(void *arg)
          break;
       }
       if (header.type == MSC_RECORD_WORKER_DONE)
+      {
+         if (header.mode & MSC_RECORD_FLAG_FLUSH_AWARE)
+         {
+            pthread_mutex_lock(&state->error_lock);
+            state->peer_flush_aware = 1;
+            pthread_mutex_unlock(&state->error_lock);
+         }
          break;
+      }
       if ((header.type != MSC_RECORD_DATA && header.type != MSC_RECORD_HOLE) ||
           header.length > state->segment_size)
       {
@@ -1391,11 +1485,10 @@ static void *directory_receiver_thread(void *arg)
       pthread_mutex_unlock(&state->completion_lock);
       if (state->error) { set_receiver_error(state); break; }
    }
-   if (outputfd >= 0)
-   {
-      fsync(outputfd);
-      close(outputfd);
-   }
+   /* Left open: on a network filesystem, closing a written file waits for the
+    * server to commit it. receivedirectory closes it after syncing the tree,
+    * while it tells the sender it is alive. */
+   worker->outputfd = outputfd;
    free(buffer);
    return NULL;
 }
@@ -1412,6 +1505,7 @@ void xferdirectory(int sockets[], struct argdata *AD)
    struct msc_checkpoint checkpoint;
    struct msc_progress progress;
    int many_small_files;
+   int finish_code = 0;
 
    memset(&manifest, 0, sizeof(manifest));
    memset(&state, 0, sizeof(state));
@@ -1500,10 +1594,23 @@ void xferdirectory(int sockets[], struct argdata *AD)
    AD->childinfo->xfercount = 0;
    for (i = 0; i < created; i++)
       AD->childinfo->xfercount += workers[i].bytes_sent;
-   if (!state.error &&
-       (recvall_exact(sockets[0], &ack, sizeof(ack)) != 0 ||
-        decode_header(&ack) != 0 || ack.type != MSC_RECORD_ACK))
-      state.error = 1;
+   if (!state.error)
+   {
+      /* The receiver syncs the tree, applies modes and timestamps and removes
+       * any checkpoint before it acknowledges, and says it is alive
+       * meanwhile. Each of its entries adds to the ceiling, as well as each
+       * byte sent. */
+      finish_code = msc_await_final_record(sockets[0], &ack, sizeof(ack), tree_record_is_beat,
+                                           AD->stall_timeout_ms, AD->flush_timeout_ms,
+                                           (uint64_t)AD->childinfo->xfercount,
+                                           (uint64_t)manifest.count + 1,
+                                           AD->checkpoint_path != NULL);
+      if (finish_code == MSC_EXIT_DESTINATION && AD->checkpoint_path != NULL)
+         fprintf(stderr, "MSC kept the checkpoint; rerun with --resume to finish "
+                         "once the destination responds\n");
+      if (finish_code != 0 || decode_header(&ack) != 0 || ack.type != MSC_RECORD_ACK)
+         state.error = 1;
+   }
    pthread_mutex_destroy(&state.cursor_lock);
    pthread_mutex_destroy(&state.error_lock);
    free(workers);
@@ -1518,8 +1625,31 @@ void xferdirectory(int sockets[], struct argdata *AD)
    {
       fprintf(stderr, "MSC recursive sender failed\n");
       if (msc_cancelled()) return;
+      /* A destination that never confirmed the tree will not do better on a
+       * retry, unlike a network failure. */
+      if (finish_code == MSC_EXIT_DESTINATION)
+         exit(MSC_EXIT_DESTINATION);
       exit(AD->checkpoint_path != NULL ? MSC_EXIT_NETWORK : MSC_EXIT_INTERNAL);
    }
+}
+
+/* After a failure, stop the beat and close the streams at once, before any
+ * slow work such as a checkpoint update, so the sender fails promptly instead
+ * of waiting on beats until its ceiling. */
+static void abandon_tree_streams(struct directory_receiver_state *state,
+                                 struct msc_beat *beat, int *beating)
+{
+   int i;
+   if (*beating)
+   {
+      msc_beat_stop(beat);
+      *beating = 0;
+   }
+   if (state->streams_closed)
+      return;
+   for (i = 0; i < state->numstreams; i++)
+      close(state->sockets[i]);
+   state->streams_closed = 1;
 }
 
 void receivedirectory(int numstreams, int sockets[], struct argdata *AD)
@@ -1528,7 +1658,9 @@ void receivedirectory(int numstreams, int sockets[], struct argdata *AD)
    struct directory_receiver_state state;
    struct directory_receiver_worker *workers;
    pthread_t *threads;
+   struct msc_beat beat;
    int created = 0;
+   int beating = 0;   /* the finish beat runs from data end to the ACK */
    int i;
    struct msc_checkpoint checkpoint;
    uint64_t expected_total = 0;
@@ -1606,6 +1738,10 @@ void receivedirectory(int numstreams, int sockets[], struct argdata *AD)
    {
       workers[i].state = &state;
       workers[i].socketfd = sockets[i];
+      workers[i].outputfd = -1;
+   }
+   for (i = 0; i < numstreams; i++)
+   {
       if (pthread_create(&threads[i], NULL, directory_receiver_thread, &workers[i]) != 0)
       {
          set_receiver_error(&state);
@@ -1615,6 +1751,17 @@ void receivedirectory(int numstreams, int sockets[], struct argdata *AD)
    }
    for (i = 0; i < created; i++)
       pthread_join(threads[i], NULL);
+   /* From the end of the data until the ACK -- syncing the tree, the final
+    * checkpoint update, modes and timestamps -- tell a sender that accepts it
+    * that this receiver is alive. The sender bounds the whole finish itself
+    * (--flush-timeout), so a sync to slow storage, which can show no progress
+    * at all while it runs, does not fail a tree whose data has arrived. */
+   if (!state.error && state.peer_flush_aware)   /* the workers have been joined */
+   {
+      msc_beat_start(&beat, msc_beat_interval_ns(AD->stall_timeout_ms),
+                     send_flushing_record, &sockets[0]);
+      beating = 1;
+   }
    if (!state.error)
    {
       size_t entry_index;
@@ -1634,11 +1781,40 @@ void receivedirectory(int numstreams, int sockets[], struct argdata *AD)
          }
       }
    }
+   if (state.error)
+      abandon_tree_streams(&state, &beat, &beating);
+   /* Every file and directory is durable before the ACK. With a checkpoint,
+    * its update syncs the tree before it claims the last ranges, and after a
+    * failure it keeps whatever progress is durable. */
    if (AD->checkpoint_path != NULL)
    {
       pthread_mutex_lock(&state.completion_lock);
       if (persist_directory_checkpoint(&state) != 0) state.error = 1;
       pthread_mutex_unlock(&state.completion_lock);
+   }
+   else if (!state.error && manifest_sync_durable(&manifest, AD->destfile) != 0)
+      state.error = 1;
+   if (!state.error && msc_fsync_parent(AD->destfile) != 0)
+   {
+      fprintf(stderr, "MSC could not sync the directory holding %s: %s\n",
+              AD->destfile, strerror(errno));
+      state.error = 1;
+   }
+   if (state.error)
+      abandon_tree_streams(&state, &beat, &beating);
+   /* Synced already, so closing them no longer waits for a commit. */
+   for (i = 0; i < created; i++)
+      if (workers[i].outputfd >= 0)
+         close(workers[i].outputfd);
+   /* A sender that has given up waiting (the tree outlasted its
+    * --flush-timeout) has told the user to rerun with --resume. Keep the
+    * checkpoint for that, and decide before the modes are applied: --resume
+    * reopens files for writing, which a mode without owner write refuses. */
+   if (!state.error && AD->checkpoint_path != NULL && msc_sender_gone(sockets[0]))
+   {
+      fprintf(stderr, "MSC sender stopped waiting; keeping checkpoint %s for --resume\n",
+              AD->checkpoint_path);
+      state.error = 1;
    }
    fault_phase = getenv("MSC_TEST_INTERRUPT_PHASE");
    if (!state.error && fault_phase != NULL && strcmp(fault_phase, "metadata") == 0)
@@ -1655,13 +1831,21 @@ void receivedirectory(int numstreams, int sockets[], struct argdata *AD)
            msc_fsync_parent(AD->checkpoint_path) != 0))
       { fprintf(stderr, "MSC could not remove completed recursive checkpoint %s: %s\n", AD->checkpoint_path, strerror(errno)); state.error = 1; }
    }
-   if (!state.error)
+   if (state.error)
+      abandon_tree_streams(&state, &beat, &beating);
+   else
    {
+      if (beating)
+      {
+         msc_beat_stop(&beat);
+         beating = 0;
+      }
       if (send_ack_record(sockets[0]) != 0)
          state.error = 1;
    }
-   for (i = 0; i < numstreams; i++)
-      close(sockets[i]);
+   if (!state.streams_closed)
+      for (i = 0; i < numstreams; i++)
+         close(sockets[i]);
    pthread_mutex_destroy(&state.error_lock);
    pthread_mutex_destroy(&state.completion_lock);
    free(workers);

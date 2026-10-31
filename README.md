@@ -182,13 +182,13 @@ unsupported. Successful completion removes the checkpoint unless
 `--keep-checkpoint` is set.
 
 The default stall timeout is 30 s (`--stall-timeout 0` disables it). After all
-data of a single file has arrived, `--flush-timeout` (default 30 min, extended
-to 1 s per 2 MiB for large files) bounds the wait for the destination to confirm
-it is durable; exceeding it exits 4. `--retries N` retries network failures.
-Checkpointed transfers also reconnect by default, probing over SSH every 10 s
-after bounded retries are exhausted; use `--reconnect-interval 0` to disable
-that loop. SIGINT/SIGTERM return 130/143. See [exit codes and
-diagnosis](docs/troubleshooting.md#exit-status).
+data of a single file or a TCP tree has arrived, `--flush-timeout` (default 30
+min, extended to 1 s per 2 MiB, plus 50 ms per entry for a tree) bounds the wait
+for the destination to confirm it is durable; exceeding it exits 4. `--retries
+N` retries network failures. Checkpointed transfers also reconnect by default,
+probing over SSH every 10 s after bounded retries are exhausted; use
+`--reconnect-interval 0` to disable that loop. SIGINT/SIGTERM return 130/143.
+See [exit codes and diagnosis](docs/troubleshooting.md#exit-status).
 
 SSH protects the launch and default control stream. The separate UDP/TCP data
 connections are not encrypted or cryptographically authenticated by MSC.

@@ -6,20 +6,25 @@ Notable user-facing changes are recorded here.
 
 ### Added
 
-- `--flush-timeout D` bounds how long a single-file sender, TCP or UDP, waits,
-  after all data has arrived, for the receiver to confirm the destination is
-  durable: D or 1 s per 2 MiB transferred, whichever is longer. Over UDP it
-  covers the flush, the checksum, each checkpointed chunk's check and checkpoint
-  update, and publication; before, a UDP sender waited for these without any
-  bound, so a stuck destination could hang it indefinitely. UDP needs both ends
-  at this version; with an older peer it waits as before. The default is 30
-  minutes, and 0 waits indefinitely. A wait longer than the stall timeout is
-  announced once with its limit. A destination that does not confirm in time
-  fails the transfer with exit 4 rather than leaving msc waiting forever; a
-  checkpointed transfer then keeps its checkpoint, and `--resume` finishes it.
+- `--flush-timeout D` bounds how long a single-file sender, TCP or UDP, or a
+  recursive TCP sender waits, after all data has arrived, for the receiver to
+  confirm the destination is durable: D or 1 s per 2 MiB transferred, whichever
+  is longer, and for a tree another 50 ms per entry. Over UDP it covers the
+  flush, the checksum, each checkpointed chunk's check and checkpoint update,
+  and publication; before, a UDP sender waited for these without any bound, so a
+  stuck destination could hang it indefinitely. UDP needs both ends at this
+  version; with an older peer it waits as before. The default is 30 minutes, and
+  0 waits indefinitely. A wait longer than the stall timeout is announced once
+  with its limit. A destination that does not confirm in time fails the transfer
+  with exit 4 rather than leaving msc waiting forever; a checkpointed transfer
+  then keeps its checkpoint, and `--resume` finishes it.
 
 ### Changed
 
+- Checkpointed recursive transfers, TCP and UDP, sync the tree's files and
+  directories 64 at a time instead of one after another, at each checkpoint and
+  before acknowledging the tree. On trees of many small files, and on network
+  filesystems where each sync is a round trip, a serial pass could take minutes.
 - TCP single-file transfers that create or truncate a regular destination on a
   local filesystem (tmpfs, ext2/3/4, XFS or Btrfs) receive data straight into a
   shared mapping of the file. Streams no longer take turns on the file's write
@@ -45,6 +50,20 @@ Notable user-facing changes are recorded here.
 
 ### Fixed
 
+- A recursive TCP transfer without `--checkpoint` now syncs every file and
+  directory, the destination root and the directory holding it before it reports
+  success. It synced only the last file each stream wrote, so a crash soon after
+  a successful transfer could lose data.
+- A recursive TCP transfer to slow storage no longer fails with exit 70 (6 with
+  a checkpoint) after all of its data has arrived. The receiver syncs the tree,
+  updates the checkpoint and applies modes and timestamps before acknowledging
+  it, and any of these outlasting the stall timeout made the sender give up. The
+  receiver now tells the sender it is alive until it acknowledges, and the
+  sender bounds the wait with `--flush-timeout`. Both ends need this version: a
+  new sender waits for an older receiver as before, and an older sender gets no
+  such messages from a new receiver, whose fuller sync can then outlast its
+  stall timeout on slow storage, failing a transfer whose data is complete and
+  durable.
 - A TCP single-file transfer whose destination fails, for example with a full
   filesystem, an exceeded quota or a failed flush, now exits 4 (destination)
   with the sender naming the failure, such as "the destination failed while
